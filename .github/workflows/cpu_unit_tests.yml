@@ -1,0 +1,64 @@
+name: cpu_unit_tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-unit:
+    name: CPU unit tests (Python 3.12)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out verl-SpeCo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: ci/requirements-ci.txt
+
+      - name: Check out pinned upstream verl
+        run: |
+          set -euo pipefail
+          verl_ref="$(awk -F= '/^VERL_BASE_COMMIT=/{print $2}' REQUIRED_VERL.txt)"
+          mkdir -p .ci
+          git clone --filter=blob:none https://github.com/verl-project/verl .ci/upstream-verl
+          git -C .ci/upstream-verl checkout "${verl_ref}"
+
+      - name: Install CPU test dependencies
+        run: python -m pip install -r ci/requirements-ci.txt
+
+      - name: Compile Python sources
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/.ci/upstream-verl
+          VERL_SPECO_UPSTREAM_ROOT: ${{ github.workspace }}/.ci/upstream-verl
+        run: python -m compileall verl_speco
+
+      - name: Validate example shell syntax
+        run: bash -n examples/*.sh
+
+      - name: Run CPU unit contract tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/.ci/upstream-verl
+          VERL_SPECO_UPSTREAM_ROOT: ${{ github.workspace }}/.ci/upstream-verl
+        run: >-
+          python -m pytest
+          tests/compat
+          tests/config
+          tests/examples
+          tests/integration
+          -q

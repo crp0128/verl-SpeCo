@@ -1,0 +1,214 @@
+# verl-SpeCo: Co-Train to Accelerate RL and Inference
+
+`verl-SpeCo` is a lightweight SPECO drafter-training overlay for
+[verl](https://github.com/verl-project/verl). It keeps upstream `verl` as an
+import-only dependency and adds speculative decoding drafter collection,
+training, and hot-update logic through `verl_speco`.
+
+## Highlights
+
+- **Import-only verl overlay**: composes upstream `verl` PPO/GRPO config and
+  runs through `python -m verl_speco.main` without patching the installed `verl`
+  tree.
+- **Drafter Co-Training in the RL loop**: collects hidden states during    rollout or
+  old-logprob computation, trains a drafter periodically, and publishes updated
+  drafter weights back to the rollout engine.
+- **Multiple drafter backends**: includes EAGLE3 and DFLASH trainer
+  backends under `verl_speco.backends`.
+- **vLLM and SGLang integration**: supports EAGLE3 and DFLASH speculative
+  decoding paths, with drafter collection and hot-update logic integrated
+  through the rollout engine.
+- **GPU and NPU examples**: provides example scripts for vLLM, SGLang, and
+  vLLM-Ascend style graph settings.
+- **Step-level observability**: exposes drafter timing and vLLM speculative
+  decoding acceptance metrics, including
+  `drafter/spec_decode/mean_acceptance_length`.
+
+## Architecture
+
+![verl-SpeCo architecture](docs/assets/speco-architecture.svg)
+
+## Performance Preview
+
+The current results focus on EAGLE3 with the vLLM rollout engine, where
+verl-SpeCo supports both GPU and NPU deployments. The figures below show a
+Qwen3-8B EAGLE3 run on vLLM-Ascend/NPU; DFLASH support is available, and DFLASH
+figures will be added in a later update.
+
+On Qwen3-8B with an EAGLE3 drafter on vLLM-Ascend/NPU, a 100-step run shows
+that co-training increases mean acceptance length over the fixed-drafter setting
+and, compared with the baseline, delivers about 20% faster rollout and 11%
+faster end-to-end training without accuracy regression.
+
+| Mean Acceptance Length | Generation Time |
+| --- | --- |
+| ![Qwen3-8B EAGLE3 mean acceptance length on vLLM-Ascend](docs/assets/qwen3-8b_eagle3_npu_accept-len.png) | ![Qwen3-8B EAGLE3 generation time on vLLM-Ascend](docs/assets/qwen3-8b_eagle3_npu_gen.png) |
+
+| Step Time | Critic Reward |
+| --- | --- |
+| ![Qwen3-8B EAGLE3 step time on vLLM-Ascend](docs/assets/qwen3-8b_eagle3_npu_step.png) | ![Qwen3-8B EAGLE3 critic reward on vLLM-Ascend](docs/assets/qwen3-8b_eagle3_npu_critic-reward.png) |
+
+## Draft Model Support
+
+| Draft model | Rollout engines | Training engines | Status |
+| :---: | :---: | :---: | :---: |
+| EAGLE3 | vLLM, SGLang | FSDP | ✅ |
+| DFLASH | vLLM, SGLang | FSDP | ✅ |
+| DSpark | TBD | TBD | WIP |
+
+## Runtime Compatibility
+
+The runtime requirements are backend-specific. `REQUIRED_VERL.txt` only pins
+the upstream `verl` version; install the matching rollout runtime for the
+drafter backend you use.
+
+| Draft model | vLLM | vLLM-Ascend | SGLang |
+| :---: | :---: | :---: | :---: |
+| EAGLE3 | &gt;= 0.18.0 | &gt;= 0.18.0 | &gt;= 0.5.10 |
+| DFLASH | &gt;= 0.20.2 | &gt;= 0.20.2 | &gt;= 0.5.12 |
+
+For vLLM DFLASH, the drafter checkpoint must use the DFlash draft model config
+expected by the runtime.
+
+## Repository Layout
+
+```text
+verl_speco/
+  main.py                         # Hydra entrypoint
+  config/speco_trainer.yaml       # verl v0.8.0 config overlay
+  trainer/speco_ray_trainer.py    # RayPPOTrainer adapter
+  workers/speco_worker.py         # drafter trainer worker
+  integration/                    # vLLM, SGLang, old-logprob, publish adapters
+  backends/                       # EAGLE3/DFLASH trainer backends
+  models/                         # drafter model definitions
+
+examples/                         # end-to-end command examples
+tests/                            # CPU-light contract tests
+ci/                               # smoke-test helpers and CI notes
+```
+
+## Installation
+
+This repository does not currently define its own Python package metadata. Use
+it with the upstream `verl` commit pinned in
+[`REQUIRED_VERL.txt`](./REQUIRED_VERL.txt), which is mirrored in
+[`verl_speco/config/speco_trainer.yaml`](./verl_speco/config/speco_trainer.yaml).
+By default, unsupported `verl` versions produce a warning. Set
+`VERL_SPECO_STRICT_VERL=1` to fail closed when the importable `verl` does not
+match the pinned version or commit.
+
+One typical editable setup is:
+
+```bash
+git clone https://github.com/verl-project/verl.git
+cd verl
+git checkout 7aed6b230776f963fa09509c10d9c3a767d1102c
+pip install -e .
+
+cd /path/to/verl-SpeCo
+export PYTHONPATH="$PWD:$PYTHONPATH"
+```
+
+Install the rollout engine and accelerator runtime that match the script you
+intend to run, for example vLLM on GPU, SGLang on GPU, or vLLM-Ascend on NPU.
+Those runtime packages are intentionally not pinned by this repository.
+
+## Quickstart
+
+Start from one of the example scripts and replace the model, drafter, dataset,
+and checkpoint paths:
+
+```bash
+bash examples/run_qwen3-8b_drafter_eagle3_vllm.sh
+```
+
+For NPU with vLLM-Ascend-style graph settings:
+
+```bash
+bash examples/run_qwen3-8b_drafter_eagle3_vllm_npu.sh
+```
+
+The vLLM-Ascend examples keep `FULL_DECODE_ONLY` and dense cudagraph capture
+sizes in the launch script so graph behavior is explicit.
+
+All examples use the same entrypoint:
+
+```bash
+python -m verl_speco.main
+```
+
+The main drafter switches are:
+
+```bash
+actor_rollout_ref.rollout.drafter.enable=True
+actor_rollout_ref.rollout.drafter.enable_drafter_training=True
+actor_rollout_ref.rollout.drafter.model_path=/path/to/drafter
+actor_rollout_ref.rollout.drafter.speculative_algorithm=EAGLE3
+```
+
+## Configuration
+
+SPECO-specific options live under:
+
+```text
+actor_rollout_ref.rollout.drafter.*
+```
+
+Important groups:
+
+- `drafter.enable`: enables speculative decoding at rollout time.
+- `drafter.enable_drafter_training`: enables online drafter trainer workers.
+- `drafter.rollout.*`: controls speculative steps, top-k, and verify tokens.
+- `drafter.training.*`: controls hidden-state collection, training interval,
+  publish interval, update mode, and DFLASH-specific training options.
+- `drafter.vllm.*`: contains vLLM-specific drafter overrides.
+
+The full default overlay is in
+[`verl_speco/config/speco_trainer.yaml`](./verl_speco/config/speco_trainer.yaml).
+
+## Testing
+
+CPU-light contract tests can be run with:
+
+```bash
+pip install -r ci/requirements-ci.txt
+pytest tests
+```
+
+Some tests require a pinned upstream `verl` checkout. Set
+`VERL_SPECO_UPSTREAM_ROOT` to the root of that checkout when running the config
+composition contract:
+
+```bash
+export VERL_SPECO_UPSTREAM_ROOT=/path/to/verl
+pytest tests/config/test_speco_config_overlay.py
+```
+
+Hardware smoke tests are kept under `ci/` and are intended for self-hosted GPU
+or NPU runners with matching model paths and runtime packages.
+
+## Community
+
+Scan the QR code below to join the verl-SpeCo Lark user group.
+
+<p align="center">
+  <img src="docs/assets/Lark_QR_code.jpg" alt="verl-SpeCo Lark user group QR code" width="220">
+</p>
+
+## Contributing
+
+Keep changes scoped to the overlay whenever possible. If a change requires
+upstream `verl` behavior, prefer adding a compatibility adapter in
+`verl_speco.integration` and document the supported `verl` version in
+`REQUIRED_VERL.txt`.
+
+Before proposing changes upstream or opening a PR, follow the repository rules
+in [`AGENTS.md`](./AGENTS.md), including duplicate-work checks and test
+reporting.
+
+## Acknowledgements
+
+This project builds on [verl](https://github.com/verl-project/verl),
+[vLLM](https://github.com/vllm-project/vllm),
+[SGLang](https://github.com/sgl-project/sglang), and
+[vLLM-Ascend](https://github.com/vllm-project/vllm-ascend).
