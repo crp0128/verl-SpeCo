@@ -13,6 +13,76 @@ from .dflash import DFlashConfig, DFlashDraftModel
 from .eagle.llama_eagle import LlamaForCausalLMEagle3
 
 
+_EAGLE3_ARCHITECTURE_ALIASES = {
+    "LlamaForCausalLMEagle3",
+    "Qwen3Eagle3Model",
+}
+
+
+def _normalize_int_list(value):
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return [int(value)]
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.startswith("["):
+            value = json.loads(raw)
+        else:
+            value = [part.strip() for part in raw.split(",") if part.strip()]
+    return [int(item) for item in list(value)]
+
+
+def _first_present_eagle3_layer_ids(config: dict):
+    eagle_config = config.get("eagle_config")
+    candidates = []
+    if isinstance(eagle_config, dict):
+        candidates.extend(
+            [
+                eagle_config.get("target_hidden_layer_ids"),
+                eagle_config.get("eagle_aux_hidden_state_layer_ids"),
+            ]
+        )
+    candidates.extend(
+        [
+            config.get("target_hidden_layer_ids"),
+            config.get("eagle_aux_hidden_state_layer_ids"),
+            config.get("target_layer_ids"),
+        ]
+    )
+    for candidate in candidates:
+        layer_ids = _normalize_int_list(candidate)
+        if layer_ids is not None:
+            return layer_ids
+    return None
+
+
+def _normalize_eagle3_config_dict(config: dict) -> dict:
+    layer_ids = _first_present_eagle3_layer_ids(config)
+    if layer_ids is not None:
+        configured_count = config.get("num_aux_hidden_states")
+        if configured_count is not None and int(configured_count) != len(layer_ids):
+            raise ValueError(
+                "EAGLE3 num_aux_hidden_states does not match layer ids: "
+                f"{configured_count} != {len(layer_ids)}"
+            )
+        config["num_aux_hidden_states"] = len(layer_ids)
+        config["eagle_aux_hidden_state_layer_ids"] = layer_ids
+        eagle_config = config.get("eagle_config")
+        if not isinstance(eagle_config, dict):
+            eagle_config = {}
+            config["eagle_config"] = eagle_config
+        eagle_config.setdefault("eagle_aux_hidden_state_layer_ids", layer_ids)
+        eagle_config.setdefault("target_hidden_layer_ids", layer_ids)
+    elif "num_aux_hidden_states" in config:
+        config["num_aux_hidden_states"] = int(config["num_aux_hidden_states"])
+
+    config["architectures"] = ["LlamaForCausalLMEagle3"]
+    return config
+
+
 class AutoDraftModel(AutoModelForCausalLMBase):
 
     @classmethod
@@ -71,6 +141,7 @@ class AutoEagle3DraftModel(AutoDraftModel):
 class AutoDraftModelConfig:
     _config_mapping = {
         "LlamaForCausalLMEagle3": LlamaConfig,
+        "Qwen3Eagle3Model": LlamaConfig,
         "DFlashDraftModel": DFlashConfig,
     }
 
@@ -110,5 +181,7 @@ class AutoDraftModelConfig:
         if architecture == "DFlashDraftModel":
             config["model_type"] = DFlashConfig.model_type
             config["architectures"] = ["DFlashDraftModel"]
+        elif architecture in _EAGLE3_ARCHITECTURE_ALIASES:
+            config = _normalize_eagle3_config_dict(config)
 
         return cls._config_mapping[architecture].from_dict(config)

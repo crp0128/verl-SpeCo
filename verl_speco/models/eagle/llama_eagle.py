@@ -33,6 +33,60 @@ except ImportError:
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+
+def _get_config_value(config, key: str, default=None):
+    if config is None:
+        return default
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _normalize_layer_ids(layer_ids) -> list[int] | None:
+    if layer_ids is None:
+        return None
+    if isinstance(layer_ids, int):
+        return [int(layer_ids)]
+    if isinstance(layer_ids, str):
+        raw = layer_ids.strip()
+        if not raw:
+            return None
+        if raw.startswith("["):
+            import json
+
+            layer_ids = json.loads(raw)
+        else:
+            layer_ids = [part.strip() for part in raw.split(",") if part.strip()]
+    return [int(layer_id) for layer_id in list(layer_ids)]
+
+
+def _eagle3_aux_layer_ids_from_config(config) -> list[int] | None:
+    eagle_config = _get_config_value(config, "eagle_config", None)
+    candidates = (
+        _get_config_value(eagle_config, "target_hidden_layer_ids", None),
+        _get_config_value(eagle_config, "eagle_aux_hidden_state_layer_ids", None),
+        _get_config_value(config, "target_hidden_layer_ids", None),
+        _get_config_value(config, "eagle_aux_hidden_state_layer_ids", None),
+        _get_config_value(config, "target_layer_ids", None),
+    )
+    for layer_ids in candidates:
+        normalized = _normalize_layer_ids(layer_ids)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def resolve_eagle3_num_aux_hidden_states(config) -> int:
+    num_aux_hidden_states = _get_config_value(config, "num_aux_hidden_states", None)
+    if num_aux_hidden_states is None:
+        layer_ids = _eagle3_aux_layer_ids_from_config(config)
+        num_aux_hidden_states = len(layer_ids) if layer_ids else 3
+    num_aux_hidden_states = int(num_aux_hidden_states)
+    if num_aux_hidden_states <= 0:
+        raise ValueError(f"EAGLE3 num_aux_hidden_states must be positive, got {num_aux_hidden_states}")
+    return num_aux_hidden_states
+
+
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
     input_ids_shape: torch.Size,
@@ -1370,14 +1424,24 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.vocab_size = config.vocab_size
         self.draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
         self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
+        self.num_aux_hidden_states = resolve_eagle3_num_aux_hidden_states(config)
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
 
         self.fc = torch.nn.Linear(
-            self.target_hidden_size * 3, config.hidden_size, bias=False
+            self.target_hidden_size * self.num_aux_hidden_states, config.hidden_size, bias=False
         )
+        if getattr(config, "fc_norm", False):
+            self.fc_norm = nn.ModuleList(
+                [
+                    LlamaRMSNorm(self.target_hidden_size, eps=config.rms_norm_eps)
+                    for _ in range(self.num_aux_hidden_states)
+                ]
+            )
+        else:
+            self.fc_norm = None
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(
@@ -1415,7 +1479,8 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
     ):
         """
         Arguments:
-            hidden_states (`torch.FloatTensor`): input to the layer, cat low, mid high hidden_states of shape `(batch, seq_len, hidden_states * 3)`
+            hidden_states (`torch.FloatTensor`): concatenated target aux hidden states of shape
+                `(batch, seq_len, target_hidden_size * num_aux_hidden_states)`
             input_ids (`torch.LongTensor`): input ids of shape `(batch, seq_len)`
             attention_mask (`torch.FloatTensor`): attention mask of size
                 `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
@@ -1509,13 +1574,17 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return self.embed_tokens(input_ids)
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # eagle 3 requires hidden states from 3 layers
-        expected_hidden_size = self.target_hidden_size * 3
+        expected_hidden_size = self.target_hidden_size * self.num_aux_hidden_states
         if hidden_states.size(-1) != expected_hidden_size:
             raise ValueError(
                 f"EAGLE3 expects hidden_states last dim {expected_hidden_size}, "
-                f"got {hidden_states.size(-1)}"
+                f"got {hidden_states.size(-1)} "
+                f"(target_hidden_size={self.target_hidden_size}, "
+                f"num_aux_hidden_states={self.num_aux_hidden_states})"
             )
+        if self.fc_norm is not None:
+            chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
+            hidden_states = torch.cat([norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)], dim=-1)
         return self.fc(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:

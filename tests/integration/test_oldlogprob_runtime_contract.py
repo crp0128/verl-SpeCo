@@ -64,7 +64,7 @@ def test_eagle3_oldlogprob_falls_back_to_default_three_layers() -> None:
     assert eagle3_num_aux_hidden_states_from_config({"speculative_algorithm": "EAGLE3"}) is None
 
 
-def test_eagle3_oldlogprob_ignores_dflash_target_layer_ids_alias() -> None:
+def test_eagle3_oldlogprob_accepts_top_level_target_layer_ids() -> None:
     drafter_cfg = {
         "speculative_algorithm": "EAGLE3",
         "target_layer_ids": [1, 9, 17, 25, 33],
@@ -74,8 +74,8 @@ def test_eagle3_oldlogprob_ignores_dflash_target_layer_ids_alias() -> None:
         drafter_cfg,
         target_num_hidden_layers=36,
         model_configs=[],
-    ) == [2, 18, 33]
-    assert eagle3_num_aux_hidden_states_from_config(drafter_cfg) is None
+    ) == [1, 9, 17, 25, 33]
+    assert eagle3_num_aux_hidden_states_from_config(drafter_cfg) == 5
 
 
 def _selection_context(*, batch_size: int, hidden_rows: int) -> dict:
