@@ -8,6 +8,7 @@ from torch.nn import functional as F
 from transformers import AutoConfig
 
 from verl_speco.models.auto import AutoDraftModelConfig, AutoEagle3DraftModel
+from verl_speco.models.eagle.llama_eagle import resolve_eagle3_num_aux_hidden_states
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
 from verl_speco.models.target.target_head import TargetHead
 from verl.utils.fsdp_utils import get_device_id
@@ -642,7 +643,11 @@ class Eagle3TrainerBackend:
         # Initialize model
         if spec_model_path and os.path.exists(spec_model_path):
             log_drafter_checkpoint_step(logger, spec_model_path, action="Loading EAGLE3 drafter weights")
-            loaded = factory_cls.from_pretrained(spec_model_path, output_loading_info=True)
+            loaded = factory_cls.from_pretrained(
+                spec_model_path,
+                config=drafter_config,
+                output_loading_info=True,
+            )
             if isinstance(loaded, tuple):
                 drafter_module, loading_info = loaded
                 missing_keys = set(loading_info.get("missing_keys", []))
@@ -763,18 +768,7 @@ class Eagle3TrainerBackend:
         }
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
         h_dim = getattr(model_config, "target_hidden_size", model_config.hidden_size)
-        num_aux_hidden_states = getattr(model_config, "num_aux_hidden_states", None)
-        if num_aux_hidden_states is None:
-            eagle_config = getattr(model_config, "eagle_config", None)
-            layer_ids = getattr(eagle_config, "target_hidden_layer_ids", None)
-            if layer_ids is None:
-                layer_ids = getattr(eagle_config, "eagle_aux_hidden_state_layer_ids", None)
-            if layer_ids is None and isinstance(eagle_config, dict):
-                layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids") or eagle_config.get(
-                    "target_hidden_layer_ids"
-                )
-            num_aux_hidden_states = len(layer_ids) if layer_ids else 3
-        num_aux_hidden_states = int(num_aux_hidden_states)
+        num_aux_hidden_states = resolve_eagle3_num_aux_hidden_states(model_config)
         aux_hidden_size = num_aux_hidden_states * h_dim
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
 

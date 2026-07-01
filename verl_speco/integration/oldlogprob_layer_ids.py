@@ -57,6 +57,7 @@ def _generic_aux_layer_ids_from_config(config: Any) -> list[int] | None:
         ("eagle_config", "eagle_aux_hidden_state_layer_ids"),
         ("target_hidden_layer_ids",),
         ("eagle_aux_hidden_state_layer_ids",),
+        ("target_layer_ids",),
     )
     for path in candidates:
         layer_ids = _normalize_layer_ids(_get_nested(config, path, None))
