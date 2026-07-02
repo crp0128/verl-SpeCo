@@ -78,6 +78,37 @@ def test_eagle3_oldlogprob_accepts_top_level_target_layer_ids() -> None:
     assert eagle3_num_aux_hidden_states_from_config(drafter_cfg) == 5
 
 
+def test_dflash_oldlogprob_ignores_dspark_training_defaults() -> None:
+    drafter_cfg = {
+        "speculative_algorithm": "DFLASH",
+        "training": {
+            "dflash_num_target_layers": 3,
+            "dspark_num_target_layers": 5,
+        },
+    }
+
+    assert resolve_oldlogprob_aux_layer_ids(
+        drafter_cfg,
+        target_num_hidden_layers=36,
+        model_configs=[],
+    ) == [1, 17, 33]
+
+
+def test_dspark_oldlogprob_uses_dspark_training_defaults() -> None:
+    drafter_cfg = {
+        "speculative_algorithm": "DSPARK",
+        "training": {
+            "dspark_num_target_layers": 5,
+        },
+    }
+
+    assert resolve_oldlogprob_aux_layer_ids(
+        drafter_cfg,
+        target_num_hidden_layers=36,
+        model_configs=[],
+    ) == [1, 9, 17, 25, 33]
+
+
 def _selection_context(*, batch_size: int, hidden_rows: int) -> dict:
     return {
         "batch_size": batch_size,

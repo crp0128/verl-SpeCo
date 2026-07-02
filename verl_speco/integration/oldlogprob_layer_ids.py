@@ -42,11 +42,29 @@ def _config_architectures(config: Any) -> list[str]:
     return [str(architecture) for architecture in architectures]
 
 
-def _is_dflash_config(drafter_cfg: Any, model_configs: tuple[Any, ...]) -> bool:
-    algorithm = str(_get_nested(drafter_cfg, ("speculative_algorithm",), "") or "").upper()
-    if algorithm == "DFLASH":
+def _drafter_algorithm(drafter_cfg: Any) -> str:
+    return str(_get_nested(drafter_cfg, ("speculative_algorithm",), "") or "").upper()
+
+
+def _is_dspark_config(config: Any) -> bool:
+    algorithm = _drafter_algorithm(config)
+    if algorithm == "DSPARK":
         return True
-    return any("DFlashDraftModel" in _config_architectures(config) for config in model_configs)
+    return any(
+        architecture in {"DSparkDraftModel", "Qwen3DSparkModel"}
+        for architecture in _config_architectures(config)
+    )
+
+
+def _is_dflash_config(drafter_cfg: Any, model_configs: tuple[Any, ...]) -> bool:
+    algorithm = _drafter_algorithm(drafter_cfg)
+    if algorithm in {"DFLASH", "DSPARK"}:
+        return True
+    return any(
+        architecture in {"DFlashDraftModel", "DSparkDraftModel", "Qwen3DSparkModel"}
+        for config in model_configs
+        for architecture in _config_architectures(config)
+    )
 
 
 def _generic_aux_layer_ids_from_config(config: Any) -> list[int] | None:
@@ -74,11 +92,16 @@ def eagle3_num_aux_hidden_states_from_config(config: Any) -> int | None:
 def _dflash_target_layer_ids_from_config(config: Any) -> list[int] | None:
     top_level = _normalize_layer_ids(_get_nested(config, ("target_layer_ids",), None))
     nested = _normalize_layer_ids(_get_nested(config, ("dflash_config", "target_layer_ids"), None))
+    dspark_nested = _normalize_layer_ids(_get_nested(config, ("dspark_config", "target_layer_ids"), None))
     if top_level is not None and nested is not None and top_level != nested:
         raise ValueError(f"DFlash target_layer_ids conflict with dflash_config.target_layer_ids: {top_level} != {nested}")
+    if top_level is not None and dspark_nested is not None and top_level != dspark_nested:
+        raise ValueError(f"DSpark target_layer_ids conflict with dspark_config.target_layer_ids: {top_level} != {dspark_nested}")
+    if nested is not None and dspark_nested is not None and nested != dspark_nested:
+        raise ValueError(f"DFlash target_layer_ids conflict with dspark_config.target_layer_ids: {nested} != {dspark_nested}")
     if top_level is not None:
         return top_level
-    return nested
+    return nested if nested is not None else dspark_nested
 
 
 def _build_dflash_target_layer_ids(num_context_layers: int, num_hidden_layers: int) -> list[int]:
@@ -92,18 +115,26 @@ def _build_dflash_target_layer_ids(num_context_layers: int, num_hidden_layers: i
     return [int(round(start + (i * span) / (num_context_layers - 1))) for i in range(num_context_layers)]
 
 
-def _dflash_num_context_layers(drafter_cfg: Any, model_configs: tuple[Any, ...]) -> int:
+def _dflash_num_context_layers(drafter_cfg: Any, model_configs: tuple[Any, ...], *, is_dspark: bool = False) -> int:
     training_cfg = _get_nested(drafter_cfg, ("training",), {}) or {}
-    candidates = (
-        _get_nested(training_cfg, ("dflash_num_target_layers",), None),
-        _get_nested(drafter_cfg, ("num_context_layers",), None),
-        _get_nested(drafter_cfg, ("dflash_config", "num_context_layers"), None),
+    candidates = []
+    if is_dspark:
+        candidates.append(_get_nested(training_cfg, ("dspark_num_target_layers",), None))
+    candidates.extend(
+        (
+            _get_nested(training_cfg, ("dflash_num_target_layers",), None),
+            _get_nested(drafter_cfg, ("num_context_layers",), None),
+            _get_nested(drafter_cfg, ("dflash_config", "num_context_layers"), None),
+        )
     )
     for config in model_configs:
-        candidates = (
-            *candidates,
-            _get_nested(config, ("num_context_layers",), None),
-            _get_nested(config, ("dflash_config", "num_context_layers"), None),
+        if is_dspark:
+            candidates.append(_get_nested(config, ("dspark_config", "num_context_layers"), None))
+        candidates.extend(
+            (
+                _get_nested(config, ("num_context_layers",), None),
+                _get_nested(config, ("dflash_config", "num_context_layers"), None),
+            )
         )
     for value in candidates:
         if value is not None:
@@ -128,6 +159,10 @@ def resolve_oldlogprob_aux_layer_ids(
 
     model_configs = tuple(config for config in model_configs if config is not None)
     if _is_dflash_config(drafter_cfg, model_configs):
+        algorithm = _drafter_algorithm(drafter_cfg)
+        is_dspark = algorithm == "DSPARK" or (
+            algorithm != "DFLASH" and any(_is_dspark_config(config) for config in model_configs)
+        )
         for config in (drafter_cfg, *model_configs):
             layer_ids = _dflash_target_layer_ids_from_config(config)
             if layer_ids is not None:
@@ -135,7 +170,7 @@ def resolve_oldlogprob_aux_layer_ids(
         if target_num_hidden_layers is None:
             return None
         return _build_dflash_target_layer_ids(
-            _dflash_num_context_layers(drafter_cfg, model_configs),
+            _dflash_num_context_layers(drafter_cfg, model_configs, is_dspark=is_dspark),
             int(target_num_hidden_layers),
         )
 

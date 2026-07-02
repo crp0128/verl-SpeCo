@@ -18,6 +18,11 @@ _EAGLE3_ARCHITECTURE_ALIASES = {
     "Qwen3Eagle3Model",
 }
 
+_DSPARK_ARCHITECTURE_ALIASES = {
+    "DSparkDraftModel",
+    "Qwen3DSparkModel",
+}
+
 
 def _normalize_int_list(value):
     if value is None:
@@ -175,13 +180,22 @@ class AutoDraftModelConfig:
 
         architecture = architectures[0]
 
-        if architecture not in cls._config_mapping:
+        if architecture not in cls._config_mapping and architecture not in _DSPARK_ARCHITECTURE_ALIASES:
             raise ValueError(f"Architecture {architecture} not supported")
 
+        config_class = cls._config_mapping.get(architecture)
         if architecture == "DFlashDraftModel":
             config["model_type"] = DFlashConfig.model_type
             config["architectures"] = ["DFlashDraftModel"]
+        elif architecture in _DSPARK_ARCHITECTURE_ALIASES:
+            from .dspark import DSparkConfig
+
+            config_class = DSparkConfig
+            config["model_type"] = DSparkConfig.model_type
+            config["architectures"] = ["DSparkDraftModel"]
+            if "enable_confidence_head" not in config:
+                config["enable_confidence_head"] = float(config.get("confidence_head_alpha", 0.0)) > 0.0
         elif architecture in _EAGLE3_ARCHITECTURE_ALIASES:
             config = _normalize_eagle3_config_dict(config)
 
-        return cls._config_mapping[architecture].from_dict(config)
+        return config_class.from_dict(config)

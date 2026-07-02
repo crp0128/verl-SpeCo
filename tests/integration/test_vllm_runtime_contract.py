@@ -3,11 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
     SPECO_VLLM_WORKER_EXTENSION_CLS,
     _new_vllm_spec_decode_stats,
+    _normalize_dflash_target_layer_aliases,
     _record_vllm_spec_decode_scheduler_stats,
+    _validate_vllm_dflash_drafter_config,
     _vllm_spec_decode_stats_to_metrics,
     attach_update_draft_weights_to_rollout,
     build_vllm_speculative_config_from_drafter,
@@ -55,6 +59,75 @@ def test_vllm_speculative_config_maps_dflash_contract() -> None:
     }
 
 
+def test_vllm_speculative_config_maps_dspark_to_dflash_contract(tmp_path) -> None:
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        """
+        {
+          "architectures": ["DSparkDraftModel"],
+          "markov_head_type": "vanilla",
+          "target_layer_ids": [1, 9, 17, 25, 33]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    config = build_vllm_speculative_config_from_drafter(
+        _drafter(
+            speculative_algorithm="DSPARK",
+            model_path=str(model_path),
+            rollout={"spec_steps": 3, "spec_verify_tokens": 16},
+        )
+    )
+
+    assert config == {
+        "method": "dflash",
+        "model": str(model_path),
+        "num_speculative_tokens": 16,
+    }
+
+
+def test_vllm_dflash_validator_rejects_dspark_when_algorithm_is_dflash(tmp_path) -> None:
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["DSparkDraftModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="vLLM DFlash requires"):
+        _validate_vllm_dflash_drafter_config(model_path, algorithm="DFLASH")
+
+
+def test_vllm_dspark_validator_accepts_markov_head_config(tmp_path) -> None:
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3ForCausalLM"], "markov_head_type": ""}',
+        encoding="utf-8",
+    )
+
+    _validate_vllm_dflash_drafter_config(model_path, algorithm="DSPARK")
+
+
+def test_vllm_dspark_config_aliases_are_dflash_compatible() -> None:
+    config = {
+        "architectures": ["DFlashDSparkDraftModel"],
+        "markov_head_type": "vanilla",
+        "mask_token_id": 151669,
+        "target_layer_ids": [1, 9, 17, 25, 33],
+    }
+
+    assert _normalize_dflash_target_layer_aliases(config) is True
+
+    assert config["dflash_config"] == {
+        "target_layer_ids": [1, 9, 17, 25, 33],
+        "mask_token_id": 151669,
+    }
+    assert config["eagle_aux_hidden_state_layer_ids"] == [2, 10, 18, 26, 34]
+
+
 def test_vllm_runtime_injects_native_config_and_worker_extension(monkeypatch) -> None:
     monkeypatch.setattr(
         "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
@@ -74,6 +147,39 @@ def test_vllm_runtime_injects_native_config_and_worker_extension(monkeypatch) ->
 
     engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
     assert engine_kwargs["speculative_config"]["method"] == "eagle3"
+    assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
+
+
+def test_vllm_runtime_injects_dspark_as_dflash_and_worker_extension(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
+        lambda: True,
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["DSparkDraftModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+    config = {
+        "actor_rollout_ref": {
+            "rollout": {
+                "name": "vllm",
+                "drafter": _drafter(
+                    speculative_algorithm="DSPARK",
+                    model_path=str(model_path),
+                    rollout={"spec_steps": 3, "spec_verify_tokens": 16},
+                ),
+                "engine_kwargs": {"vllm": {}},
+            }
+        }
+    }
+
+    configure_vllm_runtime_from_config(config)
+
+    engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
+    assert engine_kwargs["speculative_config"]["method"] == "dflash"
+    assert engine_kwargs["speculative_config"]["num_speculative_tokens"] == 16
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
 
 

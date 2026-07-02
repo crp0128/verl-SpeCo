@@ -460,13 +460,14 @@ class DrafterBaseTrainer:
         # token-wise training tensors by the rollout TP size, but DFlash anchor
         # sampling needs full local sequences and does not implement SP loss yet.
         rollout_tp_size = int(self.config.rollout.get("tensor_model_parallel_size", 1))
-        if self.backend.model_type == "dflash":
+        if self._is_block_drafter_backend():
             self.ulysses_sequence_parallel_size = 1
             if rollout_tp_size > 1 and self.training_group_world_size > 1:
                 logger.debug(
-                    "[Rank %s] Disable Ulysses SP for DFlash drafter training: "
+                    "[Rank %s] Disable Ulysses SP for %s drafter training: "
                     "rollout_tp=%s training_group_world_size=%s",
                     self.rank,
+                    self.backend.model_type,
                     rollout_tp_size,
                     self.training_group_world_size,
                 )
@@ -512,6 +513,21 @@ class DrafterBaseTrainer:
             and dim_name in self.training_device_mesh.mesh_dim_names
         )
 
+    def _is_block_drafter_backend(self) -> bool:
+        return getattr(self.backend, "model_type", None) in {"dflash", "dspark"}
+
+    def _block_drafter_metric_prefix(self) -> str:
+        model_type = str(getattr(self.backend, "model_type", "dflash") or "dflash")
+        return "dspark" if model_type == "dspark" else "dflash"
+
+    def _block_drafter_config_value(self, suffix: str, default: Any) -> Any:
+        training_cfg = self.config.rollout.drafter.training
+        prefix = self._block_drafter_metric_prefix()
+        value = training_cfg.get(f"{prefix}_{suffix}", None)
+        if value is not None:
+            return value
+        return training_cfg.get(f"dflash_{suffix}", default)
+
     def reset_training_metrics(self) -> None:
         self._training_metric_sums = {}
         self._training_metric_steps = 0
@@ -523,37 +539,38 @@ class DrafterBaseTrainer:
         for key, value in sums.items():
             if key.startswith("timing_s/drafter_"):
                 metrics[key] = value
-        correct = sums.get("dflash/correct_count", 0.0)
-        eval_tokens = sums.get("dflash/eval_token_count", 0.0)
+        prefix = self._block_drafter_metric_prefix()
+        correct = sums.get(f"{prefix}/correct_count", 0.0)
+        eval_tokens = sums.get(f"{prefix}/eval_token_count", 0.0)
         if eval_tokens > 0:
-            metrics["dflash/accuracy"] = correct / eval_tokens
-        quality_tokens = sums.get("dflash/quality_token_count", 0.0)
+            metrics[f"{prefix}/accuracy"] = correct / eval_tokens
+        quality_tokens = sums.get(f"{prefix}/quality_token_count", 0.0)
         if quality_tokens > 0:
-            metrics["dflash/top1_acc"] = sums.get("dflash/top1_correct_count", 0.0) / quality_tokens
-            metrics["dflash/top5_acc"] = sums.get("dflash/top5_correct_count", 0.0) / quality_tokens
+            metrics[f"{prefix}/top1_acc"] = sums.get(f"{prefix}/top1_correct_count", 0.0) / quality_tokens
+            metrics[f"{prefix}/top5_acc"] = sums.get(f"{prefix}/top5_correct_count", 0.0) / quality_tokens
         for key in (
-            "dflash/valid_token_count",
-            "dflash/weighted_token_count",
-            "dflash/quality_token_count",
-            "dflash/sanitized_rows",
-            "dflash/masked_rows",
-            "dflash/sampled_vocab_size",
-            "dflash/loss_mode_id",
+            f"{prefix}/valid_token_count",
+            f"{prefix}/weighted_token_count",
+            f"{prefix}/quality_token_count",
+            f"{prefix}/sanitized_rows",
+            f"{prefix}/masked_rows",
+            f"{prefix}/sampled_vocab_size",
+            f"{prefix}/loss_mode_id",
         ):
             if key in sums:
                 metrics[key] = sums[key] / steps
-        metrics["dflash/metric_steps"] = float(self._training_metric_steps)
+        metrics[f"{prefix}/metric_steps"] = float(self._training_metric_steps)
 
-        for pos in range(int(self.config.rollout.drafter.training.get("dflash_block_size", 16))):
-            count_key = f"dflash/count_per_position/{pos}"
+        for pos in range(int(self._block_drafter_config_value("block_size", 16))):
+            count_key = f"{prefix}/count_per_position/{pos}"
             count = sums.get(count_key, 0.0)
             if count <= 0:
                 continue
             metrics[count_key] = count / steps
-            loss_sum = sums.get(f"dflash/loss_sum_per_position/{pos}", 0.0)
-            correct_sum = sums.get(f"dflash/correct_per_position/{pos}", 0.0)
-            metrics[f"dflash/loss_per_position/{pos}"] = loss_sum / count
-            metrics[f"dflash/accuracy_per_position/{pos}"] = correct_sum / count
+            loss_sum = sums.get(f"{prefix}/loss_sum_per_position/{pos}", 0.0)
+            correct_sum = sums.get(f"{prefix}/correct_per_position/{pos}", 0.0)
+            metrics[f"{prefix}/loss_per_position/{pos}"] = loss_sum / count
+            metrics[f"{prefix}/accuracy_per_position/{pos}"] = correct_sum / count
         return metrics
 
     def record_training_timing(self, metric_name: str, elapsed_sec: float) -> None:
@@ -581,18 +598,19 @@ class DrafterBaseTrainer:
         if not isinstance(diagnostics, dict):
             return
         self._training_metric_steps += 1
+        prefix = self._block_drafter_metric_prefix()
         scalar_keys = {
-            "correct_count": "dflash/correct_count",
-            "eval_token_count": "dflash/eval_token_count",
-            "top1_correct_count": "dflash/top1_correct_count",
-            "top5_correct_count": "dflash/top5_correct_count",
-            "quality_token_count": "dflash/quality_token_count",
-            "valid_token_count": "dflash/valid_token_count",
-            "weighted_token_count": "dflash/weighted_token_count",
-            "sanitized_rows": "dflash/sanitized_rows",
-            "masked_rows": "dflash/masked_rows",
-            "sampled_vocab_size": "dflash/sampled_vocab_size",
-            "loss_mode_id": "dflash/loss_mode_id",
+            "correct_count": f"{prefix}/correct_count",
+            "eval_token_count": f"{prefix}/eval_token_count",
+            "top1_correct_count": f"{prefix}/top1_correct_count",
+            "top5_correct_count": f"{prefix}/top5_correct_count",
+            "quality_token_count": f"{prefix}/quality_token_count",
+            "valid_token_count": f"{prefix}/valid_token_count",
+            "weighted_token_count": f"{prefix}/weighted_token_count",
+            "sanitized_rows": f"{prefix}/sanitized_rows",
+            "masked_rows": f"{prefix}/masked_rows",
+            "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
+            "loss_mode_id": f"{prefix}/loss_mode_id",
         }
         for source_key, metric_key in scalar_keys.items():
             value = diagnostics.get(source_key)
@@ -604,9 +622,9 @@ class DrafterBaseTrainer:
             )
 
         vector_keys = {
-            "loss_sum_per_position": "dflash/loss_sum_per_position",
-            "correct_per_position": "dflash/correct_per_position",
-            "count_per_position": "dflash/count_per_position",
+            "loss_sum_per_position": f"{prefix}/loss_sum_per_position",
+            "correct_per_position": f"{prefix}/correct_per_position",
+            "count_per_position": f"{prefix}/count_per_position",
         }
         for source_key, metric_prefix in vector_keys.items():
             value = diagnostics.get(source_key)
@@ -665,7 +683,7 @@ class DrafterBaseTrainer:
         # A. 实例化模型（委托给backend）
         pending_target_weight = self._pending_target_lm_head_weight
         if (
-            getattr(self.backend, "model_type", None) in {"eagle3", "dflash"}
+            getattr(self.backend, "model_type", None) in {"eagle3", "dflash", "dspark"}
             and torch.is_tensor(pending_target_weight)
             and pending_target_weight.dim() == 2
         ):
@@ -823,7 +841,7 @@ class DrafterBaseTrainer:
 
     def _get_pretrained_export_model(self):
         model = self.model.module if hasattr(self.model, "module") else self.model
-        if getattr(self.backend, "model_type", None) == "dflash" and hasattr(model, "draft_model"):
+        if self._is_block_drafter_backend() and hasattr(model, "draft_model"):
             return model.draft_model, ("draft_model.", "module.draft_model.", "_orig_mod.draft_model.")
         return model, ()
 
@@ -1137,7 +1155,7 @@ class DrafterBaseTrainer:
 
     def get_target_lm_head_row_indices(self) -> Optional[dict[str, Any]]:
         """Return target lm_head row indices needed by the current drafter loss."""
-        if getattr(self.backend, "model_type", None) == "dflash":
+        if self._is_block_drafter_backend():
             return self._build_target_lm_head_row_indices_from_dflash_data()
         if getattr(self.backend, "model_type", None) != "eagle3":
             return None
@@ -1198,7 +1216,8 @@ class DrafterBaseTrainer:
         lm_head transfer.
         """
         training_cfg = self.config.rollout.drafter.training
-        if str(training_cfg.get("dflash_loss_mode", "full_vocab")) != "restricted_ce":
+        loss_mode = str(self._block_drafter_config_value("loss_mode", "full_vocab"))
+        if loss_mode != "restricted_ce":
             return None
 
         source_vocab_size = self._target_lm_head_vocab_size()
@@ -1225,7 +1244,7 @@ class DrafterBaseTrainer:
             "row_indices": row_indices,
             "source_vocab_size": int(source_vocab_size),
             "selected_rows": selected_rows,
-            "source": "dflash_collected_tokens",
+            "source": f"{self._block_drafter_metric_prefix()}_collected_tokens",
         }
 
     def _build_target_lm_head_row_indices_from_t2d(self, t2d: Optional[torch.Tensor]) -> Optional[dict[str, Any]]:
@@ -1552,7 +1571,7 @@ class DrafterBaseTrainer:
         if hidden_states_layout is None:
             hidden_states_layout = (
                 "dflash_aux"
-                if getattr(self.backend, "model_type", None) == "dflash"
+                if self._is_block_drafter_backend()
                 else "eagle3_aux_plus_last"
             )
 
@@ -2163,7 +2182,7 @@ class DrafterBaseTrainer:
         return None
 
     def _dflash_hard_sample_score(self, item: dict[str, Any]) -> Optional[float]:
-        """Return a larger-is-harder score for DFlash sample selection."""
+        """Return a larger-is-harder score for block-drafter sample selection."""
         explicit_score = self._item_float(
             item,
             (
@@ -2204,8 +2223,8 @@ class DrafterBaseTrainer:
         if len(available_data) <= batch_size:
             return list(available_data)
 
-        hard_ratio = float(self.config.rollout.drafter.training.get("dflash_hard_sample_ratio", 0.0) or 0.0)
-        if self.backend.model_type != "dflash" or hard_ratio <= 0:
+        hard_ratio = float(self._block_drafter_config_value("hard_sample_ratio", 0.0) or 0.0)
+        if not self._is_block_drafter_backend() or hard_ratio <= 0:
             return rng.sample(available_data, batch_size)
 
         hard_count = min(batch_size, max(0, round(batch_size * hard_ratio)))
@@ -2306,8 +2325,8 @@ class DrafterBaseTrainer:
             return None
 
         dev = next(self.model.parameters()).device
-        if self.backend.model_type == "dflash" and self.use_ulysses_sp:
-            raise NotImplementedError("DFlash drafter training does not support Ulysses sequence parallel yet")
+        if self._is_block_drafter_backend() and self.use_ulysses_sp:
+            raise NotImplementedError(f"{self.backend.model_type} drafter training does not support Ulysses sequence parallel yet")
         
         preprocessed_lists = self.backend.preprocess_individual_items(items, dev, self.model_config)
         items_seen = len(items)
@@ -2367,7 +2386,7 @@ class DrafterBaseTrainer:
                     max(last_h_states.size(0) - 1, 0),
                 ]
                 train_seq_len = min(train_seq_len_limits)
-            elif self.backend.model_type == "dflash":
+            elif self._is_block_drafter_backend():
                 train_seq_len = seq_len
             else:
                 train_seq_len = seq_len - 1
@@ -2378,7 +2397,7 @@ class DrafterBaseTrainer:
 
             items_used += 1
             packed_tokens_before_shift += train_seq_len
-            if self.backend.model_type == "dflash":
+            if self._is_block_drafter_backend():
                 packed_loss_tokens += int(item_loss_mask[:train_seq_len].detach().float().sum().cpu().item())
             elif uses_shifted_eagle_inputs:
                 packed_loss_tokens += int(item_loss_mask[2 : 2 + train_seq_len].detach().float().sum().cpu().item())
@@ -2564,7 +2583,7 @@ class DrafterBaseTrainer:
                 input_id_chunks.append(ids[:train_seq_len])
                 hidden_state_chunks.append(h_states[:train_seq_len])
                 position_id_chunks.append(item_position_ids[:train_seq_len])
-            if self.backend.model_type == "dflash":
+            if self._is_block_drafter_backend():
                 loss_mask_chunks.append(item_loss_mask[:train_seq_len])
             elif uses_shifted_eagle_inputs:
                 loss_mask_chunks.append(item_loss_mask[2 : 2 + train_seq_len])
@@ -2584,7 +2603,7 @@ class DrafterBaseTrainer:
         if not input_id_chunks:
             return None
 
-        if self.backend.model_type == "dflash":
+        if self._is_block_drafter_backend():
             max_train_len = max(chunk.size(0) for chunk in input_id_chunks)
             hidden_dim = hidden_state_chunks[0].size(-1)
             input_ids = torch.zeros(len(input_id_chunks), max_train_len, dtype=input_id_chunks[0].dtype, device=dev)

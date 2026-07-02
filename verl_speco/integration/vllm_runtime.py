@@ -27,6 +27,10 @@ SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX = "_speco_vllm_spec_decode"
 
 _VLLM_REPLICA_PATCHED = False
 _VLLM_DFLASH_CONFIG_ALIASES_PATCHED = False
+_VLLM_DSPARK_RUNTIME_PATCHED = False
+_VLLM_DSPARK_REGISTRY_ALIAS_PATCHED = False
+
+_DSPARK_VLLM_ARCHITECTURES = {"DSparkDraftModel", "Qwen3DSparkModel", "DeepSeekDSparkModel"}
 
 
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
@@ -80,6 +84,17 @@ def _set_child(container: Any, key: str, value: Any) -> None:
             container[key] = value
         else:
             setattr(container, key, value)
+
+
+def _has_config_field(config: Any, key: str) -> bool:
+    if config is None:
+        return False
+    if hasattr(config, "get"):
+        try:
+            return key in config
+        except TypeError:
+            return config.get(key, None) is not None
+    return hasattr(config, key)
 
 
 def _ensure_child_mapping(container: Any, key: str) -> Any:
@@ -181,17 +196,29 @@ def _int_list_or_none(value: Any, field_name: str) -> list[int] | None:
     if value is None:
         return None
     if isinstance(value, (str, bytes)) or isinstance(value, dict):
-        raise TypeError(f"DFlash {field_name} must be a list of integers")
+        raise TypeError(f"{field_name} must be a list of integers")
     try:
         return [int(item) for item in value]
     except TypeError as exc:
-        raise TypeError(f"DFlash {field_name} must be a list of integers") from exc
+        raise TypeError(f"{field_name} must be a list of integers") from exc
     except ValueError as exc:
-        raise ValueError(f"DFlash {field_name} must contain only integers") from exc
+        raise ValueError(f"{field_name} must contain only integers") from exc
+
+
+def _is_dspark_config(config: Any) -> bool:
+    architectures = _get_nested(config, ("architectures",), None) or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    architecture_names = {str(name) for name in architectures}
+    return bool(
+        _has_config_field(config, "markov_head_type")
+        or _has_config_field(config, "dspark_config")
+        or architecture_names.intersection(_DSPARK_VLLM_ARCHITECTURES)
+    )
 
 
 def _normalize_dflash_target_layer_aliases(config: Any) -> bool:
-    """Mirror existing DFlash target layer ids into vLLM 0.23 alias fields."""
+    """Mirror DFlash/DSpark target layer ids into vLLM 0.23 alias fields."""
 
     target_layer_ids = _int_list_or_none(
         _get_nested(config, ("target_layer_ids",), None),
@@ -204,14 +231,43 @@ def _normalize_dflash_target_layer_aliases(config: Any) -> bool:
         _get_nested(dflash_config, ("target_layer_ids",), None),
         "dflash_config.target_layer_ids",
     )
+    dspark_config = _get_nested(config, ("dspark_config",), None)
+    if dspark_config is not None and not hasattr(dspark_config, "get"):
+        raise TypeError("DSpark dspark_config must be a mapping when provided")
+    dspark_target_layer_ids = _int_list_or_none(
+        _get_nested(dspark_config, ("target_layer_ids",), None),
+        "dspark_config.target_layer_ids",
+    )
 
-    if target_layer_ids is not None and nested_target_layer_ids is not None and target_layer_ids != nested_target_layer_ids:
+    if (
+        target_layer_ids is not None
+        and nested_target_layer_ids is not None
+        and target_layer_ids != nested_target_layer_ids
+    ):
         raise ValueError(
             "DFlash target_layer_ids conflict with dflash_config.target_layer_ids: "
             f"{target_layer_ids} != {nested_target_layer_ids}"
         )
+    if (
+        target_layer_ids is not None
+        and dspark_target_layer_ids is not None
+        and target_layer_ids != dspark_target_layer_ids
+    ):
+        raise ValueError(
+            "DSpark target_layer_ids conflict with dspark_config.target_layer_ids: "
+            f"{target_layer_ids} != {dspark_target_layer_ids}"
+        )
+    if (
+        nested_target_layer_ids is not None
+        and dspark_target_layer_ids is not None
+        and nested_target_layer_ids != dspark_target_layer_ids
+    ):
+        raise ValueError(
+            "DSpark dflash_config.target_layer_ids conflict with dspark_config.target_layer_ids: "
+            f"{nested_target_layer_ids} != {dspark_target_layer_ids}"
+        )
 
-    selected_layer_ids = target_layer_ids if target_layer_ids is not None else nested_target_layer_ids
+    selected_layer_ids = _first_present(target_layer_ids, nested_target_layer_ids, dspark_target_layer_ids)
     if selected_layer_ids is None:
         return False
 
@@ -222,6 +278,13 @@ def _normalize_dflash_target_layer_aliases(config: Any) -> bool:
         changed = True
     if nested_target_layer_ids is None:
         _set_child(dflash_config, "target_layer_ids", selected_layer_ids)
+        changed = True
+    if (
+        _is_dspark_config(config)
+        and _get_nested(dflash_config, ("mask_token_id",), None) is None
+        and _get_nested(config, ("mask_token_id",), None) is not None
+    ):
+        _set_child(dflash_config, "mask_token_id", _get_nested(config, ("mask_token_id",), None))
         changed = True
 
     expected_aux_layer_ids = [layer_id + 1 for layer_id in selected_layer_ids]
@@ -241,7 +304,11 @@ def _normalize_dflash_target_layer_aliases(config: Any) -> bool:
     return changed
 
 
-def _validate_vllm_dflash_drafter_config(spec_model_path: Any) -> None:
+def _drafter_algorithm(drafter_cfg: dict[str, Any]) -> str:
+    return str(drafter_cfg.get("speculative_algorithm", "EAGLE3") or "EAGLE3").strip().upper()
+
+
+def _validate_vllm_dflash_drafter_config(spec_model_path: Any, algorithm: str = "DFLASH") -> None:
     if not spec_model_path:
         return
 
@@ -256,6 +323,17 @@ def _validate_vllm_dflash_drafter_config(spec_model_path: Any) -> None:
         raise ValueError(f"Invalid DFlash drafter config.json at {config_path}: {exc}") from exc
 
     architectures = config.get("architectures") or []
+    algorithm = str(algorithm or "DFLASH").strip().upper()
+    if algorithm == "DSPARK":
+        if not _is_dspark_config(config):
+            raise ValueError(
+                "vLLM DSpark uses the DFlash speculative path, but requires "
+                "actor_rollout_ref.rollout.drafter.model_path to point to a DSpark drafter "
+                "checkpoint with markov_head_type or a DSpark architecture in config.json; "
+                f"got architectures={architectures!r} from {config_path}."
+            )
+        return
+
     if architectures and "DFlashDraftModel" not in architectures:
         raise ValueError(
             "vLLM DFlash requires actor_rollout_ref.rollout.drafter.model_path "
@@ -299,10 +377,11 @@ def _rollout_config_from_config(config: Any) -> Any:
 
 
 def _speculative_method_from_drafter(drafter_cfg: dict[str, Any]) -> str:
-    algorithm = str(drafter_cfg.get("speculative_algorithm", "EAGLE3") or "EAGLE3").strip().upper()
+    algorithm = _drafter_algorithm(drafter_cfg)
     method_map = {
         "EAGLE3": "eagle3",
         "DFLASH": "dflash",
+        "DSPARK": "dflash",
         "DRAFT": "draft_model",
         "DRAFT_MODEL": "draft_model",
         "MTP": "mtp",
@@ -343,7 +422,7 @@ def build_vllm_speculative_config_from_drafter(
 
     rollout_drafter_cfg = drafter_cfg.get("rollout") or {}
     if method == "dflash":
-        _validate_vllm_dflash_drafter_config(spec_model_path)
+        _validate_vllm_dflash_drafter_config(spec_model_path, algorithm=_drafter_algorithm(drafter_cfg))
         num_speculative_tokens = _positive_int_or_none(rollout_drafter_cfg.get("spec_verify_tokens"))
         if num_speculative_tokens is None:
             raise ValueError(
@@ -493,6 +572,508 @@ def _maybe_apply_vllm_ascend_global_patch() -> bool:
     return True
 
 
+def _is_dspark_hf_config(hf_config: Any) -> bool:
+    architectures = _get_nested(hf_config, ("architectures",), None) or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    architecture_names = {str(name).replace("DFlash", "", 1) for name in architectures}
+    return bool(
+        _has_config_field(hf_config, "markov_head_type")
+        or _has_config_field(hf_config, "dspark_config")
+        or architecture_names.intersection(_DSPARK_VLLM_ARCHITECTURES)
+    )
+
+
+def _ensure_dspark_dflash_aliases(hf_config: Any) -> bool:
+    """Make DSpark HF config consumable by vLLM's DFlash draft model."""
+
+    if not _is_dspark_hf_config(hf_config):
+        return False
+
+    target_layer_ids = _int_list_or_none(
+        _first_present(
+            _get_nested(hf_config, ("target_layer_ids",), None),
+            _get_nested(hf_config, ("dflash_config", "target_layer_ids"), None),
+            _get_nested(hf_config, ("dspark_config", "target_layer_ids"), None),
+        ),
+        "DSpark target_layer_ids",
+    )
+    if target_layer_ids is None:
+        return False
+
+    changed = False
+    dflash_config = _get_nested(hf_config, ("dflash_config",), None)
+    if dflash_config is None:
+        dflash_config = {}
+        _set_child(hf_config, "dflash_config", dflash_config)
+        changed = True
+    if _get_nested(dflash_config, ("target_layer_ids",), None) is None:
+        _set_child(dflash_config, "target_layer_ids", target_layer_ids)
+        changed = True
+    if _get_nested(dflash_config, ("mask_token_id",), None) is None:
+        mask_token_id = _get_nested(hf_config, ("mask_token_id",), None)
+        if mask_token_id is not None:
+            _set_child(dflash_config, "mask_token_id", mask_token_id)
+            changed = True
+
+    if _get_nested(hf_config, ("eagle_aux_hidden_state_layer_ids",), None) is None:
+        _set_child(hf_config, "eagle_aux_hidden_state_layer_ids", [layer_id + 1 for layer_id in target_layer_ids])
+        changed = True
+    return changed
+
+
+def _dspark_hf_config_from_vllm_config(vllm_config: Any) -> Any:
+    spec_cfg = getattr(vllm_config, "speculative_config", None)
+    draft_model_cfg = getattr(spec_cfg, "draft_model_config", None) if spec_cfg is not None else None
+    return getattr(draft_model_cfg, "hf_config", None)
+
+
+def _dspark_hf_config_from_proposer(proposer: Any) -> Any:
+    draft_model_cfg = getattr(proposer, "draft_model_config", None)
+    if draft_model_cfg is not None:
+        hf_config = getattr(draft_model_cfg, "hf_config", None)
+        if hf_config is not None:
+            return hf_config
+    spec_cfg = getattr(proposer, "speculative_config", None)
+    draft_model_cfg = getattr(spec_cfg, "draft_model_config", None) if spec_cfg is not None else None
+    return getattr(draft_model_cfg, "hf_config", None)
+
+
+def _patch_vllm_dspark_parallel_token() -> bool:
+    try:
+        from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install vLLM DSpark parallel-token patch: %s", exc)
+        return False
+
+    current = getattr(SpecDecodeBaseProposer, "_init_parallel_drafting_params", None)
+    if not callable(current):
+        return False
+    if getattr(current, "_speco_dspark_parallel_token", False):
+        return True
+
+    def patched_init_parallel_drafting_params(self):
+        model_hf_config = self.draft_model_config.hf_config
+        if _is_dspark_hf_config(model_hf_config):
+            _ensure_dspark_dflash_aliases(model_hf_config)
+            mask_token_id = _get_nested(model_hf_config, ("mask_token_id",), None)
+            if mask_token_id is not None:
+                self.parallel_drafting_token_id = int(mask_token_id)
+                return
+        current(self)
+
+    patched_init_parallel_drafting_params._speco_dspark_parallel_token = True
+    patched_init_parallel_drafting_params._speco_original_init_parallel_drafting_params = current
+    SpecDecodeBaseProposer._init_parallel_drafting_params = patched_init_parallel_drafting_params
+    return True
+
+
+def _patch_vllm_dspark_qwen3_heads() -> bool:
+    try:
+        import torch
+        from torch import nn
+        from vllm.model_executor.layers.linear import ReplicatedLinear
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+        from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
+        from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install vLLM DSpark Qwen3 head patch: %s", exc)
+        return False
+
+    class DSparkConfidenceHead(nn.Module):
+        def __init__(self, vllm_config: Any, prefix: str) -> None:
+            super().__init__()
+            config = vllm_config.model_config.hf_config
+            rank = int(getattr(config, "markov_rank", getattr(config, "dspark_markov_rank", 256)))
+            self.proj = ReplicatedLinear(
+                config.hidden_size + rank,
+                1,
+                bias=True,
+                params_dtype=torch.float32,
+                quant_config=None,
+                prefix=f"{prefix}.proj",
+            )
+
+        def forward(self, hidden_states: Any, markov_embeds: Any) -> Any:
+            x = torch.cat([hidden_states, markov_embeds], dim=-1)
+            confidence, _ = self.proj(x.float())
+            return confidence.squeeze(-1)
+
+    class DSparkMarkovHead(nn.Module):
+        def __init__(self, vllm_config: Any, prefix: str) -> None:
+            super().__init__()
+            config = vllm_config.model_config.hf_config
+            rank = int(getattr(config, "markov_rank", getattr(config, "dspark_markov_rank", 256)))
+            self.markov_w1 = VocabParallelEmbedding(
+                config.vocab_size,
+                rank,
+                prefix=f"{prefix}.markov_w1",
+            )
+            self.markov_w2 = ParallelLMHead(
+                config.vocab_size,
+                rank,
+                params_dtype=torch.float32,
+                org_num_embeddings=config.vocab_size,
+                prefix=f"{prefix}.markov_w2",
+            )
+            self.logits_processor = LogitsProcessor(config.vocab_size)
+
+        def forward(self, token_ids: Any) -> tuple[Any, Any]:
+            embeds = self.markov_w1(token_ids)
+            logits = self.logits_processor(
+                self.markov_w2,
+                embeds.view(-1, embeds.shape[-1]).float(),
+            )
+            return logits.view(*embeds.shape[:-1], -1), embeds
+
+    current = getattr(DFlashQwen3Model, "__init__", None)
+    if not callable(current):
+        return False
+    if getattr(current, "_speco_dspark_qwen3_heads", False):
+        return True
+
+    def patched_dflash_qwen3_init(self, *args, **kwargs):
+        vllm_config = kwargs.get("vllm_config")
+        if vllm_config is None and args:
+            vllm_config = args[0]
+        prefix = kwargs.get("prefix", "")
+        hf_config = _dspark_hf_config_from_vllm_config(vllm_config)
+        is_dspark = _is_dspark_hf_config(hf_config)
+        if is_dspark:
+            _ensure_dspark_dflash_aliases(hf_config)
+
+        current(self, *args, **kwargs)
+
+        if is_dspark:
+            if not hasattr(self, "markov_head"):
+                self.markov_head = DSparkMarkovHead(vllm_config, prefix=f"{prefix}.markov_head")
+            if not hasattr(self, "confidence_head"):
+                self.confidence_head = DSparkConfidenceHead(vllm_config, prefix=f"{prefix}.confidence_head")
+
+    patched_dflash_qwen3_init._speco_dspark_qwen3_heads = True
+    patched_dflash_qwen3_init._speco_original_dflash_qwen3_init = current
+    DFlashQwen3Model.__init__ = patched_dflash_qwen3_init
+    return True
+
+
+def _patch_vllm_dspark_compute_logits() -> bool:
+    try:
+        import torch
+        from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install vLLM DSpark compute_logits patch: %s", exc)
+        return False
+
+    current = getattr(DFlashQwen3ForCausalLM, "compute_logits", None)
+    if not callable(current):
+        return False
+    if getattr(current, "_speco_dspark_compute_logits", False):
+        return True
+
+    def patched_compute_logits(self, hidden_states):
+        seed_buffer = getattr(self, "_speco_dspark_seed_buffer", None)
+        num_spec = int(getattr(self, "_speco_dspark_num_speculative_tokens", 0) or 0)
+        markov_head = getattr(getattr(self, "model", None), "markov_head", None)
+        if (
+            bool(getattr(self, "_speco_dspark_use_full_block_logits", False))
+            and _is_dspark_hf_config(getattr(self, "config", None))
+            and seed_buffer is not None
+            and markov_head is not None
+            and num_spec > 0
+            and hidden_states is not None
+        ):
+            blk = num_spec + 1
+            if hidden_states.shape[0] % blk == 0:
+                raw_logits = current(self, hidden_states)
+                if raw_logits is None:
+                    return None
+                logits = raw_logits.view(-1, blk, raw_logits.shape[-1])
+                num_blk = logits.shape[0]
+                draft_buffer = getattr(self, "_speco_dspark_draft_buffer", None)
+                if draft_buffer is not None and draft_buffer.shape[0] >= num_blk and draft_buffer.shape[1] >= blk:
+                    draft_token_ids = draft_buffer[:num_blk, :blk]
+                else:
+                    draft_token_ids = torch.zeros(
+                        (num_blk, blk),
+                        dtype=seed_buffer.dtype,
+                        device=seed_buffer.device,
+                    )
+                draft_token_ids[:, 0] = seed_buffer[:num_blk]
+                for idx in range(num_spec):
+                    logits_bias, _ = markov_head(draft_token_ids[:, idx])
+                    logits[:, idx] += logits_bias
+                    draft_token_ids[:, idx + 1] = logits[:, idx].argmax(dim=-1)
+                return logits[:, :num_spec].reshape(-1, logits.shape[-1])
+        return current(self, hidden_states)
+
+    patched_compute_logits._speco_dspark_compute_logits = True
+    patched_compute_logits._speco_original_compute_logits = current
+    DFlashQwen3ForCausalLM.compute_logits = patched_compute_logits
+    return True
+
+
+def _patch_vllm_dspark_sample_hook() -> bool:
+    try:
+        import torch
+        from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install vLLM DSpark sampling hook: %s", exc)
+        return False
+
+    current = getattr(SpecDecodeBaseProposer, "_sample_draft_tokens", None)
+    if not callable(current):
+        return False
+    if getattr(current, "_speco_dspark_sample_hook", False):
+        return True
+
+    def patched_sample_draft_tokens(self, hidden_states, sampling_metadata):
+        hf_config = _dspark_hf_config_from_proposer(self)
+        markov_head = getattr(getattr(self.model, "model", None), "markov_head", None)
+        seed_buffer = getattr(self, "_dspark_seed_buffer", None)
+        if (
+            _is_dspark_hf_config(hf_config)
+            and markov_head is not None
+            and seed_buffer is not None
+            and hidden_states is not None
+        ):
+            num_spec = int(getattr(self, "num_speculative_tokens", 0) or 0)
+            blk = num_spec + 1
+            if num_spec > 0 and hidden_states.shape[0] % blk == 0:
+                compute_logits = getattr(self.model, "compute_logits", None)
+                compute_logits_fn = getattr(compute_logits, "__func__", compute_logits)
+                original_compute_logits = getattr(compute_logits_fn, "_speco_original_compute_logits", None)
+                if callable(original_compute_logits):
+                    raw_logits = original_compute_logits(self.model, hidden_states)
+                else:
+                    raw_logits = self.model.compute_logits(hidden_states)
+                logits = raw_logits.view(-1, blk, raw_logits.shape[-1])
+                num_blk = logits.shape[0]
+                draft_buffer = getattr(self, "_dspark_draft_buffer", None)
+                if draft_buffer is not None and draft_buffer.shape[0] >= num_blk and draft_buffer.shape[1] >= blk:
+                    draft_token_ids = draft_buffer[:num_blk, :blk]
+                else:
+                    draft_token_ids = torch.zeros(
+                        (num_blk, blk),
+                        dtype=seed_buffer.dtype,
+                        device=seed_buffer.device,
+                    )
+                draft_token_ids[:, 0] = seed_buffer[:num_blk]
+                for idx in range(num_spec):
+                    logits_bias, _ = markov_head(draft_token_ids[:, idx])
+                    logits[:, idx] += logits_bias
+                    draft_token_ids[:, idx + 1] = logits[:, idx].argmax(dim=-1)
+                return draft_token_ids[:, 1:].reshape(-1), None
+        return current(self, hidden_states, sampling_metadata)
+
+    patched_sample_draft_tokens._speco_dspark_sample_hook = True
+    patched_sample_draft_tokens._speco_original_sample_draft_tokens = current
+    SpecDecodeBaseProposer._sample_draft_tokens = patched_sample_draft_tokens
+    return True
+
+
+def _patch_vllm_dspark_dflash_proposer(
+    module_name: str,
+    class_name: str,
+    *,
+    expand_sample_indices: bool = False,
+) -> bool:
+    try:
+        import importlib
+        import torch
+
+        module = importlib.import_module(module_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to import %s for DSpark proposer patch: %s", module_name, exc)
+        return False
+
+    proposer_cls = getattr(module, class_name, None)
+    if proposer_cls is None:
+        return False
+
+    def should_expand_full_block_logits() -> bool:
+        if not expand_sample_indices:
+            return False
+        if not module_name.startswith("vllm_ascend."):
+            return True
+        try:
+            from vllm_ascend.ascend_config import get_ascend_config
+            from vllm_ascend.utils import lmhead_tp_enable
+
+            return not bool(get_ascend_config().enable_reduce_sample) and not bool(lmhead_tp_enable())
+        except Exception:  # noqa: BLE001
+            return True
+
+    changed = False
+    current_init = getattr(proposer_cls, "__init__", None)
+    if callable(current_init) and not getattr(current_init, "_speco_dspark_buffers", False):
+
+        def patched_init(self, *args, **kwargs):
+            current_init(self, *args, **kwargs)
+            hf_config = _dspark_hf_config_from_proposer(self)
+            if not _is_dspark_hf_config(hf_config):
+                return
+            _ensure_dspark_dflash_aliases(hf_config)
+            device = getattr(self, "device", None)
+            if device is None:
+                device = kwargs.get("device")
+            if device is None and len(args) >= 2:
+                device = args[1]
+            blk = 1 + int(getattr(self, "num_speculative_tokens", 0) or 0)
+            max_batch_size = int(getattr(self, "max_batch_size", 0) or 0)
+            if max_batch_size <= 0 or device is None:
+                return
+            if getattr(self, "_dspark_seed_buffer", None) is None:
+                self._dspark_seed_buffer = torch.zeros(max_batch_size, dtype=torch.int64, device=device)
+            if getattr(self, "_dspark_draft_buffer", None) is None:
+                self._dspark_draft_buffer = torch.zeros((max_batch_size, blk), dtype=torch.int64, device=device)
+            draft_model = getattr(self, "model", None)
+            if draft_model is not None:
+                draft_model._speco_dspark_seed_buffer = self._dspark_seed_buffer
+                draft_model._speco_dspark_draft_buffer = self._dspark_draft_buffer
+                draft_model._speco_dspark_num_speculative_tokens = int(
+                    getattr(self, "num_speculative_tokens", 0) or 0
+                )
+                draft_model._speco_dspark_use_full_block_logits = should_expand_full_block_logits()
+
+        patched_init._speco_dspark_buffers = True
+        patched_init._speco_original_init = current_init
+        proposer_cls.__init__ = patched_init
+        changed = True
+
+    current_set_inputs = getattr(proposer_cls, "set_inputs_first_pass", None)
+    if callable(current_set_inputs) and not getattr(current_set_inputs, "_speco_dspark_seed_copy", False):
+
+        def patched_set_inputs_first_pass(
+            self,
+            target_token_ids,
+            next_token_ids,
+            target_positions,
+            target_hidden_states,
+            token_indices_to_sample,
+            cad,
+            num_rejected_tokens_gpu,
+            *args,
+            **kwargs,
+        ):
+            if _is_dspark_hf_config(_dspark_hf_config_from_proposer(self)):
+                self._next_token_ids = next_token_ids
+                seed_buffer = getattr(self, "_dspark_seed_buffer", None)
+                if seed_buffer is not None:
+                    n = next_token_ids.shape[0]
+                    seed_buffer[:n].copy_(next_token_ids)
+                    if n < seed_buffer.shape[0]:
+                        seed_buffer[n:].fill_(0)
+                    draft_model = getattr(self, "model", None)
+                    if draft_model is not None:
+                        draft_model._speco_dspark_seed_buffer = seed_buffer
+                        draft_model._speco_dspark_draft_buffer = getattr(self, "_dspark_draft_buffer", None)
+                        draft_model._speco_dspark_num_speculative_tokens = int(
+                            getattr(self, "num_speculative_tokens", 0) or 0
+                        )
+                        draft_model._speco_dspark_use_full_block_logits = should_expand_full_block_logits()
+            result = current_set_inputs(
+                self,
+                target_token_ids,
+                next_token_ids,
+                target_positions,
+                target_hidden_states,
+                token_indices_to_sample,
+                cad,
+                num_rejected_tokens_gpu,
+                *args,
+                **kwargs,
+            )
+            if (
+                should_expand_full_block_logits()
+                and _is_dspark_hf_config(_dspark_hf_config_from_proposer(self))
+                and isinstance(result, tuple)
+                and len(result) >= 3
+            ):
+                num_tokens, returned_indices, *rest = result
+                if returned_indices is not None:
+                    full_indices = torch.arange(
+                        int(num_tokens),
+                        dtype=returned_indices.dtype,
+                        device=returned_indices.device,
+                    )
+                    return (num_tokens, full_indices, *rest)
+            return result
+
+        patched_set_inputs_first_pass._speco_dspark_seed_copy = True
+        patched_set_inputs_first_pass._speco_original_set_inputs_first_pass = current_set_inputs
+        proposer_cls.set_inputs_first_pass = patched_set_inputs_first_pass
+        changed = True
+
+    return changed
+
+
+def _import_vllm_ascend_dspark_patch() -> bool:
+    try:
+        import importlib
+
+        importlib.import_module("vllm_ascend.patch.platform.patch_dspark_proposer")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to import vLLM-Ascend DSpark platform patch: %s", exc)
+        return False
+    return True
+
+
+def _vllm_ascend_has_dspark_main_loop() -> bool:
+    try:
+        import inspect
+
+        import vllm_ascend.spec_decode.llm_base_proposer as proposer_module
+    except Exception:  # noqa: BLE001
+        return False
+
+    for candidate in vars(proposer_module).values():
+        if not isinstance(candidate, type) or "Proposer" not in candidate.__name__:
+            continue
+        for method_name in ("_run_merged_draft", "propose"):
+            method = getattr(candidate, method_name, None)
+            if method is None:
+                continue
+            try:
+                source = inspect.getsource(method)
+            except (OSError, TypeError):
+                continue
+            if "markov_head_type" in source and "markov_head" in source:
+                return True
+    return False
+
+
+def patch_vllm_dspark_runtime() -> bool:
+    """Install DSpark runtime compatibility hooks for vLLM 0.23/vLLM-Ascend."""
+
+    global _VLLM_DSPARK_RUNTIME_PATCHED
+
+    patched = bool(_VLLM_DSPARK_RUNTIME_PATCHED)
+    patched = _import_vllm_ascend_dspark_patch() or patched
+    patched = _patch_vllm_dspark_parallel_token() or patched
+    patched = _patch_vllm_dspark_qwen3_heads() or patched
+    patched = _patch_vllm_dspark_compute_logits() or patched
+    patched = _patch_vllm_dspark_sample_hook() or patched
+    patched = (
+        _patch_vllm_dspark_dflash_proposer(
+            "vllm.v1.spec_decode.dflash",
+            "DFlashProposer",
+            expand_sample_indices=True,
+        )
+        or patched
+    )
+    patched = (
+        _patch_vllm_dspark_dflash_proposer(
+            "vllm_ascend.spec_decode.dflash_proposer",
+            "AscendDflashProposer",
+            expand_sample_indices=not _vllm_ascend_has_dspark_main_loop(),
+        )
+        or patched
+    )
+    if patched:
+        _VLLM_DSPARK_RUNTIME_PATCHED = True
+    return patched
+
+
 def _record_vllm_spec_decode_acceptance(
     scheduler: Any,
     *,
@@ -610,6 +1191,8 @@ def patch_vllm_dflash_config_aliases() -> bool:
         current(self, *args, **kwargs)
         if str(method or "eagle").strip().lower() == "dflash":
             _normalize_dflash_target_layer_aliases(self)
+            if _is_dspark_hf_config(self):
+                _set_child(self, "architectures", ["DFlashDraftModel"])
 
     patched_eagle_config_init._speco_dflash_config_aliases = True
     patched_eagle_config_init._speco_original_eagle_config_init = current
@@ -618,9 +1201,39 @@ def patch_vllm_dflash_config_aliases() -> bool:
     return True
 
 
+def patch_vllm_dspark_registry_aliases() -> bool:
+    """Let vLLM resolve DSpark draft architectures through the DFlash model."""
+
+    global _VLLM_DSPARK_REGISTRY_ALIAS_PATCHED
+    if _VLLM_DSPARK_REGISTRY_ALIAS_PATCHED:
+        return True
+    try:
+        from vllm.model_executor.models import registry
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install vLLM DSpark registry aliases: %s", exc)
+        return False
+
+    model_registry = getattr(registry, "ModelRegistry", None)
+    register_model = getattr(model_registry, "register_model", None)
+    if not callable(register_model):
+        return False
+
+    existing_models = getattr(model_registry, "models", {})
+    for architecture in sorted(_DSPARK_VLLM_ARCHITECTURES | {"DFlashDSparkDraftModel", "DFlashQwen3DSparkModel"}):
+        if architecture not in existing_models:
+            register_model(
+                architecture,
+                "vllm.model_executor.models.qwen3_dflash:DFlashQwen3ForCausalLM",
+            )
+    _VLLM_DSPARK_REGISTRY_ALIAS_PATCHED = True
+    return True
+
+
 def _speco_vllm_run_engine_core_with_acceptance_logging(*args, **kwargs):
     _maybe_apply_vllm_ascend_global_patch()
     patch_vllm_dflash_config_aliases()
+    patch_vllm_dspark_registry_aliases()
+    patch_vllm_dspark_runtime()
     patch_vllm_spec_decode_acceptance_logging()
     patch_vllm_worker_proc_entrypoint()
 
@@ -656,6 +1269,8 @@ def patch_vllm_engine_core_entrypoint() -> bool:
 def _speco_vllm_worker_main_with_runtime_observability(*args, **kwargs):
     _maybe_apply_vllm_ascend_global_patch()
     patch_vllm_dflash_config_aliases()
+    patch_vllm_dspark_registry_aliases()
+    patch_vllm_dspark_runtime()
     patch_vllm_spec_decode_acceptance_logging()
 
     original = getattr(_speco_vllm_worker_main_with_runtime_observability, "_speco_original_worker_main", None)
@@ -706,9 +1321,17 @@ def install_vllm_runtime_observability() -> bool:
 
     _maybe_apply_vllm_ascend_global_patch()
     dflash_config_patched = patch_vllm_dflash_config_aliases()
+    dspark_registry_patched = patch_vllm_dspark_registry_aliases()
+    dspark_runtime_patched = patch_vllm_dspark_runtime()
     acceptance_patched = install_vllm_spec_decode_acceptance_logging()
     worker_proc_patched = patch_vllm_worker_proc_entrypoint()
-    return dflash_config_patched or acceptance_patched or worker_proc_patched
+    return (
+        dflash_config_patched
+        or dspark_registry_patched
+        or dspark_runtime_patched
+        or acceptance_patched
+        or worker_proc_patched
+    )
 
 
 def _new_vllm_spec_decode_stats() -> dict[str, float]:
