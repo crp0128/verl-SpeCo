@@ -1,6 +1,5 @@
 set -x
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-export TORCH_COMPILE_DISABLE=1
 
 # NPU example for the native DFlash proposer in vLLM.
 project_name='verl_grpo_example_dflash_drafter'
