@@ -85,7 +85,6 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.rollout.spec_steps=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_topk=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=7 \
-    actor_rollout_ref.rollout.drafter.vllm.speculative_config_overrides.draft_sample_method=greedy \
     actor_rollout_ref.rollout.drafter.training.step=20 \
     actor_rollout_ref.rollout.drafter.training.max_collect_samples_per_step_per_replica=16 \
     actor_rollout_ref.rollout.drafter.training.hidden_state_window_tokens_per_sample=512 \
