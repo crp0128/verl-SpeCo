@@ -447,6 +447,7 @@ def build_vllm_speculative_config_from_drafter(
     speculative_config: dict[str, Any] = {
         "method": method,
         "num_speculative_tokens": num_speculative_tokens,
+        "draft_sample_method": "greedy",
     }
     if spec_model_path is not None:
         speculative_config["model"] = spec_model_path

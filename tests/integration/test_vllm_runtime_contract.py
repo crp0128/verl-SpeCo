@@ -41,6 +41,7 @@ def test_vllm_speculative_config_maps_eagle3_contract() -> None:
     config = build_vllm_speculative_config_from_drafter(_drafter())
 
     assert config == {
+        "draft_sample_method": "greedy",
         "method": "eagle3",
         "model": "/models/drafter",
         "num_speculative_tokens": 3,
@@ -56,6 +57,7 @@ def test_vllm_speculative_config_maps_dflash_contract() -> None:
     )
 
     assert config == {
+        "draft_sample_method": "greedy",
         "method": "dflash",
         "model": "/models/drafter",
         "num_speculative_tokens": 16,
@@ -85,6 +87,7 @@ def test_vllm_speculative_config_maps_dspark_to_dflash_contract(tmp_path) -> Non
     )
 
     assert config == {
+        "draft_sample_method": "greedy",
         "method": "dflash",
         "model": str(model_path),
         "num_speculative_tokens": 16,
