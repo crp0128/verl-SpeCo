@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +14,7 @@ from verl_speco.integration.vllm_runtime import (
     _normalize_dflash_target_layer_aliases,
     _record_vllm_spec_decode_scheduler_stats,
     _validate_vllm_dflash_drafter_config,
+    _vllm_ascend_has_dspark_pr11153_k_query_runtime,
     _vllm_spec_decode_stats_to_metrics,
     attach_update_draft_weights_to_rollout,
     build_vllm_speculative_config_from_drafter,
@@ -126,6 +129,75 @@ def test_vllm_dspark_config_aliases_are_dflash_compatible() -> None:
         "mask_token_id": 151669,
     }
     assert config["eagle_aux_hidden_state_layer_ids"] == [2, 10, 18, 26, 34]
+
+
+def _install_fake_vllm_ascend_modules(monkeypatch, dflash_cls, proposer_cls) -> None:
+    root_module = types.ModuleType("vllm_ascend")
+    spec_decode_module = types.ModuleType("vllm_ascend.spec_decode")
+    dflash_module = types.ModuleType("vllm_ascend.spec_decode.dflash_proposer")
+    proposer_module = types.ModuleType("vllm_ascend.spec_decode.llm_base_proposer")
+
+    dflash_module.AscendDflashProposer = dflash_cls
+    proposer_module.AscendSpecDecodeBaseProposer = proposer_cls
+    spec_decode_module.dflash_proposer = dflash_module
+    spec_decode_module.llm_base_proposer = proposer_module
+    root_module.spec_decode = spec_decode_module
+
+    monkeypatch.setitem(sys.modules, "vllm_ascend", root_module)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.spec_decode", spec_decode_module)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.spec_decode.dflash_proposer", dflash_module)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.spec_decode.llm_base_proposer", proposer_module)
+
+
+class _FakePR11153DflashProposer:
+    def _num_query_per_req(self):
+        return self.num_speculative_tokens if self._is_dspark else 1 + self.num_speculative_tokens
+
+    def set_inputs_first_pass(self):
+        return self._num_query_per_req(), "IS_DSPARK"
+
+
+class _FakePR11153SpecDecodeBaseProposer:
+    def _run_merged_draft(self):
+        if hasattr(self.speculative_config.draft_model_config.hf_config, "markov_head_type"):
+            blk = self.num_speculative_tokens
+            draft_token_ids = self.model.model.markov_head
+            return draft_token_ids[:, 1:] if blk else None
+        return None
+
+
+class _FakeOldDSparkDflashProposer:
+    def set_inputs_first_pass(self):
+        return 1 + self.num_speculative_tokens
+
+
+class _FakeOldDSparkSpecDecodeBaseProposer:
+    def _run_merged_draft(self):
+        if hasattr(self.speculative_config.draft_model_config.hf_config, "markov_head_type"):
+            blk = self.num_speculative_tokens + 1
+            draft_token_ids = self.model.model.markov_head
+            return draft_token_ids[:, 1:] if blk else None
+        return None
+
+
+def test_vllm_ascend_dspark_runtime_detector_accepts_pr11153_k_query(monkeypatch) -> None:
+    _install_fake_vllm_ascend_modules(
+        monkeypatch,
+        _FakePR11153DflashProposer,
+        _FakePR11153SpecDecodeBaseProposer,
+    )
+
+    assert _vllm_ascend_has_dspark_pr11153_k_query_runtime() is True
+
+
+def test_vllm_ascend_dspark_runtime_detector_rejects_old_full_block_layout(monkeypatch) -> None:
+    _install_fake_vllm_ascend_modules(
+        monkeypatch,
+        _FakeOldDSparkDflashProposer,
+        _FakeOldDSparkSpecDecodeBaseProposer,
+    )
+
+    assert _vllm_ascend_has_dspark_pr11153_k_query_runtime() is False
 
 
 def test_vllm_runtime_injects_native_config_and_worker_extension(monkeypatch) -> None:

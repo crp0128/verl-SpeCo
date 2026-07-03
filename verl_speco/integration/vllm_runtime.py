@@ -756,257 +756,6 @@ def _patch_vllm_dspark_qwen3_heads() -> bool:
     return True
 
 
-def _patch_vllm_dspark_compute_logits() -> bool:
-    try:
-        import torch
-        from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Unable to install vLLM DSpark compute_logits patch: %s", exc)
-        return False
-
-    current = getattr(DFlashQwen3ForCausalLM, "compute_logits", None)
-    if not callable(current):
-        return False
-    if getattr(current, "_speco_dspark_compute_logits", False):
-        return True
-
-    def patched_compute_logits(self, hidden_states):
-        seed_buffer = getattr(self, "_speco_dspark_seed_buffer", None)
-        num_spec = int(getattr(self, "_speco_dspark_num_speculative_tokens", 0) or 0)
-        markov_head = getattr(getattr(self, "model", None), "markov_head", None)
-        if (
-            bool(getattr(self, "_speco_dspark_use_full_block_logits", False))
-            and _is_dspark_hf_config(getattr(self, "config", None))
-            and seed_buffer is not None
-            and markov_head is not None
-            and num_spec > 0
-            and hidden_states is not None
-        ):
-            blk = num_spec + 1
-            if hidden_states.shape[0] % blk == 0:
-                raw_logits = current(self, hidden_states)
-                if raw_logits is None:
-                    return None
-                logits = raw_logits.view(-1, blk, raw_logits.shape[-1])
-                num_blk = logits.shape[0]
-                draft_buffer = getattr(self, "_speco_dspark_draft_buffer", None)
-                if draft_buffer is not None and draft_buffer.shape[0] >= num_blk and draft_buffer.shape[1] >= blk:
-                    draft_token_ids = draft_buffer[:num_blk, :blk]
-                else:
-                    draft_token_ids = torch.zeros(
-                        (num_blk, blk),
-                        dtype=seed_buffer.dtype,
-                        device=seed_buffer.device,
-                    )
-                draft_token_ids[:, 0] = seed_buffer[:num_blk]
-                for idx in range(num_spec):
-                    logits_bias, _ = markov_head(draft_token_ids[:, idx])
-                    logits[:, idx] += logits_bias
-                    draft_token_ids[:, idx + 1] = logits[:, idx].argmax(dim=-1)
-                return logits[:, :num_spec].reshape(-1, logits.shape[-1])
-        return current(self, hidden_states)
-
-    patched_compute_logits._speco_dspark_compute_logits = True
-    patched_compute_logits._speco_original_compute_logits = current
-    DFlashQwen3ForCausalLM.compute_logits = patched_compute_logits
-    return True
-
-
-def _patch_vllm_dspark_sample_hook() -> bool:
-    try:
-        import torch
-        from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Unable to install vLLM DSpark sampling hook: %s", exc)
-        return False
-
-    current = getattr(SpecDecodeBaseProposer, "_sample_draft_tokens", None)
-    if not callable(current):
-        return False
-    if getattr(current, "_speco_dspark_sample_hook", False):
-        return True
-
-    def patched_sample_draft_tokens(self, hidden_states, sampling_metadata):
-        hf_config = _dspark_hf_config_from_proposer(self)
-        markov_head = getattr(getattr(self.model, "model", None), "markov_head", None)
-        seed_buffer = getattr(self, "_dspark_seed_buffer", None)
-        if (
-            _is_dspark_hf_config(hf_config)
-            and markov_head is not None
-            and seed_buffer is not None
-            and hidden_states is not None
-        ):
-            num_spec = int(getattr(self, "num_speculative_tokens", 0) or 0)
-            blk = num_spec + 1
-            if num_spec > 0 and hidden_states.shape[0] % blk == 0:
-                compute_logits = getattr(self.model, "compute_logits", None)
-                compute_logits_fn = getattr(compute_logits, "__func__", compute_logits)
-                original_compute_logits = getattr(compute_logits_fn, "_speco_original_compute_logits", None)
-                if callable(original_compute_logits):
-                    raw_logits = original_compute_logits(self.model, hidden_states)
-                else:
-                    raw_logits = self.model.compute_logits(hidden_states)
-                logits = raw_logits.view(-1, blk, raw_logits.shape[-1])
-                num_blk = logits.shape[0]
-                draft_buffer = getattr(self, "_dspark_draft_buffer", None)
-                if draft_buffer is not None and draft_buffer.shape[0] >= num_blk and draft_buffer.shape[1] >= blk:
-                    draft_token_ids = draft_buffer[:num_blk, :blk]
-                else:
-                    draft_token_ids = torch.zeros(
-                        (num_blk, blk),
-                        dtype=seed_buffer.dtype,
-                        device=seed_buffer.device,
-                    )
-                draft_token_ids[:, 0] = seed_buffer[:num_blk]
-                for idx in range(num_spec):
-                    logits_bias, _ = markov_head(draft_token_ids[:, idx])
-                    logits[:, idx] += logits_bias
-                    draft_token_ids[:, idx + 1] = logits[:, idx].argmax(dim=-1)
-                return draft_token_ids[:, 1:].reshape(-1), None
-        return current(self, hidden_states, sampling_metadata)
-
-    patched_sample_draft_tokens._speco_dspark_sample_hook = True
-    patched_sample_draft_tokens._speco_original_sample_draft_tokens = current
-    SpecDecodeBaseProposer._sample_draft_tokens = patched_sample_draft_tokens
-    return True
-
-
-def _patch_vllm_dspark_dflash_proposer(
-    module_name: str,
-    class_name: str,
-    *,
-    expand_sample_indices: bool = False,
-) -> bool:
-    try:
-        import importlib
-        import torch
-
-        module = importlib.import_module(module_name)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Unable to import %s for DSpark proposer patch: %s", module_name, exc)
-        return False
-
-    proposer_cls = getattr(module, class_name, None)
-    if proposer_cls is None:
-        return False
-
-    def should_expand_full_block_logits() -> bool:
-        if not expand_sample_indices:
-            return False
-        if not module_name.startswith("vllm_ascend."):
-            return True
-        try:
-            from vllm_ascend.ascend_config import get_ascend_config
-            from vllm_ascend.utils import lmhead_tp_enable
-
-            return not bool(get_ascend_config().enable_reduce_sample) and not bool(lmhead_tp_enable())
-        except Exception:  # noqa: BLE001
-            return True
-
-    changed = False
-    current_init = getattr(proposer_cls, "__init__", None)
-    if callable(current_init) and not getattr(current_init, "_speco_dspark_buffers", False):
-
-        def patched_init(self, *args, **kwargs):
-            current_init(self, *args, **kwargs)
-            hf_config = _dspark_hf_config_from_proposer(self)
-            if not _is_dspark_hf_config(hf_config):
-                return
-            _ensure_dspark_dflash_aliases(hf_config)
-            device = getattr(self, "device", None)
-            if device is None:
-                device = kwargs.get("device")
-            if device is None and len(args) >= 2:
-                device = args[1]
-            blk = 1 + int(getattr(self, "num_speculative_tokens", 0) or 0)
-            max_batch_size = int(getattr(self, "max_batch_size", 0) or 0)
-            if max_batch_size <= 0 or device is None:
-                return
-            if getattr(self, "_dspark_seed_buffer", None) is None:
-                self._dspark_seed_buffer = torch.zeros(max_batch_size, dtype=torch.int64, device=device)
-            if getattr(self, "_dspark_draft_buffer", None) is None:
-                self._dspark_draft_buffer = torch.zeros((max_batch_size, blk), dtype=torch.int64, device=device)
-            draft_model = getattr(self, "model", None)
-            if draft_model is not None:
-                draft_model._speco_dspark_seed_buffer = self._dspark_seed_buffer
-                draft_model._speco_dspark_draft_buffer = self._dspark_draft_buffer
-                draft_model._speco_dspark_num_speculative_tokens = int(
-                    getattr(self, "num_speculative_tokens", 0) or 0
-                )
-                draft_model._speco_dspark_use_full_block_logits = should_expand_full_block_logits()
-
-        patched_init._speco_dspark_buffers = True
-        patched_init._speco_original_init = current_init
-        proposer_cls.__init__ = patched_init
-        changed = True
-
-    current_set_inputs = getattr(proposer_cls, "set_inputs_first_pass", None)
-    if callable(current_set_inputs) and not getattr(current_set_inputs, "_speco_dspark_seed_copy", False):
-
-        def patched_set_inputs_first_pass(
-            self,
-            target_token_ids,
-            next_token_ids,
-            target_positions,
-            target_hidden_states,
-            token_indices_to_sample,
-            cad,
-            num_rejected_tokens_gpu,
-            *args,
-            **kwargs,
-        ):
-            if _is_dspark_hf_config(_dspark_hf_config_from_proposer(self)):
-                self._next_token_ids = next_token_ids
-                seed_buffer = getattr(self, "_dspark_seed_buffer", None)
-                if seed_buffer is not None:
-                    n = next_token_ids.shape[0]
-                    seed_buffer[:n].copy_(next_token_ids)
-                    if n < seed_buffer.shape[0]:
-                        seed_buffer[n:].fill_(0)
-                    draft_model = getattr(self, "model", None)
-                    if draft_model is not None:
-                        draft_model._speco_dspark_seed_buffer = seed_buffer
-                        draft_model._speco_dspark_draft_buffer = getattr(self, "_dspark_draft_buffer", None)
-                        draft_model._speco_dspark_num_speculative_tokens = int(
-                            getattr(self, "num_speculative_tokens", 0) or 0
-                        )
-                        draft_model._speco_dspark_use_full_block_logits = should_expand_full_block_logits()
-            result = current_set_inputs(
-                self,
-                target_token_ids,
-                next_token_ids,
-                target_positions,
-                target_hidden_states,
-                token_indices_to_sample,
-                cad,
-                num_rejected_tokens_gpu,
-                *args,
-                **kwargs,
-            )
-            if (
-                should_expand_full_block_logits()
-                and _is_dspark_hf_config(_dspark_hf_config_from_proposer(self))
-                and isinstance(result, tuple)
-                and len(result) >= 3
-            ):
-                num_tokens, returned_indices, *rest = result
-                if returned_indices is not None:
-                    full_indices = torch.arange(
-                        int(num_tokens),
-                        dtype=returned_indices.dtype,
-                        device=returned_indices.device,
-                    )
-                    return (num_tokens, full_indices, *rest)
-            return result
-
-        patched_set_inputs_first_pass._speco_dspark_seed_copy = True
-        patched_set_inputs_first_pass._speco_original_set_inputs_first_pass = current_set_inputs
-        proposer_cls.set_inputs_first_pass = patched_set_inputs_first_pass
-        changed = True
-
-    return changed
-
-
 def _import_vllm_ascend_dspark_patch() -> bool:
     try:
         import importlib
@@ -1018,57 +767,84 @@ def _import_vllm_ascend_dspark_patch() -> bool:
     return True
 
 
-def _vllm_ascend_has_dspark_main_loop() -> bool:
+def _source_contains_all(obj: Any, markers: tuple[str, ...]) -> bool:
+    if obj is None:
+        return False
     try:
         import inspect
 
+        source = inspect.getsource(obj)
+    except (OSError, TypeError):
+        return False
+    return all(marker in source for marker in markers)
+
+
+def _vllm_ascend_has_dspark_pr11153_k_query_runtime() -> bool:
+    """Detect the latest PR #11153 DSpark layout in vLLM-Ascend.
+
+    The current PR logic differs from the older fallback in two important ways:
+    DSpark uses K query tokens per request instead of DFlash's K+1, and the
+    vLLM-Ascend proposer samples the anchor position plus K-1 mask positions.
+    """
+
+    try:
+        import vllm_ascend.spec_decode.dflash_proposer as dflash_module
         import vllm_ascend.spec_decode.llm_base_proposer as proposer_module
     except Exception:  # noqa: BLE001
+        return False
+
+    dflash_cls = getattr(dflash_module, "AscendDflashProposer", None)
+    if dflash_cls is None:
+        return False
+
+    has_k_query_proposer = _source_contains_all(
+        getattr(dflash_cls, "_num_query_per_req", None),
+        (
+            "self._is_dspark",
+            "self.num_speculative_tokens",
+            "1 + self.num_speculative_tokens",
+        ),
+    ) and _source_contains_all(
+        getattr(dflash_cls, "set_inputs_first_pass", None),
+        ("_num_query_per_req", "IS_DSPARK"),
+    )
+    if not has_k_query_proposer:
         return False
 
     for candidate in vars(proposer_module).values():
         if not isinstance(candidate, type) or "Proposer" not in candidate.__name__:
             continue
-        for method_name in ("_run_merged_draft", "propose"):
-            method = getattr(candidate, method_name, None)
-            if method is None:
-                continue
-            try:
-                source = inspect.getsource(method)
-            except (OSError, TypeError):
-                continue
-            if "markov_head_type" in source and "markov_head" in source:
-                return True
+        method = getattr(candidate, "_run_merged_draft", None)
+        if _source_contains_all(
+            method,
+            (
+                "markov_head_type",
+                "blk = self.num_speculative_tokens",
+                "markov_head",
+                "draft_token_ids[:, 1:]",
+            ),
+        ):
+            return True
     return False
 
 
 def patch_vllm_dspark_runtime() -> bool:
-    """Install DSpark runtime compatibility hooks for vLLM 0.23/vLLM-Ascend."""
+    """Install DSpark hooks for vLLM-Ascend PR #11153's K-query runtime."""
 
     global _VLLM_DSPARK_RUNTIME_PATCHED
+
+    ascend_has_pr11153_k_query = _vllm_ascend_has_dspark_pr11153_k_query_runtime()
+    if not ascend_has_pr11153_k_query:
+        logger.debug(
+            "vLLM-Ascend DSpark runtime does not match PR #11153's latest K-query "
+            "layout; SpeCo will not install legacy DSpark fallback patches."
+        )
+        return False
 
     patched = bool(_VLLM_DSPARK_RUNTIME_PATCHED)
     patched = _import_vllm_ascend_dspark_patch() or patched
     patched = _patch_vllm_dspark_parallel_token() or patched
     patched = _patch_vllm_dspark_qwen3_heads() or patched
-    patched = _patch_vllm_dspark_compute_logits() or patched
-    patched = _patch_vllm_dspark_sample_hook() or patched
-    patched = (
-        _patch_vllm_dspark_dflash_proposer(
-            "vllm.v1.spec_decode.dflash",
-            "DFlashProposer",
-            expand_sample_indices=True,
-        )
-        or patched
-    )
-    patched = (
-        _patch_vllm_dspark_dflash_proposer(
-            "vllm_ascend.spec_decode.dflash_proposer",
-            "AscendDflashProposer",
-            expand_sample_indices=not _vllm_ascend_has_dspark_main_loop(),
-        )
-        or patched
-    )
     if patched:
         _VLLM_DSPARK_RUNTIME_PATCHED = True
     return patched
