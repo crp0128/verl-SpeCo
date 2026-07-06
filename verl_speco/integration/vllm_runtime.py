@@ -623,6 +623,12 @@ def patch_transformers_attention_layer_type_constants() -> bool:
     return True
 
 
+# Ray imports this module to deserialize SpecoVLLMHttpServer before the normal
+# worker runtime hooks run. Patch transformers before any top-level verl/vLLM
+# imports below can transitively import vLLM.
+patch_transformers_attention_layer_type_constants()
+
+
 def _is_dspark_hf_config(hf_config: Any) -> bool:
     architectures = _get_nested(hf_config, ("architectures",), None) or []
     if isinstance(architectures, str):
