@@ -1,7 +1,7 @@
 set -x
 
-# GPU example for DSpark on vLLM. SPECO maps DSPARK to vLLM's dflash
-# speculative path and installs DSpark compatibility hooks at runtime.
+# GPU example for DSpark on vLLM. SPECO maps DSPARK to vLLM's native
+# dspark speculative method.
 project_name='verl_grpo_example_dspark_drafter'
 exp_name='qwen3_8b_dspark_drafter_vllm_gpu'
 

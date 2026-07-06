@@ -24,6 +24,7 @@ SPECO_VLLM_DRAFT_UPDATE_USE_SHM_ENV = "VERL_SPECO_VLLM_DRAFT_UPDATE_USE_SHM"
 SPECO_VLLM_WORKER_EXTENSION_CLS = "verl_speco.integration.vllm_runtime.SpecoVLLMColocateWorkerExtension"
 SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_ENV = "VERL_SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_SECONDS"
 SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX = "_speco_vllm_spec_decode"
+SPECO_VLLM_DRAFT_DIAG_ENV = "VERL_SPECO_VLLM_DRAFT_DIAG"
 
 _VLLM_REPLICA_PATCHED = False
 _VLLM_DFLASH_CONFIG_ALIASES_PATCHED = False
@@ -385,10 +386,12 @@ def _rollout_config_from_config(config: Any) -> Any:
 
 def _speculative_method_from_drafter(drafter_cfg: dict[str, Any]) -> str:
     algorithm = _drafter_algorithm(drafter_cfg)
+    if algorithm == "DSPARK":
+        return "dflash" if _is_vllm_ascend_runtime_hint() else "dspark"
+
     method_map = {
         "EAGLE3": "eagle3",
         "DFLASH": "dflash",
-        "DSPARK": "dspark",
         "DRAFT": "draft_model",
         "DRAFT_MODEL": "draft_model",
         "MTP": "mtp",
@@ -416,6 +419,7 @@ def build_vllm_speculative_config_from_drafter(
     if not bool(drafter_cfg.get("enable")):
         return {}
 
+    algorithm = _drafter_algorithm(drafter_cfg)
     method = _speculative_method_from_drafter(drafter_cfg)
     spec_model_path = _first_present(
         drafter_cfg.get("checkpoint_path"),
@@ -424,13 +428,13 @@ def build_vllm_speculative_config_from_drafter(
         _get_nested(drafter_cfg, ("model", "path"), None),
         drafter_cfg.get("spec_model_path"),
     )
-    if method in {"eagle", "eagle3", "draft_model", "dflash"} and spec_model_path is None:
+    if method in {"eagle", "eagle3", "draft_model", "dflash", "dspark"} and spec_model_path is None:
         raise ValueError("actor_rollout_ref.rollout.drafter.model_path is required for vLLM speculative decoding")
 
     rollout_drafter_cfg = drafter_cfg.get("rollout") or {}
     if method in ("dflash", "dspark"):
-        if method == "dflash":
-            _validate_vllm_dflash_drafter_config(spec_model_path, algorithm=_drafter_algorithm(drafter_cfg))
+        if method == "dflash" or algorithm == "DSPARK":
+            _validate_vllm_dflash_drafter_config(spec_model_path, algorithm=algorithm)
         num_speculative_tokens = _positive_int_or_none(rollout_drafter_cfg.get("spec_verify_tokens"))
         if num_speculative_tokens is None:
             raise ValueError(
@@ -475,10 +479,9 @@ def build_vllm_speculative_config_from_drafter(
     if _should_force_eager(drafter_cfg):
         speculative_config["enforce_eager"] = True
 
-    # DSpark/DFlash with temperature > 0 needs probabilistic draft sampling
-    # for Gumbel-based rejection (exact-match greedy has very low acceptance).
-    if method in {"dflash", "dspark"} and "draft_sample_method" not in speculative_config:
-        speculative_config["draft_sample_method"] = "probabilistic"
+    # Keep draft sampling greedy by default. This preserves the NPU/vLLM-Ascend
+    # DFlash-family behavior where draft probabilities should not affect
+    # rejection sampling; native GPU DSpark can opt in through overrides.
 
     overrides = vllm_cfg.get("speculative_config_overrides") or {}
     if not isinstance(overrides, dict):
@@ -1609,14 +1612,20 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     """vLLM worker extension that can update only the speculative draft model."""
 
     def __new__(cls, **kwargs):
-        instance = super().__new__(cls, **kwargs)
+        try:
+            instance = super().__new__(cls, **kwargs)
+        except TypeError:
+            instance = super().__new__(cls)
         # vLLM's extension mechanism forbids overriding methods that already
         # exist on Worker (e.g. wake_up). Use __new__ (dunder, skipped by the
-        # conflict check) to install an instance-level wrapper instead — Python
-        # resolves instance attributes before class methods.
-        _orig_wake_up = type(instance).wake_up
-        def _speco_wake_up_hook(tags=None):
-            result = _orig_wake_up(instance, tags)
+        # conflict check) to install an instance-level wrapper instead.
+        # Python resolves instance attributes before class methods.
+        _orig_wake_up = getattr(type(instance), "wake_up", None)
+        if not callable(_orig_wake_up):
+            return instance
+
+        def _speco_wake_up_hook(*args, **kwargs):
+            result = _orig_wake_up(instance, *args, **kwargs)
             reloaded = instance._speco_reload_draft_from_checkpoint()
             if reloaded > 0:
                 logger.warning(
@@ -1936,7 +1945,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
 
     def _speco_diag_draft_state(self, phase: str):
         """Log norms of key draft model parameters for debugging."""
-        import torch
+        if not bool(_bool_or_none(os.getenv(SPECO_VLLM_DRAFT_DIAG_ENV))):
+            return
+
         draft_model, _ = self._speco_resolve_draft_model()
         if draft_model is None:
             logger.warning("[speco-diag:%s] no draft model found", phase)

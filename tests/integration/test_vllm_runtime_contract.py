@@ -10,6 +10,7 @@ import pytest
 from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
     SPECO_VLLM_WORKER_EXTENSION_CLS,
+    SpecoVLLMColocateWorkerExtension,
     _new_vllm_spec_decode_stats,
     _normalize_dflash_target_layer_aliases,
     _record_vllm_spec_decode_scheduler_stats,
@@ -49,6 +50,12 @@ def test_vllm_speculative_config_maps_eagle3_contract() -> None:
     }
 
 
+def test_vllm_worker_extension_constructs_without_wake_up_fallback() -> None:
+    extension = SpecoVLLMColocateWorkerExtension()
+
+    assert isinstance(extension, SpecoVLLMColocateWorkerExtension)
+
+
 def test_vllm_speculative_config_maps_dflash_contract() -> None:
     config = build_vllm_speculative_config_from_drafter(
         _drafter(
@@ -65,7 +72,40 @@ def test_vllm_speculative_config_maps_dflash_contract() -> None:
     }
 
 
-def test_vllm_speculative_config_maps_dspark_to_dflash_contract(tmp_path) -> None:
+def test_vllm_speculative_config_maps_dspark_to_native_gpu_contract(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: False)
+
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        """
+        {
+          "architectures": ["DSparkDraftModel"],
+          "markov_head_type": "vanilla",
+          "target_layer_ids": [1, 9, 17, 25, 33]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    config = build_vllm_speculative_config_from_drafter(
+        _drafter(
+            speculative_algorithm="DSPARK",
+            model_path=str(model_path),
+            rollout={"spec_steps": 3, "spec_verify_tokens": 16},
+        )
+    )
+
+    assert config == {
+        "draft_sample_method": "greedy",
+        "method": "dspark",
+        "model": str(model_path),
+        "num_speculative_tokens": 16,
+    }
+
+
+def test_vllm_speculative_config_maps_dspark_to_dflash_on_npu_contract(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True)
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     (model_path / "config.json").write_text(
@@ -93,6 +133,28 @@ def test_vllm_speculative_config_maps_dspark_to_dflash_contract(tmp_path) -> Non
         "model": str(model_path),
         "num_speculative_tokens": 16,
     }
+
+
+def test_vllm_dspark_gpu_probabilistic_sampling_requires_override(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: False)
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["DSparkDraftModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+
+    config = build_vllm_speculative_config_from_drafter(
+        _drafter(
+            speculative_algorithm="DSPARK",
+            model_path=str(model_path),
+            rollout={"spec_steps": 3, "spec_verify_tokens": 16},
+            vllm={"speculative_config_overrides": {"draft_sample_method": "probabilistic"}},
+        )
+    )
+
+    assert config["method"] == "dspark"
+    assert config["draft_sample_method"] == "probabilistic"
 
 
 def test_vllm_dflash_validator_rejects_dspark_when_algorithm_is_dflash(tmp_path) -> None:
@@ -226,11 +288,12 @@ def test_vllm_runtime_injects_native_config_and_worker_extension(monkeypatch) ->
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
 
 
-def test_vllm_runtime_injects_dspark_as_dflash_and_worker_extension(monkeypatch, tmp_path) -> None:
+def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
         lambda: True,
     )
+    monkeypatch.setattr("verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True)
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     (model_path / "config.json").write_text(
