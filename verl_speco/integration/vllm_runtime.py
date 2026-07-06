@@ -388,7 +388,7 @@ def _speculative_method_from_drafter(drafter_cfg: dict[str, Any]) -> str:
     method_map = {
         "EAGLE3": "eagle3",
         "DFLASH": "dflash",
-        "DSPARK": "dflash",
+        "DSPARK": "dspark",
         "DRAFT": "draft_model",
         "DRAFT_MODEL": "draft_model",
         "MTP": "mtp",
@@ -428,13 +428,14 @@ def build_vllm_speculative_config_from_drafter(
         raise ValueError("actor_rollout_ref.rollout.drafter.model_path is required for vLLM speculative decoding")
 
     rollout_drafter_cfg = drafter_cfg.get("rollout") or {}
-    if method == "dflash":
-        _validate_vllm_dflash_drafter_config(spec_model_path, algorithm=_drafter_algorithm(drafter_cfg))
+    if method in ("dflash", "dspark"):
+        if method == "dflash":
+            _validate_vllm_dflash_drafter_config(spec_model_path, algorithm=_drafter_algorithm(drafter_cfg))
         num_speculative_tokens = _positive_int_or_none(rollout_drafter_cfg.get("spec_verify_tokens"))
         if num_speculative_tokens is None:
             raise ValueError(
                 "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens "
-                "must be positive for vLLM DFlash speculative decoding"
+                f"must be positive for vLLM {method.upper()} speculative decoding"
             )
     else:
         num_speculative_tokens = _positive_int_or_none(
@@ -473,6 +474,11 @@ def build_vllm_speculative_config_from_drafter(
 
     if _should_force_eager(drafter_cfg):
         speculative_config["enforce_eager"] = True
+
+    # DSpark/DFlash with temperature > 0 needs probabilistic draft sampling
+    # for Gumbel-based rejection (exact-match greedy has very low acceptance).
+    if method in {"dflash", "dspark"} and "draft_sample_method" not in speculative_config:
+        speculative_config["draft_sample_method"] = "probabilistic"
 
     overrides = vllm_cfg.get("speculative_config_overrides") or {}
     if not isinstance(overrides, dict):
@@ -1602,6 +1608,25 @@ except Exception:  # noqa: BLE001
 class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     """vLLM worker extension that can update only the speculative draft model."""
 
+    def __new__(cls, **kwargs):
+        instance = super().__new__(cls, **kwargs)
+        # vLLM's extension mechanism forbids overriding methods that already
+        # exist on Worker (e.g. wake_up). Use __new__ (dunder, skipped by the
+        # conflict check) to install an instance-level wrapper instead — Python
+        # resolves instance attributes before class methods.
+        _orig_wake_up = type(instance).wake_up
+        def _speco_wake_up_hook(tags=None):
+            result = _orig_wake_up(instance, tags)
+            reloaded = instance._speco_reload_draft_from_checkpoint()
+            if reloaded > 0:
+                logger.warning(
+                    "[speco draft wake_up] drafter weights restored after wake_up (%d tensors)",
+                    reloaded,
+                )
+            return result
+        instance.wake_up = _speco_wake_up_hook
+        return instance
+
     def _get_speco_draft_zmq_handle(self) -> str:
         get_base = getattr(self, "_get_zmq_handle", None)
         if callable(get_base):
@@ -1649,7 +1674,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         return method
 
     def _speco_is_dflash_draft(self) -> bool:
-        return self._speco_draft_method() == "dflash"
+        return self._speco_draft_method() in ("dflash", "dspark")
 
     def _speco_update_draft_weights(self, weights: list[tuple[str, Any]]) -> int:
         draft_model, proposer = self._speco_resolve_draft_model()
@@ -1753,14 +1778,15 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
 
         draft_method = self._speco_draft_method()
         is_dflash = draft_method == "dflash"
+        is_dspark = draft_method == "dspark"
         is_eagle3 = draft_method == "eagle3"
 
-        # Translate training-side names.  DFlash publishes into the inner
-        # DFlashQwen3Model, while EAGLE3 publishes into the outer vLLM
-        # Eagle3LlamaForCausalLM because lm_head.weight lives outside
+        # Translate training-side names.  DFlash/DSpark publish into the inner
+        # DFlashQwen3Model/Qwen3DSparkModel, while EAGLE3 publishes into the
+        # outer Eagle3LlamaForCausalLM because lm_head.weight lives outside
         # ``draft_model.model`` in vLLM.
         _strip_prefixes = ("module.", "_orig_mod.", "draft_model.", "model.draft_model.")
-        if is_dflash:
+        if is_dflash or is_dspark:
             _strip_prefixes = (*_strip_prefixes, "model.")
         _alias_map = (
             ("context_proj.", "fc."),
@@ -1778,10 +1804,10 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                         n = n[len(pfx):]
                         changed = True
             if "midlayer." in n:
-                n = n.replace("midlayer.", "layers.0." if is_dflash else "model.layers.0.")
+                n = n.replace("midlayer.", "layers.0.")
             if is_eagle3 and n != "lm_head.weight" and "." in n and not n.startswith("model."):
                 n = f"model.{n}"
-            if is_dflash:
+            if is_dflash or is_dspark:
                 for src, dst in _alias_map:
                     if src in n:
                         n = n.replace(src, dst)
@@ -1794,6 +1820,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             inner_model = getattr(draft_model, "model", None)
             if inner_model is None:
                 return {"loaded_params": 0, "has_draft_model": True}
+            logger.warning("[speco draft ipc] loading %d translated weights into %s (method=%s), first 5 keys: %s",
+                          len(translated_weights), type(inner_model).__name__, draft_method,
+                          [n for n, _ in translated_weights[:5]])
             inner_model.load_weights(iter(translated_weights))
 
             # Rebuild fused KV buffers (torch.cat snapshot, not a view)
@@ -1802,6 +1831,20 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             except Exception as exc:
                 logger.warning("[speco draft update] _build_fused_kv_buffers failed: %s", exc)
 
+        self._speco_diag_draft_state("after_draft_ipc_update")
+        # One-time diagnostic: check whether probabilistic sampling is active
+        proposer = self._speco_resolve_draft_proposer()
+        if proposer is not None and not getattr(self, "_speco_logged_sampling_mode", False):
+            self._speco_logged_sampling_mode = True
+            draft_logits = getattr(proposer, "draft_logits", "MISSING")
+            spec_cfg = getattr(getattr(getattr(self, "model_runner", None), "vllm_config", None), "speculative_config", None)
+            dsm = getattr(spec_cfg, "draft_sample_method", "UNKNOWN") if spec_cfg else "NO_SPEC_CFG"
+            logger.warning(
+                "[speco-diag:sampling_mode] draft_sample_method=%s draft_logits=%s proposer=%s",
+                dsm,
+                "None(greedy)" if draft_logits is None else f"tensor{tuple(draft_logits.shape)}",
+                type(proposer).__name__,
+            )
         return {"loaded_params": loaded_params, "has_draft_model": True}
 
     # ----------------------------------------------------------------
@@ -1877,10 +1920,33 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Override target weight sync to also reload drafter from checkpoint."""
         patch_verl_bucketed_weight_transfer_rebuild_ipc()
+        # Diagnostic: check draft state BEFORE target sync
+        self._speco_diag_draft_state("before_target_sync")
         result = super().update_weights_from_ipc(
             peft_config=peft_config, base_sync_done=base_sync_done, use_shm=use_shm
         )
+        # Diagnostic: check draft state AFTER target sync (may be zeroed by wake_up)
+        self._speco_diag_draft_state("after_target_sync")
         reloaded = self._speco_reload_draft_from_checkpoint()
         if reloaded > 0:
             logger.warning("[speco draft reload] drafter weights restored after target sync (%d tensors)", reloaded)
+        # Diagnostic: check draft state AFTER reload
+        self._speco_diag_draft_state("after_draft_reload")
         return result
+
+    def _speco_diag_draft_state(self, phase: str):
+        """Log norms of key draft model parameters for debugging."""
+        import torch
+        draft_model, _ = self._speco_resolve_draft_model()
+        if draft_model is None:
+            logger.warning("[speco-diag:%s] no draft model found", phase)
+            return
+        try:
+            params = dict(draft_model.named_parameters())
+            diag_keys = [k for k in params if any(s in k for s in ("markov", "fc.", "norm.", "layers.0."))]
+            if not diag_keys:
+                diag_keys = list(params.keys())[:5]
+            norms = {k: f"{params[k].data.float().norm().item():.4f}" for k in diag_keys[:6]}
+            logger.warning("[speco-diag:%s] draft param norms: %s", phase, norms)
+        except Exception as exc:
+            logger.warning("[speco-diag:%s] failed: %s", phase, exc)
