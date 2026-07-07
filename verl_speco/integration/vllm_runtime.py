@@ -24,9 +24,21 @@ SPECO_VLLM_DRAFT_UPDATE_USE_SHM_ENV = "VERL_SPECO_VLLM_DRAFT_UPDATE_USE_SHM"
 SPECO_VLLM_WORKER_EXTENSION_CLS = "verl_speco.integration.vllm_runtime.SpecoVLLMColocateWorkerExtension"
 SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_ENV = "VERL_SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_SECONDS"
 SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX = "_speco_vllm_spec_decode"
+SPECO_VLLM_DRAFT_DIAG_ENV = "VERL_SPECO_VLLM_DRAFT_DIAG"
 
 _VLLM_REPLICA_PATCHED = False
 _VLLM_DFLASH_CONFIG_ALIASES_PATCHED = False
+_VLLM_DSPARK_RUNTIME_PATCHED = False
+_VLLM_DSPARK_REGISTRY_ALIAS_PATCHED = False
+
+_DSPARK_VLLM_ARCHITECTURES = {"DSparkDraftModel", "Qwen3DSparkModel", "DeepSeekDSparkModel"}
+_TRANSFORMERS_ATTENTION_LAYER_TYPES_FALLBACK = (
+    "attention",
+    "full_attention",
+    "sliding_attention",
+    "chunked_attention",
+    "linear_attention",
+)
 
 
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
@@ -82,6 +94,17 @@ def _set_child(container: Any, key: str, value: Any) -> None:
             setattr(container, key, value)
 
 
+def _has_config_field(config: Any, key: str) -> bool:
+    if config is None:
+        return False
+    if hasattr(config, "get"):
+        try:
+            return key in config
+        except TypeError:
+            return config.get(key, None) is not None
+    return hasattr(config, key)
+
+
 def _ensure_child_mapping(container: Any, key: str) -> Any:
     child = _get_nested(container, (key,), None)
     if child is None:
@@ -129,6 +152,20 @@ def _bool_or_none(value: Any) -> bool | None:
         if normalized in {"0", "false", "off", "no", "n", ""}:
             return False
     return bool(value)
+
+
+def _describe_vllm_draft_logits(draft_logits: Any, *, missing: bool = False) -> str:
+    if missing:
+        return "missing"
+    if draft_logits is None:
+        return "None(greedy)"
+    shape = getattr(draft_logits, "shape", None)
+    if shape is not None:
+        try:
+            return f"tensor{tuple(shape)}"
+        except TypeError:
+            return f"shape={shape}"
+    return type(draft_logits).__name__
 
 
 def _resolve_torch_rebuild_func(func: Any):
@@ -181,17 +218,29 @@ def _int_list_or_none(value: Any, field_name: str) -> list[int] | None:
     if value is None:
         return None
     if isinstance(value, (str, bytes)) or isinstance(value, dict):
-        raise TypeError(f"DFlash {field_name} must be a list of integers")
+        raise TypeError(f"{field_name} must be a list of integers")
     try:
         return [int(item) for item in value]
     except TypeError as exc:
-        raise TypeError(f"DFlash {field_name} must be a list of integers") from exc
+        raise TypeError(f"{field_name} must be a list of integers") from exc
     except ValueError as exc:
-        raise ValueError(f"DFlash {field_name} must contain only integers") from exc
+        raise ValueError(f"{field_name} must contain only integers") from exc
+
+
+def _is_dspark_config(config: Any) -> bool:
+    architectures = _get_nested(config, ("architectures",), None) or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    architecture_names = {str(name) for name in architectures}
+    return bool(
+        _has_config_field(config, "markov_head_type")
+        or _has_config_field(config, "dspark_config")
+        or architecture_names.intersection(_DSPARK_VLLM_ARCHITECTURES)
+    )
 
 
 def _normalize_dflash_target_layer_aliases(config: Any) -> bool:
-    """Mirror existing DFlash target layer ids into vLLM 0.23 alias fields."""
+    """Mirror DFlash/DSpark target layer ids into vLLM 0.23 alias fields."""
 
     target_layer_ids = _int_list_or_none(
         _get_nested(config, ("target_layer_ids",), None),
@@ -204,14 +253,43 @@ def _normalize_dflash_target_layer_aliases(config: Any) -> bool:
         _get_nested(dflash_config, ("target_layer_ids",), None),
         "dflash_config.target_layer_ids",
     )
+    dspark_config = _get_nested(config, ("dspark_config",), None)
+    if dspark_config is not None and not hasattr(dspark_config, "get"):
+        raise TypeError("DSpark dspark_config must be a mapping when provided")
+    dspark_target_layer_ids = _int_list_or_none(
+        _get_nested(dspark_config, ("target_layer_ids",), None),
+        "dspark_config.target_layer_ids",
+    )
 
-    if target_layer_ids is not None and nested_target_layer_ids is not None and target_layer_ids != nested_target_layer_ids:
+    if (
+        target_layer_ids is not None
+        and nested_target_layer_ids is not None
+        and target_layer_ids != nested_target_layer_ids
+    ):
         raise ValueError(
             "DFlash target_layer_ids conflict with dflash_config.target_layer_ids: "
             f"{target_layer_ids} != {nested_target_layer_ids}"
         )
+    if (
+        target_layer_ids is not None
+        and dspark_target_layer_ids is not None
+        and target_layer_ids != dspark_target_layer_ids
+    ):
+        raise ValueError(
+            "DSpark target_layer_ids conflict with dspark_config.target_layer_ids: "
+            f"{target_layer_ids} != {dspark_target_layer_ids}"
+        )
+    if (
+        nested_target_layer_ids is not None
+        and dspark_target_layer_ids is not None
+        and nested_target_layer_ids != dspark_target_layer_ids
+    ):
+        raise ValueError(
+            "DSpark dflash_config.target_layer_ids conflict with dspark_config.target_layer_ids: "
+            f"{nested_target_layer_ids} != {dspark_target_layer_ids}"
+        )
 
-    selected_layer_ids = target_layer_ids if target_layer_ids is not None else nested_target_layer_ids
+    selected_layer_ids = _first_present(target_layer_ids, nested_target_layer_ids, dspark_target_layer_ids)
     if selected_layer_ids is None:
         return False
 
@@ -222,6 +300,13 @@ def _normalize_dflash_target_layer_aliases(config: Any) -> bool:
         changed = True
     if nested_target_layer_ids is None:
         _set_child(dflash_config, "target_layer_ids", selected_layer_ids)
+        changed = True
+    if (
+        _is_dspark_config(config)
+        and _get_nested(dflash_config, ("mask_token_id",), None) is None
+        and _get_nested(config, ("mask_token_id",), None) is not None
+    ):
+        _set_child(dflash_config, "mask_token_id", _get_nested(config, ("mask_token_id",), None))
         changed = True
 
     expected_aux_layer_ids = [layer_id + 1 for layer_id in selected_layer_ids]
@@ -241,7 +326,11 @@ def _normalize_dflash_target_layer_aliases(config: Any) -> bool:
     return changed
 
 
-def _validate_vllm_dflash_drafter_config(spec_model_path: Any) -> None:
+def _drafter_algorithm(drafter_cfg: dict[str, Any]) -> str:
+    return str(drafter_cfg.get("speculative_algorithm", "EAGLE3") or "EAGLE3").strip().upper()
+
+
+def _validate_vllm_dflash_drafter_config(spec_model_path: Any, algorithm: str = "DFLASH") -> None:
     if not spec_model_path:
         return
 
@@ -256,6 +345,17 @@ def _validate_vllm_dflash_drafter_config(spec_model_path: Any) -> None:
         raise ValueError(f"Invalid DFlash drafter config.json at {config_path}: {exc}") from exc
 
     architectures = config.get("architectures") or []
+    algorithm = str(algorithm or "DFLASH").strip().upper()
+    if algorithm == "DSPARK":
+        if not _is_dspark_config(config):
+            raise ValueError(
+                "vLLM DSpark uses the DFlash speculative path, but requires "
+                "actor_rollout_ref.rollout.drafter.model_path to point to a DSpark drafter "
+                "checkpoint with markov_head_type or a DSpark architecture in config.json; "
+                f"got architectures={architectures!r} from {config_path}."
+            )
+        return
+
     if architectures and "DFlashDraftModel" not in architectures:
         raise ValueError(
             "vLLM DFlash requires actor_rollout_ref.rollout.drafter.model_path "
@@ -299,7 +399,10 @@ def _rollout_config_from_config(config: Any) -> Any:
 
 
 def _speculative_method_from_drafter(drafter_cfg: dict[str, Any]) -> str:
-    algorithm = str(drafter_cfg.get("speculative_algorithm", "EAGLE3") or "EAGLE3").strip().upper()
+    algorithm = _drafter_algorithm(drafter_cfg)
+    if algorithm == "DSPARK":
+        return "dflash" if _is_vllm_ascend_runtime_hint() else "dspark"
+
     method_map = {
         "EAGLE3": "eagle3",
         "DFLASH": "dflash",
@@ -330,6 +433,7 @@ def build_vllm_speculative_config_from_drafter(
     if not bool(drafter_cfg.get("enable")):
         return {}
 
+    algorithm = _drafter_algorithm(drafter_cfg)
     method = _speculative_method_from_drafter(drafter_cfg)
     spec_model_path = _first_present(
         drafter_cfg.get("checkpoint_path"),
@@ -338,17 +442,18 @@ def build_vllm_speculative_config_from_drafter(
         _get_nested(drafter_cfg, ("model", "path"), None),
         drafter_cfg.get("spec_model_path"),
     )
-    if method in {"eagle", "eagle3", "draft_model", "dflash"} and spec_model_path is None:
+    if method in {"eagle", "eagle3", "draft_model", "dflash", "dspark"} and spec_model_path is None:
         raise ValueError("actor_rollout_ref.rollout.drafter.model_path is required for vLLM speculative decoding")
 
     rollout_drafter_cfg = drafter_cfg.get("rollout") or {}
-    if method == "dflash":
-        _validate_vllm_dflash_drafter_config(spec_model_path)
+    if method in ("dflash", "dspark"):
+        if method == "dflash" or algorithm == "DSPARK":
+            _validate_vllm_dflash_drafter_config(spec_model_path, algorithm=algorithm)
         num_speculative_tokens = _positive_int_or_none(rollout_drafter_cfg.get("spec_verify_tokens"))
         if num_speculative_tokens is None:
             raise ValueError(
                 "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens "
-                "must be positive for vLLM DFlash speculative decoding"
+                f"must be positive for vLLM {method.upper()} speculative decoding"
             )
     else:
         num_speculative_tokens = _positive_int_or_none(
@@ -368,6 +473,7 @@ def build_vllm_speculative_config_from_drafter(
     speculative_config: dict[str, Any] = {
         "method": method,
         "num_speculative_tokens": num_speculative_tokens,
+        "draft_sample_method": "greedy",
     }
     if spec_model_path is not None:
         speculative_config["model"] = spec_model_path
@@ -386,6 +492,10 @@ def build_vllm_speculative_config_from_drafter(
 
     if _should_force_eager(drafter_cfg):
         speculative_config["enforce_eager"] = True
+
+    # Keep draft sampling greedy by default. This preserves the NPU/vLLM-Ascend
+    # DFlash-family behavior where draft probabilities should not affect
+    # rejection sampling; native GPU DSpark can opt in through overrides.
 
     overrides = vllm_cfg.get("speculative_config_overrides") or {}
     if not isinstance(overrides, dict):
@@ -477,6 +587,7 @@ def _is_vllm_ascend_runtime_hint() -> bool:
 
 
 def _maybe_apply_vllm_ascend_global_patch() -> bool:
+    patch_transformers_attention_layer_type_constants()
     if not _is_vllm_ascend_runtime_hint():
         return False
     try:
@@ -491,6 +602,332 @@ def _maybe_apply_vllm_ascend_global_patch() -> bool:
         logger.debug("Unable to apply vLLM-Ascend global patch hook: %s", exc)
         return False
     return True
+
+
+def patch_transformers_attention_layer_type_constants() -> bool:
+    """Provide the attention layer type aliases expected by mixed vLLM builds."""
+
+    try:
+        from transformers import configuration_utils
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install transformers attention layer type compat: %s", exc)
+        return False
+
+    has_v5_name = hasattr(configuration_utils, "ALLOWED_ATTENTION_LAYER_TYPES")
+    has_v4_name = hasattr(configuration_utils, "ALLOWED_LAYER_TYPES")
+    if has_v5_name and has_v4_name:
+        return False
+
+    existing = None
+    if has_v5_name:
+        existing = getattr(configuration_utils, "ALLOWED_ATTENTION_LAYER_TYPES", None)
+    elif has_v4_name:
+        existing = getattr(configuration_utils, "ALLOWED_LAYER_TYPES", None)
+
+    try:
+        allowed_layer_types = tuple(existing) if existing is not None else _TRANSFORMERS_ATTENTION_LAYER_TYPES_FALLBACK
+    except TypeError:
+        allowed_layer_types = _TRANSFORMERS_ATTENTION_LAYER_TYPES_FALLBACK
+    if not allowed_layer_types:
+        allowed_layer_types = _TRANSFORMERS_ATTENTION_LAYER_TYPES_FALLBACK
+
+    patched_names = []
+    if not has_v5_name:
+        configuration_utils.ALLOWED_ATTENTION_LAYER_TYPES = allowed_layer_types
+        patched_names.append("ALLOWED_ATTENTION_LAYER_TYPES")
+    if not has_v4_name:
+        configuration_utils.ALLOWED_LAYER_TYPES = allowed_layer_types
+        patched_names.append("ALLOWED_LAYER_TYPES")
+
+    logger.warning(
+        "[speco vllm compat] patched transformers.configuration_utils missing %s for vLLM import",
+        ", ".join(patched_names),
+    )
+    return True
+
+
+# Ray imports this module to deserialize SpecoVLLMHttpServer before the normal
+# worker runtime hooks run. Patch transformers before any top-level verl/vLLM
+# imports below can transitively import vLLM.
+patch_transformers_attention_layer_type_constants()
+
+
+def _is_dspark_hf_config(hf_config: Any) -> bool:
+    architectures = _get_nested(hf_config, ("architectures",), None) or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    architecture_names = {str(name).replace("DFlash", "", 1) for name in architectures}
+    return bool(
+        _has_config_field(hf_config, "markov_head_type")
+        or _has_config_field(hf_config, "dspark_config")
+        or architecture_names.intersection(_DSPARK_VLLM_ARCHITECTURES)
+    )
+
+
+def _ensure_dspark_dflash_aliases(hf_config: Any) -> bool:
+    """Make DSpark HF config consumable by vLLM's DFlash draft model."""
+
+    if not _is_dspark_hf_config(hf_config):
+        return False
+
+    target_layer_ids = _int_list_or_none(
+        _first_present(
+            _get_nested(hf_config, ("target_layer_ids",), None),
+            _get_nested(hf_config, ("dflash_config", "target_layer_ids"), None),
+            _get_nested(hf_config, ("dspark_config", "target_layer_ids"), None),
+        ),
+        "DSpark target_layer_ids",
+    )
+    if target_layer_ids is None:
+        return False
+
+    changed = False
+    dflash_config = _get_nested(hf_config, ("dflash_config",), None)
+    if dflash_config is None:
+        dflash_config = {}
+        _set_child(hf_config, "dflash_config", dflash_config)
+        changed = True
+    if _get_nested(dflash_config, ("target_layer_ids",), None) is None:
+        _set_child(dflash_config, "target_layer_ids", target_layer_ids)
+        changed = True
+    if _get_nested(dflash_config, ("mask_token_id",), None) is None:
+        mask_token_id = _get_nested(hf_config, ("mask_token_id",), None)
+        if mask_token_id is not None:
+            _set_child(dflash_config, "mask_token_id", mask_token_id)
+            changed = True
+
+    if _get_nested(hf_config, ("eagle_aux_hidden_state_layer_ids",), None) is None:
+        _set_child(hf_config, "eagle_aux_hidden_state_layer_ids", [layer_id + 1 for layer_id in target_layer_ids])
+        changed = True
+    return changed
+
+
+def _dspark_hf_config_from_vllm_config(vllm_config: Any) -> Any:
+    spec_cfg = getattr(vllm_config, "speculative_config", None)
+    draft_model_cfg = getattr(spec_cfg, "draft_model_config", None) if spec_cfg is not None else None
+    return getattr(draft_model_cfg, "hf_config", None)
+
+
+def _dspark_hf_config_from_proposer(proposer: Any) -> Any:
+    draft_model_cfg = getattr(proposer, "draft_model_config", None)
+    if draft_model_cfg is not None:
+        hf_config = getattr(draft_model_cfg, "hf_config", None)
+        if hf_config is not None:
+            return hf_config
+    spec_cfg = getattr(proposer, "speculative_config", None)
+    draft_model_cfg = getattr(spec_cfg, "draft_model_config", None) if spec_cfg is not None else None
+    return getattr(draft_model_cfg, "hf_config", None)
+
+
+def _patch_vllm_dspark_parallel_token() -> bool:
+    try:
+        from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install vLLM DSpark parallel-token patch: %s", exc)
+        return False
+
+    current = getattr(SpecDecodeBaseProposer, "_init_parallel_drafting_params", None)
+    if not callable(current):
+        return False
+    if getattr(current, "_speco_dspark_parallel_token", False):
+        return True
+
+    def patched_init_parallel_drafting_params(self):
+        model_hf_config = self.draft_model_config.hf_config
+        if _is_dspark_hf_config(model_hf_config):
+            _ensure_dspark_dflash_aliases(model_hf_config)
+            mask_token_id = _get_nested(model_hf_config, ("mask_token_id",), None)
+            if mask_token_id is not None:
+                self.parallel_drafting_token_id = int(mask_token_id)
+                return
+        current(self)
+
+    patched_init_parallel_drafting_params._speco_dspark_parallel_token = True
+    patched_init_parallel_drafting_params._speco_original_init_parallel_drafting_params = current
+    SpecDecodeBaseProposer._init_parallel_drafting_params = patched_init_parallel_drafting_params
+    return True
+
+
+def _patch_vllm_dspark_qwen3_heads() -> bool:
+    try:
+        import torch
+        from torch import nn
+        from vllm.model_executor.layers.linear import ReplicatedLinear
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+        from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
+        from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install vLLM DSpark Qwen3 head patch: %s", exc)
+        return False
+
+    class DSparkConfidenceHead(nn.Module):
+        def __init__(self, vllm_config: Any, prefix: str) -> None:
+            super().__init__()
+            config = vllm_config.model_config.hf_config
+            rank = int(getattr(config, "markov_rank", getattr(config, "dspark_markov_rank", 256)))
+            self.proj = ReplicatedLinear(
+                config.hidden_size + rank,
+                1,
+                bias=True,
+                params_dtype=torch.float32,
+                quant_config=None,
+                prefix=f"{prefix}.proj",
+            )
+
+        def forward(self, hidden_states: Any, markov_embeds: Any) -> Any:
+            x = torch.cat([hidden_states, markov_embeds], dim=-1)
+            confidence, _ = self.proj(x.float())
+            return confidence.squeeze(-1)
+
+    class DSparkMarkovHead(nn.Module):
+        def __init__(self, vllm_config: Any, prefix: str) -> None:
+            super().__init__()
+            config = vllm_config.model_config.hf_config
+            rank = int(getattr(config, "markov_rank", getattr(config, "dspark_markov_rank", 256)))
+            self.markov_w1 = VocabParallelEmbedding(
+                config.vocab_size,
+                rank,
+                prefix=f"{prefix}.markov_w1",
+            )
+            self.markov_w2 = ParallelLMHead(
+                config.vocab_size,
+                rank,
+                params_dtype=torch.float32,
+                org_num_embeddings=config.vocab_size,
+                prefix=f"{prefix}.markov_w2",
+            )
+            self.logits_processor = LogitsProcessor(config.vocab_size)
+
+        def forward(self, token_ids: Any) -> tuple[Any, Any]:
+            embeds = self.markov_w1(token_ids)
+            logits = self.logits_processor(
+                self.markov_w2,
+                embeds.view(-1, embeds.shape[-1]).float(),
+            )
+            return logits.view(*embeds.shape[:-1], -1), embeds
+
+    current = getattr(DFlashQwen3Model, "__init__", None)
+    if not callable(current):
+        return False
+    if getattr(current, "_speco_dspark_qwen3_heads", False):
+        return True
+
+    def patched_dflash_qwen3_init(self, *args, **kwargs):
+        vllm_config = kwargs.get("vllm_config")
+        if vllm_config is None and args:
+            vllm_config = args[0]
+        prefix = kwargs.get("prefix", "")
+        hf_config = _dspark_hf_config_from_vllm_config(vllm_config)
+        is_dspark = _is_dspark_hf_config(hf_config)
+        if is_dspark:
+            _ensure_dspark_dflash_aliases(hf_config)
+
+        current(self, *args, **kwargs)
+
+        if is_dspark:
+            if not hasattr(self, "markov_head"):
+                self.markov_head = DSparkMarkovHead(vllm_config, prefix=f"{prefix}.markov_head")
+            if not hasattr(self, "confidence_head"):
+                self.confidence_head = DSparkConfidenceHead(vllm_config, prefix=f"{prefix}.confidence_head")
+
+    patched_dflash_qwen3_init._speco_dspark_qwen3_heads = True
+    patched_dflash_qwen3_init._speco_original_dflash_qwen3_init = current
+    DFlashQwen3Model.__init__ = patched_dflash_qwen3_init
+    return True
+
+
+def _import_vllm_ascend_dspark_patch() -> bool:
+    try:
+        import importlib
+
+        importlib.import_module("vllm_ascend.patch.platform.patch_dspark_proposer")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to import vLLM-Ascend DSpark platform patch: %s", exc)
+        return False
+    return True
+
+
+def _source_contains_all(obj: Any, markers: tuple[str, ...]) -> bool:
+    if obj is None:
+        return False
+    try:
+        import inspect
+
+        source = inspect.getsource(obj)
+    except (OSError, TypeError):
+        return False
+    return all(marker in source for marker in markers)
+
+
+def _vllm_ascend_has_dspark_pr11153_k_query_runtime() -> bool:
+    """Detect the latest PR #11153 DSpark layout in vLLM-Ascend.
+
+    The current PR logic differs from the older fallback in two important ways:
+    DSpark uses K query tokens per request instead of DFlash's K+1, and the
+    vLLM-Ascend proposer samples the anchor position plus K-1 mask positions.
+    """
+
+    try:
+        import vllm_ascend.spec_decode.dflash_proposer as dflash_module
+        import vllm_ascend.spec_decode.llm_base_proposer as proposer_module
+    except Exception:  # noqa: BLE001
+        return False
+
+    dflash_cls = getattr(dflash_module, "AscendDflashProposer", None)
+    if dflash_cls is None:
+        return False
+
+    has_k_query_proposer = _source_contains_all(
+        getattr(dflash_cls, "_num_query_per_req", None),
+        (
+            "self._is_dspark",
+            "self.num_speculative_tokens",
+            "1 + self.num_speculative_tokens",
+        ),
+    ) and _source_contains_all(
+        getattr(dflash_cls, "set_inputs_first_pass", None),
+        ("_num_query_per_req", "IS_DSPARK"),
+    )
+    if not has_k_query_proposer:
+        return False
+
+    for candidate in vars(proposer_module).values():
+        if not isinstance(candidate, type) or "Proposer" not in candidate.__name__:
+            continue
+        method = getattr(candidate, "_run_merged_draft", None)
+        if _source_contains_all(
+            method,
+            (
+                "markov_head_type",
+                "blk = self.num_speculative_tokens",
+                "markov_head",
+                "draft_token_ids[:, 1:]",
+            ),
+        ):
+            return True
+    return False
+
+
+def patch_vllm_dspark_runtime() -> bool:
+    """Install DSpark hooks for vLLM-Ascend PR #11153's K-query runtime."""
+
+    global _VLLM_DSPARK_RUNTIME_PATCHED
+
+    ascend_has_pr11153_k_query = _vllm_ascend_has_dspark_pr11153_k_query_runtime()
+    if not ascend_has_pr11153_k_query:
+        logger.debug(
+            "vLLM-Ascend DSpark runtime does not match PR #11153's latest K-query "
+            "layout; SpeCo will not install legacy DSpark fallback patches."
+        )
+        return False
+
+    patched = bool(_VLLM_DSPARK_RUNTIME_PATCHED)
+    patched = _import_vllm_ascend_dspark_patch() or patched
+    patched = _patch_vllm_dspark_parallel_token() or patched
+    patched = _patch_vllm_dspark_qwen3_heads() or patched
+    if patched:
+        _VLLM_DSPARK_RUNTIME_PATCHED = True
+    return patched
 
 
 def _record_vllm_spec_decode_acceptance(
@@ -610,6 +1047,8 @@ def patch_vllm_dflash_config_aliases() -> bool:
         current(self, *args, **kwargs)
         if str(method or "eagle").strip().lower() == "dflash":
             _normalize_dflash_target_layer_aliases(self)
+            if _is_dspark_hf_config(self):
+                _set_child(self, "architectures", ["DFlashDraftModel"])
 
     patched_eagle_config_init._speco_dflash_config_aliases = True
     patched_eagle_config_init._speco_original_eagle_config_init = current
@@ -618,9 +1057,39 @@ def patch_vllm_dflash_config_aliases() -> bool:
     return True
 
 
+def patch_vllm_dspark_registry_aliases() -> bool:
+    """Let vLLM resolve DSpark draft architectures through the DFlash model."""
+
+    global _VLLM_DSPARK_REGISTRY_ALIAS_PATCHED
+    if _VLLM_DSPARK_REGISTRY_ALIAS_PATCHED:
+        return True
+    try:
+        from vllm.model_executor.models import registry
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install vLLM DSpark registry aliases: %s", exc)
+        return False
+
+    model_registry = getattr(registry, "ModelRegistry", None)
+    register_model = getattr(model_registry, "register_model", None)
+    if not callable(register_model):
+        return False
+
+    existing_models = getattr(model_registry, "models", {})
+    for architecture in sorted(_DSPARK_VLLM_ARCHITECTURES | {"DFlashDSparkDraftModel", "DFlashQwen3DSparkModel"}):
+        if architecture not in existing_models:
+            register_model(
+                architecture,
+                "vllm.model_executor.models.qwen3_dflash:DFlashQwen3ForCausalLM",
+            )
+    _VLLM_DSPARK_REGISTRY_ALIAS_PATCHED = True
+    return True
+
+
 def _speco_vllm_run_engine_core_with_acceptance_logging(*args, **kwargs):
     _maybe_apply_vllm_ascend_global_patch()
     patch_vllm_dflash_config_aliases()
+    patch_vllm_dspark_registry_aliases()
+    patch_vllm_dspark_runtime()
     patch_vllm_spec_decode_acceptance_logging()
     patch_vllm_worker_proc_entrypoint()
 
@@ -656,6 +1125,8 @@ def patch_vllm_engine_core_entrypoint() -> bool:
 def _speco_vllm_worker_main_with_runtime_observability(*args, **kwargs):
     _maybe_apply_vllm_ascend_global_patch()
     patch_vllm_dflash_config_aliases()
+    patch_vllm_dspark_registry_aliases()
+    patch_vllm_dspark_runtime()
     patch_vllm_spec_decode_acceptance_logging()
 
     original = getattr(_speco_vllm_worker_main_with_runtime_observability, "_speco_original_worker_main", None)
@@ -706,9 +1177,17 @@ def install_vllm_runtime_observability() -> bool:
 
     _maybe_apply_vllm_ascend_global_patch()
     dflash_config_patched = patch_vllm_dflash_config_aliases()
+    dspark_registry_patched = patch_vllm_dspark_registry_aliases()
+    dspark_runtime_patched = patch_vllm_dspark_runtime()
     acceptance_patched = install_vllm_spec_decode_acceptance_logging()
     worker_proc_patched = patch_vllm_worker_proc_entrypoint()
-    return dflash_config_patched or acceptance_patched or worker_proc_patched
+    return (
+        dflash_config_patched
+        or dspark_registry_patched
+        or dspark_runtime_patched
+        or acceptance_patched
+        or worker_proc_patched
+    )
 
 
 def _new_vllm_spec_decode_stats() -> dict[str, float]:
@@ -1146,6 +1625,31 @@ except Exception:  # noqa: BLE001
 class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     """vLLM worker extension that can update only the speculative draft model."""
 
+    def __new__(cls, **kwargs):
+        try:
+            instance = super().__new__(cls, **kwargs)
+        except TypeError:
+            instance = super().__new__(cls)
+        # vLLM's extension mechanism forbids overriding methods that already
+        # exist on Worker (e.g. wake_up). Use __new__ (dunder, skipped by the
+        # conflict check) to install an instance-level wrapper instead.
+        # Python resolves instance attributes before class methods.
+        _orig_wake_up = getattr(type(instance), "wake_up", None)
+        if not callable(_orig_wake_up):
+            return instance
+
+        def _speco_wake_up_hook(*args, **kwargs):
+            result = _orig_wake_up(instance, *args, **kwargs)
+            reloaded = instance._speco_reload_draft_from_checkpoint()
+            if reloaded > 0:
+                logger.warning(
+                    "[speco draft wake_up] drafter weights restored after wake_up (%d tensors)",
+                    reloaded,
+                )
+            return result
+        instance.wake_up = _speco_wake_up_hook
+        return instance
+
     def _get_speco_draft_zmq_handle(self) -> str:
         get_base = getattr(self, "_get_zmq_handle", None)
         if callable(get_base):
@@ -1193,7 +1697,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         return method
 
     def _speco_is_dflash_draft(self) -> bool:
-        return self._speco_draft_method() == "dflash"
+        return self._speco_draft_method() in ("dflash", "dspark")
 
     def _speco_update_draft_weights(self, weights: list[tuple[str, Any]]) -> int:
         draft_model, proposer = self._speco_resolve_draft_model()
@@ -1297,14 +1801,15 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
 
         draft_method = self._speco_draft_method()
         is_dflash = draft_method == "dflash"
+        is_dspark = draft_method == "dspark"
         is_eagle3 = draft_method == "eagle3"
 
-        # Translate training-side names.  DFlash publishes into the inner
-        # DFlashQwen3Model, while EAGLE3 publishes into the outer vLLM
-        # Eagle3LlamaForCausalLM because lm_head.weight lives outside
+        # Translate training-side names.  DFlash/DSpark publish into the inner
+        # DFlashQwen3Model/Qwen3DSparkModel, while EAGLE3 publishes into the
+        # outer Eagle3LlamaForCausalLM because lm_head.weight lives outside
         # ``draft_model.model`` in vLLM.
         _strip_prefixes = ("module.", "_orig_mod.", "draft_model.", "model.draft_model.")
-        if is_dflash:
+        if is_dflash or is_dspark:
             _strip_prefixes = (*_strip_prefixes, "model.")
         _alias_map = (
             ("context_proj.", "fc."),
@@ -1322,10 +1827,10 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                         n = n[len(pfx):]
                         changed = True
             if "midlayer." in n:
-                n = n.replace("midlayer.", "layers.0." if is_dflash else "model.layers.0.")
+                n = n.replace("midlayer.", "layers.0.")
             if is_eagle3 and n != "lm_head.weight" and "." in n and not n.startswith("model."):
                 n = f"model.{n}"
-            if is_dflash:
+            if is_dflash or is_dspark:
                 for src, dst in _alias_map:
                     if src in n:
                         n = n.replace(src, dst)
@@ -1338,6 +1843,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             inner_model = getattr(draft_model, "model", None)
             if inner_model is None:
                 return {"loaded_params": 0, "has_draft_model": True}
+            logger.warning("[speco draft ipc] loading %d translated weights into %s (method=%s), first 5 keys: %s",
+                          len(translated_weights), type(inner_model).__name__, draft_method,
+                          [n for n, _ in translated_weights[:5]])
             inner_model.load_weights(iter(translated_weights))
 
             # Rebuild fused KV buffers (torch.cat snapshot, not a view)
@@ -1346,6 +1854,21 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             except Exception as exc:
                 logger.warning("[speco draft update] _build_fused_kv_buffers failed: %s", exc)
 
+        self._speco_diag_draft_state("after_draft_ipc_update")
+        # One-time diagnostic: check whether probabilistic sampling is active
+        proposer = self._speco_resolve_draft_proposer()
+        if proposer is not None and not getattr(self, "_speco_logged_sampling_mode", False):
+            self._speco_logged_sampling_mode = True
+            missing_draft_logits = not hasattr(proposer, "draft_logits")
+            draft_logits = getattr(proposer, "draft_logits", None)
+            spec_cfg = getattr(getattr(getattr(self, "model_runner", None), "vllm_config", None), "speculative_config", None)
+            dsm = getattr(spec_cfg, "draft_sample_method", "UNKNOWN") if spec_cfg else "NO_SPEC_CFG"
+            logger.warning(
+                "[speco-diag:sampling_mode] draft_sample_method=%s draft_logits=%s proposer=%s",
+                dsm,
+                _describe_vllm_draft_logits(draft_logits, missing=missing_draft_logits),
+                type(proposer).__name__,
+            )
         return {"loaded_params": loaded_params, "has_draft_model": True}
 
     # ----------------------------------------------------------------
@@ -1421,10 +1944,35 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Override target weight sync to also reload drafter from checkpoint."""
         patch_verl_bucketed_weight_transfer_rebuild_ipc()
+        # Diagnostic: check draft state BEFORE target sync
+        self._speco_diag_draft_state("before_target_sync")
         result = super().update_weights_from_ipc(
             peft_config=peft_config, base_sync_done=base_sync_done, use_shm=use_shm
         )
+        # Diagnostic: check draft state AFTER target sync (may be zeroed by wake_up)
+        self._speco_diag_draft_state("after_target_sync")
         reloaded = self._speco_reload_draft_from_checkpoint()
         if reloaded > 0:
             logger.warning("[speco draft reload] drafter weights restored after target sync (%d tensors)", reloaded)
+        # Diagnostic: check draft state AFTER reload
+        self._speco_diag_draft_state("after_draft_reload")
         return result
+
+    def _speco_diag_draft_state(self, phase: str):
+        """Log norms of key draft model parameters for debugging."""
+        if not bool(_bool_or_none(os.getenv(SPECO_VLLM_DRAFT_DIAG_ENV))):
+            return
+
+        draft_model, _ = self._speco_resolve_draft_model()
+        if draft_model is None:
+            logger.warning("[speco-diag:%s] no draft model found", phase)
+            return
+        try:
+            params = dict(draft_model.named_parameters())
+            diag_keys = [k for k in params if any(s in k for s in ("markov", "fc.", "norm.", "layers.0."))]
+            if not diag_keys:
+                diag_keys = list(params.keys())[:5]
+            norms = {k: f"{params[k].data.float().norm().item():.4f}" for k in diag_keys[:6]}
+            logger.warning("[speco-diag:%s] draft param norms: %s", phase, norms)
+        except Exception as exc:
+            logger.warning("[speco-diag:%s] failed: %s", phase, exc)

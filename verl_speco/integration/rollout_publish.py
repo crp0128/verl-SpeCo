@@ -324,7 +324,7 @@ def export_actor_lm_head_weight(worker: Any, row_indices: Any = None) -> Optiona
         return None
 
     normalized_row_indices = _normalize_lm_head_row_indices(row_indices)
-    is_dflash = drafter_speculative_algorithm(getattr(worker, "config", None)) == "DFLASH"
+    is_dflash = drafter_speculative_algorithm(getattr(worker, "config", None)) in {"DFLASH", "DSPARK"}
     if is_dflash and normalized_row_indices is not None and int(normalized_row_indices.numel()) > 0:
         direct_payload = _export_actor_lm_head_rows_direct(worker, normalized_row_indices)
         if isinstance(direct_payload, dict) and direct_payload.get("_speco_non_owner_direct_sparse"):

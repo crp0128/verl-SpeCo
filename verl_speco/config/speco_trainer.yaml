@@ -111,6 +111,28 @@ actor_rollout_ref:
         dflash_max_window: 512
         dflash_loss_mode: full_vocab
         dflash_sampled_ce_negatives: 0
+        dspark_block_size: 7
+        dspark_num_anchors: 512
+        dspark_loss_decay_gamma: 7.0
+        dspark_hard_sample_ratio: 0.0
+        dspark_hidden_size: null
+        dspark_num_target_layers: 5
+        dspark_num_hidden_layers: 5
+        dspark_mask_token_id: null
+        dspark_target_layer_ids: null
+        dspark_max_window: 512
+        dspark_loss_mode: full_vocab
+        dspark_sampled_ce_negatives: 0
+        dspark_markov_rank: 256
+        dspark_markov_head_type: vanilla
+        dspark_confidence_head_alpha: 0.0
+        dspark_confidence_loss_alpha: 0.0
+        dspark_confidence_head_with_markov: true
+        dspark_ce_loss_alpha: 1.0
+        dspark_l1_loss_alpha: 0.0
+        dspark_debug_log: false
+        dspark_debug_log_first_n: 2
+        dspark_debug_log_interval: 100
         current_max_samples: 2048
         data_buffer_max_size: 1024
         hidden_state_clip_value: 1.0e4

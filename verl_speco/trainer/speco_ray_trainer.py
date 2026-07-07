@@ -634,7 +634,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_oldlogprob_hidden_layout(self) -> str:
         drafter_cfg = self._speco_drafter_config()
         algorithm = str(_get_nested(drafter_cfg, ("speculative_algorithm",), "") or "").upper()
-        return "dflash_aux" if algorithm == "DFLASH" else "eagle3_aux_plus_last"
+        return "dflash_aux" if algorithm in {"DFLASH", "DSPARK"} else "eagle3_aux_plus_last"
 
     @staticmethod
     def _speco_oldlogprob_window_train_rows(training_cfg) -> int:
