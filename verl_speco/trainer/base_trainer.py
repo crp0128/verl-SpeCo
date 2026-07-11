@@ -548,9 +548,17 @@ class DrafterBaseTrainer:
         if quality_tokens > 0:
             metrics[f"{prefix}/top1_acc"] = sums.get(f"{prefix}/top1_correct_count", 0.0) / quality_tokens
             metrics[f"{prefix}/top5_acc"] = sums.get(f"{prefix}/top5_correct_count", 0.0) / quality_tokens
+        ce_tokens = sums.get(f"{prefix}/ce_weighted_token_count", 0.0)
+        if ce_tokens > 0:
+            metrics[f"{prefix}/ce_loss"] = sums.get(f"{prefix}/ce_loss_sum", 0.0) / ce_tokens
+        l1_tokens = sums.get(f"{prefix}/l1_weighted_token_count", 0.0)
+        if l1_tokens > 0:
+            metrics[f"{prefix}/l1_loss"] = sums.get(f"{prefix}/l1_loss_sum", 0.0) / l1_tokens
         for key in (
             f"{prefix}/valid_token_count",
             f"{prefix}/weighted_token_count",
+            f"{prefix}/ce_weighted_token_count",
+            f"{prefix}/l1_weighted_token_count",
             f"{prefix}/quality_token_count",
             f"{prefix}/sanitized_rows",
             f"{prefix}/masked_rows",
@@ -607,6 +615,10 @@ class DrafterBaseTrainer:
             "quality_token_count": f"{prefix}/quality_token_count",
             "valid_token_count": f"{prefix}/valid_token_count",
             "weighted_token_count": f"{prefix}/weighted_token_count",
+            "ce_loss_sum": f"{prefix}/ce_loss_sum",
+            "ce_weighted_token_count": f"{prefix}/ce_weighted_token_count",
+            "l1_loss_sum": f"{prefix}/l1_loss_sum",
+            "l1_weighted_token_count": f"{prefix}/l1_weighted_token_count",
             "sanitized_rows": f"{prefix}/sanitized_rows",
             "masked_rows": f"{prefix}/masked_rows",
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
@@ -2143,7 +2155,7 @@ class DrafterBaseTrainer:
             batch["loss_mask"], bad_input_rows, batch["attention_mask"]
         )
 
-        for target_key in ("target", "last_hidden_states"):
+        for target_key in ("target", "last_hidden_states", "target_last_hidden_states"):
             if target_key not in batch:
                 continue
             target_tensor, bad_target_rows = self._sanitize_sequence_tensor(batch[target_key], target_key, clip_value)
@@ -2345,11 +2357,17 @@ class DrafterBaseTrainer:
         position_id_chunks = []
         last_hidden_state_chunks = []
         target_logprob_chunks = []
+        target_last_hidden_state_chunks = []
 
         ids_list = preprocessed_lists["ids"]
         hidden_list = preprocessed_lists["h_states"]
         mask_list = preprocessed_lists["masks"]
         position_list = preprocessed_lists.get("position_ids")
+        target_last_h_list = preprocessed_lists.get("target_last_h_states")
+        dspark_l1_enabled = (
+            self.backend.model_type == "dspark"
+            and float(self.config.rollout.drafter.training.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
+        )
         if position_list is None:
             position_list = [torch.arange(ids.size(0), device=ids.device, dtype=torch.long) for ids in ids_list]
         for item_idx, (ids, h_states, item_loss_mask, item_position_ids) in enumerate(
@@ -2357,9 +2375,23 @@ class DrafterBaseTrainer:
         ):
             source_item = items[item_idx] if item_idx < len(items) else {}
             uses_shifted_eagle_inputs = self.backend.model_type == "eagle3"
-            seq_len = min(ids.size(0), h_states.size(0), item_loss_mask.size(0), item_position_ids.size(0))
+            target_last_h_states = (
+                target_last_h_list[item_idx]
+                if target_last_h_list is not None and item_idx < len(target_last_h_list)
+                else None
+            )
+            seq_len_limits = [ids.size(0), h_states.size(0), item_loss_mask.size(0), item_position_ids.size(0)]
+            if torch.is_tensor(target_last_h_states):
+                seq_len_limits.append(target_last_h_states.size(0))
+            seq_len = min(seq_len_limits)
             if seq_len < 1:
                 items_dropped_short += 1
+                continue
+            if (
+                dspark_l1_enabled
+                and not torch.is_tensor(target_last_h_states)
+            ):
+                items_dropped_missing_target += 1
                 continue
 
             target_logprobs_item = None
@@ -2599,6 +2631,8 @@ class DrafterBaseTrainer:
                     )
                 else:
                     last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
+            elif dspark_l1_enabled and torch.is_tensor(target_last_h_states):
+                target_last_hidden_state_chunks.append(target_last_h_states[:train_seq_len])
 
         if not input_id_chunks:
             return None
@@ -2626,6 +2660,26 @@ class DrafterBaseTrainer:
                 base_h[row_idx, :row_len] = h_chunk
                 position_ids[row_idx, :row_len] = pos_chunk
                 attn_mask[row_idx, :row_len] = 1
+            target_last_hidden_states = None
+            if target_last_hidden_state_chunks:
+                if len(target_last_hidden_state_chunks) != len(input_id_chunks):
+                    logger.warning(
+                        "[dspark-trainer] dropping batch with partial target_last_hidden_states: "
+                        "target_rows=%s batch_rows=%s",
+                        len(target_last_hidden_state_chunks),
+                        len(input_id_chunks),
+                    )
+                    return None
+                target_hidden_dim = target_last_hidden_state_chunks[0].size(-1)
+                target_last_hidden_states = torch.zeros(
+                    len(target_last_hidden_state_chunks),
+                    max_train_len,
+                    target_hidden_dim,
+                    dtype=target_last_hidden_state_chunks[0].dtype,
+                    device=dev,
+                )
+                for row_idx, target_h_chunk in enumerate(target_last_hidden_state_chunks):
+                    target_last_hidden_states[row_idx, : target_h_chunk.size(0)] = target_h_chunk
         else:
             input_ids = torch.cat(input_id_chunks, dim=0).unsqueeze(0).contiguous()
             loss_mask = torch.cat(loss_mask_chunks, dim=0).unsqueeze(0).contiguous()
@@ -2655,6 +2709,8 @@ class DrafterBaseTrainer:
                 batch["target_logprobs"] = target_logprobs
             else:
                 batch["last_hidden_states"] = last_hidden_states
+        elif self.backend.model_type == "dspark" and target_last_hidden_state_chunks:
+            batch["target_last_hidden_states"] = target_last_hidden_states
 
         batch = self._sanitize_training_batch(batch)
         input_ids = batch["input_ids"]
@@ -2667,6 +2723,8 @@ class DrafterBaseTrainer:
                 target_logprobs = batch["target_logprobs"]
             else:
                 last_hidden_states = batch["last_hidden_states"]
+        elif self.backend.model_type == "dspark" and "target_last_hidden_states" in batch:
+            target_last_hidden_states = batch["target_last_hidden_states"]
 
         # Use Ulysses SP to pad and slice if needed.
         pad_size_for_batch = 0
@@ -2699,6 +2757,10 @@ class DrafterBaseTrainer:
                         last_hidden_states = torch.nn.functional.pad(
                             last_hidden_states, (0, 0, 0, pad_size), value=0.0
                         )
+                elif self.backend.model_type == "dspark" and "target_last_hidden_states" in batch:
+                    target_last_hidden_states = torch.nn.functional.pad(
+                        target_last_hidden_states, (0, 0, 0, pad_size), value=0.0
+                    )
 
             # Slice for this rank
             loss_mask = slice_input_tensor(loss_mask, dim=1, padding=False)
@@ -2709,6 +2771,8 @@ class DrafterBaseTrainer:
                     target_logprobs = slice_input_tensor(target_logprobs, dim=1, padding=False)
                 else:
                     last_hidden_states = slice_input_tensor(last_hidden_states, dim=1, padding=False)
+            elif self.backend.model_type == "dspark" and "target_last_hidden_states" in batch:
+                target_last_hidden_states = slice_input_tensor(target_last_hidden_states, dim=1, padding=False)
 
             # Store pad_size for later gathering
             self._current_pad_size = pad_size_for_batch
@@ -2728,6 +2792,8 @@ class DrafterBaseTrainer:
                 batch["target_logprobs"] = target_logprobs
             else:
                 batch["last_hidden_states"] = last_hidden_states
+        elif self.backend.model_type == "dspark" and target_last_hidden_state_chunks:
+            batch["target_last_hidden_states"] = target_last_hidden_states
         batch["_speco_pad_size"] = pad_size_for_batch
 
         if alignment_debug_enabled():

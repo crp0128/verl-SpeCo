@@ -26,8 +26,8 @@ class DSparkConfig(DFlashConfig):
         enable_confidence_head: Optional[bool] = None,
         confidence_head_alpha: float = 0.0,
         confidence_head_with_markov: bool = True,
-        ce_loss_alpha: float = 1.0,
-        l1_loss_alpha: float = 0.0,
+        ce_loss_alpha: float = 0.1,
+        l1_loss_alpha: float = 0.9,
         loss_decay_gamma: float = 7.0,
         **kwargs,
     ):

@@ -12,7 +12,7 @@ DSparkConfig = dspark_models.DSparkConfig
 DSparkDraftModel = dspark_models.DSparkDraftModel
 
 
-def _small_dspark_training_model(block_size: int = 4):
+def _small_dspark_training_model(block_size: int = 4, l1_loss_alpha: float = 0.0, l1_chunk_size: int = 0):
     config = DSparkConfig(
         hidden_size=8,
         intermediate_size=16,
@@ -32,7 +32,37 @@ def _small_dspark_training_model(block_size: int = 4):
         markov_head_type="vanilla",
     )
     draft_model = DSparkDraftModel(config)
-    return DSparkTrainingModel(draft_model=draft_model, block_size=block_size, num_anchors=2)
+    return DSparkTrainingModel(
+        draft_model=draft_model,
+        block_size=block_size,
+        num_anchors=2,
+        l1_loss_alpha=l1_loss_alpha,
+        l1_chunk_size=l1_chunk_size,
+    )
+
+
+def test_dspark_default_loss_weights_match_deepspec():
+    config = DSparkConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        vocab_size=32,
+        num_target_layers=4,
+        num_context_layers=2,
+        target_hidden_size=8,
+        target_num_hidden_layers=4,
+        target_layer_ids=[1, 3],
+        mask_token_id=31,
+    )
+    model = DSparkTrainingModel(draft_model=DSparkDraftModel(config))
+
+    assert config.ce_loss_alpha == pytest.approx(0.1)
+    assert config.l1_loss_alpha == pytest.approx(0.9)
+    assert model.ce_loss_alpha == pytest.approx(0.1)
+    assert model.l1_loss_alpha == pytest.approx(0.9)
+    assert model.l1_chunk_size == 0
 
 
 def test_dspark_label_and_prev_token_alignment():
@@ -124,3 +154,26 @@ def test_dspark_markov_bias_changes_logits():
 
     assert corrected.abs().sum().item() > 0
     assert not torch.equal(corrected, base_logits)
+
+
+def test_dspark_l1_loss_uses_target_last_hidden_states():
+    model = _small_dspark_training_model(block_size=2, l1_loss_alpha=0.5)
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    hidden_states = [torch.randn(1, 5, 8), torch.randn(1, 5, 8)]
+    target_last_hidden_states = torch.randn(1, 5, 8)
+    lm_head_weight = torch.randn(32, 8)
+
+    loss, *_rest, diagnostics = model(
+        input_ids=input_ids,
+        hidden_states_list=hidden_states,
+        loss_mask=loss_mask,
+        lm_head_weight=lm_head_weight,
+        target_last_hidden_states=target_last_hidden_states,
+    )
+
+    assert torch.isfinite(loss)
+    assert diagnostics["ce_weighted_token_count"].item() > 0
+    assert diagnostics["ce_loss_sum"].item() >= 0
+    assert diagnostics["l1_weighted_token_count"].item() > 0
+    assert diagnostics["l1_loss_sum"].item() >= 0

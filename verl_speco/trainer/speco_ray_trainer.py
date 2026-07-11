@@ -647,6 +647,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_oldlogprob_hidden_layout(self) -> str:
         drafter_cfg = self._speco_drafter_config()
         algorithm = str(_get_nested(drafter_cfg, ("speculative_algorithm",), "") or "").upper()
+        training_cfg = self._speco_drafter_training_config()
+        if algorithm == "DSPARK" and float(training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0:
+            return "dflash_aux_plus_last"
         return "dflash_aux" if algorithm in {"DFLASH", "DSPARK"} else "eagle3_aux_plus_last"
 
     @staticmethod
@@ -1171,6 +1174,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         training_cfg = self._speco_drafter_training_config()
         if bool(training_cfg.get("use_logits", False)):
             return None
+        drafter_cfg = self._speco_drafter_config()
+        algorithm = str(_get_nested(drafter_cfg, ("speculative_algorithm",), "") or "").upper()
+        if algorithm == "DSPARK" and float(training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0:
+            return None
         if not bool(training_cfg.get("target_lm_head_row_restricted_sync", True)):
             return None
 
@@ -1631,35 +1638,56 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_last_oldlogprob_collect_elapsed_sec = 0.0
             self._speco_last_oldlogprob_collect_rpc_elapsed_sec = 0.0
             self._speco_last_oldlogprob_total_elapsed_sec = 0.0
-            self._speco_last_collect_interval_matched = int(self._speco_should_collect_drafter_this_step())
+            collect_interval_matched = self._speco_should_collect_drafter_this_step()
+            train_interval_matched = self._speco_should_train_drafter_this_step()
+            self._speco_last_collect_interval_matched = int(collect_interval_matched)
             prepare_started = time.perf_counter()
+            original_batch = batch
+
+            def compute_old_log_prob_without_collection():
+                self._speco_last_oldlogprob_prepare_elapsed_sec = time.perf_counter() - prepare_started
+                compute_started = time.perf_counter()
+                if self._speco_oldlogprob_entropy_hook_enabled():
+                    old_log_prob, old_log_prob_mfu = self._speco_compute_old_log_prob_without_forced_entropy(
+                        original_batch
+                    )
+                else:
+                    old_log_prob, old_log_prob_mfu = original_compute_old_log_prob(original_batch)
+                self._speco_last_oldlogprob_compute_elapsed_sec = time.perf_counter() - compute_started
+                self._speco_last_oldlogprob_total_elapsed_sec = time.perf_counter() - oldlogprob_started
+                return old_log_prob, old_log_prob_mfu
+
+            if not collect_interval_matched or not train_interval_matched:
+                return compute_old_log_prob_without_collection()
+
             batch = _select_policy_model_batch(batch)
             collect_plan = self._speco_build_oldlogprob_collect_plan(batch)
+            if collect_plan is None:
+                return compute_old_log_prob_without_collection()
             batch_td = batch.to_tensordict()
             batch_td = left_right_2_no_padding(batch_td)
             calculate_entropy = self._speco_oldlogprob_calculate_entropy()
             tu.assign_non_tensor(batch_td, calculate_entropy=calculate_entropy, compute_loss=False)
-            if collect_plan is not None:
-                batch_td[OLD_LOGPROB_COLLECT_MASK_KEY] = collect_plan["collect_mask"]
-                batch_td[OLD_LOGPROB_HIDDEN_POSITIONS_KEY] = collect_plan["hidden_positions"]
-                batch_td[OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY] = collect_plan["hidden_position_mask"]
-                batch_td[OLD_LOGPROB_OWNER_RANK_KEY] = collect_plan["owner_rank"]
-                tu.assign_non_tensor_data(
-                    batch_td,
-                    OLD_LOGPROB_AUX_LAYER_IDS_KEY,
-                    self._speco_oldlogprob_aux_layer_ids(),
-                )
-                tu.assign_non_tensor_data(
-                    batch_td,
-                    OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
-                    self._speco_oldlogprob_hidden_capture_impl(),
-                )
-                tu.assign_non_tensor_data(
-                    batch_td,
-                    OLD_LOGPROB_HIDDEN_LAYOUT_KEY,
-                    self._speco_oldlogprob_hidden_layout(),
-                )
-                tu.assign_non_tensor_data(batch_td, OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY, True)
+            batch_td[OLD_LOGPROB_COLLECT_MASK_KEY] = collect_plan["collect_mask"]
+            batch_td[OLD_LOGPROB_HIDDEN_POSITIONS_KEY] = collect_plan["hidden_positions"]
+            batch_td[OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY] = collect_plan["hidden_position_mask"]
+            batch_td[OLD_LOGPROB_OWNER_RANK_KEY] = collect_plan["owner_rank"]
+            tu.assign_non_tensor_data(
+                batch_td,
+                OLD_LOGPROB_AUX_LAYER_IDS_KEY,
+                self._speco_oldlogprob_aux_layer_ids(),
+            )
+            tu.assign_non_tensor_data(
+                batch_td,
+                OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
+                self._speco_oldlogprob_hidden_capture_impl(),
+            )
+            tu.assign_non_tensor_data(
+                batch_td,
+                OLD_LOGPROB_HIDDEN_LAYOUT_KEY,
+                self._speco_oldlogprob_hidden_layout(),
+            )
+            tu.assign_non_tensor_data(batch_td, OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY, True)
 
             self._speco_last_oldlogprob_prepare_elapsed_sec = time.perf_counter() - prepare_started
             compute_started = time.perf_counter()

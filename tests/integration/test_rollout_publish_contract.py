@@ -93,3 +93,25 @@ def test_publish_state_filter_skips_non_eagle_lm_head() -> None:
     )
 
     assert set(trainer._get_trainable_state_dict()) == {"context_proj.weight"}
+
+
+def test_publish_state_filter_excludes_block_drafter_embedding() -> None:
+    torch = pytest.importorskip("torch")
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="publish state filtering needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(model_type="dspark")
+    trainer.training_device_mesh = None
+    trainer._frozen_param_names = []
+    trainer.model = SimpleNamespace(
+        state_dict=lambda: {
+            "draft_model.embed_tokens.weight": torch.ones(2, 2),
+            "context_proj.weight": torch.ones(2, 2),
+        }
+    )
+
+    assert set(trainer._get_trainable_state_dict()) == {"context_proj.weight"}
