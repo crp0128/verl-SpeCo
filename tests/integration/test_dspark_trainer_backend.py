@@ -12,7 +12,12 @@ DSparkConfig = dspark_models.DSparkConfig
 DSparkDraftModel = dspark_models.DSparkDraftModel
 
 
-def _small_dspark_training_model(block_size: int = 4, l1_loss_alpha: float = 0.0, l1_chunk_size: int = 0):
+def _small_dspark_training_model(
+    block_size: int = 4,
+    l1_loss_alpha: float = 0.0,
+    l1_chunk_size: int = 0,
+    loss_mode: str = "full_vocab",
+):
     config = DSparkConfig(
         hidden_size=8,
         intermediate_size=16,
@@ -36,6 +41,7 @@ def _small_dspark_training_model(block_size: int = 4, l1_loss_alpha: float = 0.0
         draft_model=draft_model,
         block_size=block_size,
         num_anchors=2,
+        loss_mode=loss_mode,
         l1_loss_alpha=l1_loss_alpha,
         l1_chunk_size=l1_chunk_size,
     )
@@ -177,3 +183,46 @@ def test_dspark_l1_loss_uses_target_last_hidden_states():
     assert diagnostics["ce_loss_sum"].item() >= 0
     assert diagnostics["l1_weighted_token_count"].item() > 0
     assert diagnostics["l1_loss_sum"].item() >= 0
+
+
+@pytest.mark.parametrize(
+    ("loss_mode", "expects_reused_logits"),
+    [("full_vocab", True), ("restricted_ce", False)],
+)
+def test_dspark_l1_reuses_only_full_vocab_ce_logits(monkeypatch, loss_mode, expects_reused_logits):
+    model = _small_dspark_training_model(
+        block_size=2,
+        l1_loss_alpha=0.5,
+        loss_mode=loss_mode,
+    )
+    captured_logits = []
+    original_compute_l1 = model._compute_l1_loss_for_active
+
+    def capture_compute_l1(**kwargs):
+        captured_logits.append(kwargs.get("active_draft_logits"))
+        return original_compute_l1(**kwargs)
+
+    monkeypatch.setattr(model, "_compute_l1_loss_for_active", capture_compute_l1)
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    hidden_states = [torch.randn(1, 5, 8), torch.randn(1, 5, 8)]
+    target_last_hidden_states = torch.randn(1, 5, 8)
+    lm_head_weight = torch.randn(32, 8)
+
+    loss, *_ = model(
+        input_ids=input_ids,
+        hidden_states_list=hidden_states,
+        loss_mask=loss_mask,
+        lm_head_weight=lm_head_weight,
+        target_last_hidden_states=target_last_hidden_states,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert len(captured_logits) == 1
+    assert (captured_logits[0] is not None) is expects_reused_logits
+    assert any(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
