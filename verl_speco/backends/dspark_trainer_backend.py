@@ -189,7 +189,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         active_target_hidden: torch.Tensor,
         active_weights: torch.Tensor,
         lm_head_weight: torch.Tensor,
-        active_draft_logits: Optional[torch.Tensor] = None,
+        active_draft_log_probs: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if active_hidden.numel() == 0:
             zero = active_weights.new_zeros(())
@@ -198,12 +198,12 @@ class DSparkTrainingModel(DFlashTrainingModel):
         l1_sum = active_weights.new_zeros((), dtype=torch.float32)
         l1_den = active_weights.float().sum()
         active_count = int(active_hidden.size(0))
-        if active_draft_logits is not None:
+        if active_draft_log_probs is not None:
             expected_shape = (active_count, int(lm_head_weight.size(0)))
-            if tuple(active_draft_logits.shape) != expected_shape:
+            if tuple(active_draft_log_probs.shape) != expected_shape:
                 raise ValueError(
-                    "DSpark precomputed draft logits must have shape "
-                    f"{expected_shape}, got {tuple(active_draft_logits.shape)}"
+                    "DSpark precomputed draft log probabilities must have shape "
+                    f"{expected_shape}, got {tuple(active_draft_log_probs.shape)}"
                 )
         chunk_size = self.l1_chunk_size if self.l1_chunk_size > 0 else active_count
         for start in range(0, active_count, chunk_size):
@@ -213,7 +213,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
             target_hidden_chunk = active_target_hidden[start:end]
             weights_chunk = active_weights[start:end].float()
 
-            if active_draft_logits is None:
+            if active_draft_log_probs is None:
                 draft_logits = F.linear(hidden_chunk, lm_head_weight)
                 markov_bias = self._markov_bias_for_active(
                     active_hidden=hidden_chunk,
@@ -222,10 +222,10 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 )
                 if markov_bias is not None:
                     draft_logits = draft_logits + markov_bias
+                draft_probs = torch.softmax(draft_logits.float(), dim=-1)
             else:
-                draft_logits = active_draft_logits[start:end]
+                draft_probs = active_draft_log_probs[start:end].exp()
             target_logits = F.linear(target_hidden_chunk, lm_head_weight)
-            draft_probs = torch.softmax(draft_logits.float(), dim=-1)
             target_probs = torch.softmax(target_logits.float(), dim=-1)
             l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
             l1_sum = l1_sum + (l1_dist * weights_chunk).sum()
@@ -357,6 +357,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         local_l1_sum = torch.zeros((), dtype=torch.float32, device=device)
         local_l1_den = torch.zeros((), dtype=torch.float32, device=device)
         active_logits = None
+        active_log_probs = None
         restricted_vocab = None
         if active_targets.numel() == 0:
             loss = flat_weights.sum() * 0.0
@@ -383,7 +384,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 )
                 if markov_bias is not None:
                     active_logits = active_logits + markov_bias
-                active_loss = F.cross_entropy(active_logits, active_targets, reduction="none")
+                active_log_probs = F.log_softmax(active_logits.float(), dim=-1)
+                active_loss = F.nll_loss(active_log_probs, active_targets, reduction="none")
 
             finite_loss = torch.isfinite(active_loss)
             sanitized_rows = (~finite_loss).sum().to(dtype=torch.float32)
@@ -403,12 +405,12 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 finite_target_hidden = torch.isfinite(active_target_hidden).all(dim=-1)
                 l1_mask = finite_loss & finite_target_hidden
                 if l1_mask.any():
-                    reusable_draft_logits = None
-                    # Full-vocab CE already includes the complete LM head and Markov bias.
-                    # Restricted CE must build separate full-vocab logits for L1.
+                    reusable_draft_log_probs = None
+                    # Full-vocab CE already normalizes the complete LM head and Markov bias.
+                    # Restricted CE must build separate full-vocab probabilities for L1.
                     if restricted_vocab is None:
-                        reusable_draft_logits = (
-                            active_logits if l1_mask.all() else active_logits[l1_mask]
+                        reusable_draft_log_probs = (
+                            active_log_probs if l1_mask.all() else active_log_probs[l1_mask]
                         )
                     local_l1_sum, local_l1_den = self._compute_l1_loss_for_active(
                         active_hidden=active_hidden[l1_mask],
@@ -416,7 +418,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                         active_target_hidden=active_target_hidden[l1_mask],
                         active_weights=active_loss_weights[l1_mask],
                         lm_head_weight=lm_head_weight,
-                        active_draft_logits=reusable_draft_logits,
+                        active_draft_log_probs=reusable_draft_log_probs,
                     )
                 l1_loss = local_l1_sum / local_l1_den.clamp(min=1e-6)
             else:

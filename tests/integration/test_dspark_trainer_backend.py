@@ -186,20 +186,20 @@ def test_dspark_l1_loss_uses_target_last_hidden_states():
 
 
 @pytest.mark.parametrize(
-    ("loss_mode", "expects_reused_logits"),
+    ("loss_mode", "expects_reused_log_probs"),
     [("full_vocab", True), ("restricted_ce", False)],
 )
-def test_dspark_l1_reuses_only_full_vocab_ce_logits(monkeypatch, loss_mode, expects_reused_logits):
+def test_dspark_l1_reuses_only_full_vocab_ce_log_probs(monkeypatch, loss_mode, expects_reused_log_probs):
     model = _small_dspark_training_model(
         block_size=2,
         l1_loss_alpha=0.5,
         loss_mode=loss_mode,
     )
-    captured_logits = []
+    captured_log_probs = []
     original_compute_l1 = model._compute_l1_loss_for_active
 
     def capture_compute_l1(**kwargs):
-        captured_logits.append(kwargs.get("active_draft_logits"))
+        captured_log_probs.append(kwargs.get("active_draft_log_probs"))
         return original_compute_l1(**kwargs)
 
     monkeypatch.setattr(model, "_compute_l1_loss_for_active", capture_compute_l1)
@@ -219,8 +219,11 @@ def test_dspark_l1_reuses_only_full_vocab_ce_logits(monkeypatch, loss_mode, expe
     loss.backward()
 
     assert torch.isfinite(loss)
-    assert len(captured_logits) == 1
-    assert (captured_logits[0] is not None) is expects_reused_logits
+    assert len(captured_log_probs) == 1
+    assert (captured_log_probs[0] is not None) is expects_reused_log_probs
+    if captured_log_probs[0] is not None:
+        probability_mass = captured_log_probs[0].exp().sum(dim=-1)
+        assert torch.allclose(probability_mass, torch.ones_like(probability_mass), atol=1e-5, rtol=1e-5)
     assert any(
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
         for parameter in model.parameters()
