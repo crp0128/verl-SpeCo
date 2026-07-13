@@ -58,6 +58,49 @@ def _create_dflash_mask_mod(anchor_positions: torch.Tensor, block_keep_mask: tor
     return dflash_mask_mod
 
 
+def _create_dflash_dense_attention_mask(
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    ctx_len: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Build the dense equivalent of the DFlash/DSpark training block mask.
+
+    PyTorch FlexAttention is currently used only on CUDA. Other devices use
+    SDPA and therefore need an explicit boolean mask with ``True`` entries for
+    keys that are visible to each draft query.
+    """
+
+    bsz, num_blocks = anchor_positions.shape
+    device = anchor_positions.device
+    draft_len = num_blocks * block_size
+
+    query_indices = torch.arange(draft_len, device=device)
+    query_block_ids = query_indices // block_size
+    query_anchors = anchor_positions.index_select(1, query_block_ids)
+    query_valid = block_keep_mask.index_select(1, query_block_ids)
+
+    context_indices = torch.arange(ctx_len, device=device)
+    context_allowed = context_indices.view(1, 1, ctx_len) < query_anchors.unsqueeze(-1)
+
+    draft_block_ids = torch.arange(draft_len, device=device) // block_size
+    draft_allowed = (
+        query_block_ids.view(1, draft_len, 1)
+        == draft_block_ids.view(1, 1, draft_len)
+    ).expand(bsz, -1, -1)
+    allowed = torch.cat([context_allowed, draft_allowed], dim=-1)
+
+    # Some SDPA kernels do not define fully masked rows safely. Dummy anchor
+    # rows are excluded from every loss, so let each one attend only to itself.
+    total_len = ctx_len + draft_len
+    key_indices = torch.arange(total_len, device=device)
+    safe_self = key_indices.view(1, 1, total_len) == (
+        ctx_len + query_indices
+    ).view(1, draft_len, 1)
+    allowed = torch.where(query_valid.unsqueeze(-1), allowed, safe_self)
+    return allowed.unsqueeze(1)
+
+
 class DFlashTrainingModel(nn.Module):
     """Training wrapper around DFlashDraftModel.
 
@@ -199,6 +242,7 @@ class DFlashTrainingModel(nn.Module):
         draft_len = n_blocks * self.block_size
 
         block_mask = None
+        dense_attention_mask = None
         if device.type == "cuda":
             block_mask = compile_friendly_create_block_mask(
                 mask_mod=_create_dflash_mask_mod(anchor_positions, block_keep_mask, seq_len, self.block_size),
@@ -208,6 +252,13 @@ class DFlashTrainingModel(nn.Module):
                 KV_LEN=seq_len + draft_len,
                 device=device,
             )
+        else:
+            dense_attention_mask = _create_dflash_dense_attention_mask(
+                anchor_positions,
+                block_keep_mask,
+                seq_len,
+                self.block_size,
+            )
 
         draft_hidden = self.draft_model(
             draft_input_ids=None,
@@ -215,6 +266,7 @@ class DFlashTrainingModel(nn.Module):
             draft_position_ids=draft_position_ids,
             context_position_ids=context_position_ids,
             block_mask=block_mask,
+            dense_attention_mask=dense_attention_mask,
             noise_embedding=noise_embedding,
         )
         label_offsets = self._cached_arange("label_offsets", self.block_size, device, view_shape=(1, 1, -1))

@@ -6,10 +6,12 @@ torch = pytest.importorskip("torch")
 
 dspark_backend = pytest.importorskip("verl_speco.backends.dspark_trainer_backend")
 dspark_models = pytest.importorskip("verl_speco.models.dspark")
+dflash_backend = pytest.importorskip("verl_speco.backends.dflash_trainer_backend")
 
 DSparkTrainingModel = dspark_backend.DSparkTrainingModel
 DSparkConfig = dspark_models.DSparkConfig
 DSparkDraftModel = dspark_models.DSparkDraftModel
+create_dense_attention_mask = dflash_backend._create_dflash_dense_attention_mask
 
 
 def _small_dspark_training_model(
@@ -89,6 +91,40 @@ def test_dspark_label_and_prev_token_alignment():
     assert target_ids.tolist() == [[[13, 14, 15, 16]]]
     assert prev_token_ids.tolist() == [[[12, 13, 14, 15]]]
     assert eval_mask.tolist() == [[[True, True, True, True]]]
+
+
+def test_dspark_dense_attention_mask_matches_deepspec_block_contract():
+    anchor_positions = torch.tensor([[2, 4]], dtype=torch.long)
+    block_keep_mask = torch.tensor([[True, True]])
+
+    mask = create_dense_attention_mask(
+        anchor_positions=anchor_positions,
+        block_keep_mask=block_keep_mask,
+        ctx_len=6,
+        block_size=2,
+    )
+
+    assert mask.dtype == torch.bool
+    assert mask.shape == (1, 1, 4, 10)
+    assert torch.nonzero(mask[0, 0, 0], as_tuple=False).flatten().tolist() == [0, 1, 6, 7]
+    assert torch.nonzero(mask[0, 0, 1], as_tuple=False).flatten().tolist() == [0, 1, 6, 7]
+    assert torch.nonzero(mask[0, 0, 2], as_tuple=False).flatten().tolist() == [0, 1, 2, 3, 8, 9]
+    assert torch.nonzero(mask[0, 0, 3], as_tuple=False).flatten().tolist() == [0, 1, 2, 3, 8, 9]
+
+
+def test_dspark_dense_attention_mask_keeps_dummy_rows_finite_safe():
+    anchor_positions = torch.tensor([[2, 0]], dtype=torch.long)
+    block_keep_mask = torch.tensor([[True, False]])
+
+    mask = create_dense_attention_mask(
+        anchor_positions=anchor_positions,
+        block_keep_mask=block_keep_mask,
+        ctx_len=6,
+        block_size=2,
+    )
+
+    assert torch.nonzero(mask[0, 0, 2], as_tuple=False).flatten().tolist() == [8]
+    assert torch.nonzero(mask[0, 0, 3], as_tuple=False).flatten().tolist() == [9]
 
 
 def test_dspark_first_position_is_masked_when_first_target_invalid():
