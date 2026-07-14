@@ -413,6 +413,7 @@ class DrafterBaseTrainer:
         self._training_initialized = False
         self._training_active = False
         self.training_steps = 0
+        self.optimizer_steps_total = 0
         self._alignment_debug_step = None
         self._alignment_debug_counts = {}
 
@@ -568,6 +569,9 @@ class DrafterBaseTrainer:
             if key in sums:
                 metrics[key] = sums[key] / steps
         metrics[f"{prefix}/metric_steps"] = float(self._training_metric_steps)
+        metrics["drafter/optimizer_steps_total"] = float(self.optimizer_steps_total)
+        if self.optimizer is not None and self.optimizer.param_groups:
+            metrics["drafter/current_lr"] = float(self.optimizer.param_groups[0]["lr"])
 
         for pos in range(int(self._block_drafter_config_value("block_size", 16))):
             count_key = f"{prefix}/count_per_position/{pos}"
@@ -3014,16 +3018,20 @@ class DrafterBaseTrainer:
             )
             self.optimizer.zero_grad(set_to_none=True)
             return False
+        current_lr = float(self.optimizer.param_groups[0]["lr"])
         self.optimizer.step()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
+        self.optimizer_steps_total += 1
         self.optimizer.zero_grad(set_to_none=True)
         self.record_training_timing("timing_s/drafter_optimizer", time.time() - optimizer_ts)
 
         self.training_steps += 1
         logger.warning(
-            "[drafter loss] step=%s loss=%.4f vloss=%.4f ploss=%.4f",
+            "[drafter loss] step=%s optimizer_step_total=%s lr=%.3e loss=%.4f vloss=%.4f ploss=%.4f",
             self.training_steps,
+            self.optimizer_steps_total,
+            current_lr,
             float(loss.item()),
             float(vloss.item()),
             float(ploss.item()),
