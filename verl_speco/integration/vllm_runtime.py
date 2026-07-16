@@ -493,8 +493,8 @@ def build_vllm_speculative_config_from_drafter(
     algorithm = _drafter_algorithm(drafter_cfg)
     method = _speculative_method_from_drafter(drafter_cfg)
     spec_model_path = _first_present(
-        drafter_cfg.get("checkpoint_path"),
         drafter_cfg.get("model_path"),
+        drafter_cfg.get("checkpoint_path"),
         _get_nested(drafter_cfg, ("spec_model", "path"), None),
         _get_nested(drafter_cfg, ("model", "path"), None),
         drafter_cfg.get("spec_model_path"),

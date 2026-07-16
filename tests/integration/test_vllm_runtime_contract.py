@@ -51,6 +51,22 @@ def test_vllm_speculative_config_maps_eagle3_contract() -> None:
     }
 
 
+def test_vllm_fresh_training_does_not_load_checkpoint_output_root() -> None:
+    config = build_vllm_speculative_config_from_drafter(
+        _drafter(checkpoint_path="/checkpoints/run/drafter")
+    )
+
+    assert config["model"] == "/models/drafter"
+
+
+def test_vllm_checkpoint_path_remains_a_fallback_without_model_path() -> None:
+    config = build_vllm_speculative_config_from_drafter(
+        _drafter(model_path=None, checkpoint_path="/checkpoints/draft_step_10")
+    )
+
+    assert config["model"] == "/checkpoints/draft_step_10"
+
+
 def test_vllm_worker_extension_constructs_without_wake_up_fallback() -> None:
     extension = SpecoVLLMColocateWorkerExtension()
 
