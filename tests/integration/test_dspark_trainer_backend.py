@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -12,6 +14,33 @@ DSparkTrainingModel = dspark_backend.DSparkTrainingModel
 DSparkConfig = dspark_models.DSparkConfig
 DSparkDraftModel = dspark_models.DSparkDraftModel
 create_dense_attention_mask = dflash_backend._create_dflash_dense_attention_mask
+
+
+def test_dspark_checkpoint_exports_qwen3_model_type(tmp_path):
+    config = DSparkConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        vocab_size=32,
+        num_target_layers=4,
+        num_context_layers=2,
+        target_hidden_size=8,
+        target_num_hidden_layers=4,
+        target_layer_ids=[1, 3],
+        mask_token_id=31,
+    )
+
+    assert config.model_type == "dspark"
+    config.save_pretrained(tmp_path)
+    saved_config = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert saved_config["model_type"] == "qwen3"
+    assert saved_config["architectures"] == ["DSparkDraftModel"]
+
+    reloaded = DSparkConfig.from_dspark_pretrained(str(tmp_path))
+    assert reloaded.model_type == "dspark"
+    assert reloaded.to_dict()["model_type"] == "qwen3"
 
 
 def _small_dspark_training_model(

@@ -22,7 +22,6 @@ from verl_speco.integration.vllm_runtime import (
     build_vllm_speculative_config_from_drafter,
     configure_vllm_runtime_from_config,
     patch_transformers_attention_layer_type_constants,
-    patch_transformers_dspark_config,
     speco_vllm_update_draft_weights,
 )
 
@@ -98,11 +97,6 @@ def test_vllm_speculative_config_maps_dflash_contract() -> None:
 
 def test_vllm_speculative_config_maps_dspark_to_native_gpu_contract(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: False)
-    register_calls = []
-    monkeypatch.setattr(
-        "verl_speco.integration.vllm_runtime.patch_transformers_dspark_config",
-        lambda: register_calls.append(True) or True,
-    )
 
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
@@ -131,16 +125,10 @@ def test_vllm_speculative_config_maps_dspark_to_native_gpu_contract(tmp_path, mo
         "model": str(model_path),
         "num_speculative_tokens": 16,
     }
-    assert register_calls == []
 
 
 def test_vllm_speculative_config_maps_dspark_to_dflash_on_npu_contract(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True)
-    register_calls = []
-    monkeypatch.setattr(
-        "verl_speco.integration.vllm_runtime.patch_transformers_dspark_config",
-        lambda: register_calls.append(True) or True,
-    )
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     (model_path / "config.json").write_text(
@@ -168,7 +156,6 @@ def test_vllm_speculative_config_maps_dspark_to_dflash_on_npu_contract(tmp_path,
         "model": str(model_path),
         "num_speculative_tokens": 16,
     }
-    assert register_calls == [True]
 
 
 def test_vllm_dspark_gpu_probabilistic_sampling_requires_override(tmp_path, monkeypatch) -> None:
@@ -369,33 +356,6 @@ def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None
     assert configuration_utils_module.ALLOWED_LAYER_TYPES
     assert configuration_utils_module.ALLOWED_LAYER_TYPES == configuration_utils_module.ALLOWED_ATTENTION_LAYER_TYPES
     assert patch_transformers_attention_layer_type_constants() is False
-
-
-def test_transformers_dspark_config_registration(monkeypatch) -> None:
-    import verl_speco.integration.vllm_runtime as runtime
-
-    registrations = []
-
-    class FakePretrainedConfig:
-        pass
-
-    class FakeAutoConfig:
-        @classmethod
-        def register(cls, model_type, config_class, **kwargs):
-            registrations.append((model_type, config_class, kwargs))
-
-    transformers_module = types.ModuleType("transformers")
-    transformers_module.AutoConfig = FakeAutoConfig
-    transformers_module.PretrainedConfig = FakePretrainedConfig
-    monkeypatch.setitem(sys.modules, "transformers", transformers_module)
-    monkeypatch.setattr(runtime, "_TRANSFORMERS_DSPARK_CONFIG_REGISTERED", False)
-
-    assert patch_transformers_dspark_config() is True
-    assert registrations[0][0] == "dspark"
-    assert registrations[0][1].model_type == "dspark"
-    assert registrations[0][2] == {"exist_ok": True}
-    assert patch_transformers_dspark_config() is True
-    assert len(registrations) == 1
 
 
 def test_transformers_attention_layer_type_patch_runs_before_vllm_worker_extension_import() -> None:

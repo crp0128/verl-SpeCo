@@ -15,6 +15,7 @@ class DSparkConfig(DFlashConfig):
     """
 
     model_type = "dspark"
+    checkpoint_model_type = "qwen3"
 
     def __init__(
         self,
@@ -48,6 +49,12 @@ class DSparkConfig(DFlashConfig):
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)
         self.loss_decay_gamma = float(loss_decay_gamma)
+
+    def to_dict(self) -> dict:
+        """Serialize checkpoints as Qwen3 while keeping the internal DSpark type."""
+        config = super().to_dict()
+        config["model_type"] = self.checkpoint_model_type
+        return config
 
     @classmethod
     def from_dspark_pretrained(cls, model_path: str):
