@@ -30,6 +30,7 @@ _VLLM_REPLICA_PATCHED = False
 _VLLM_DFLASH_CONFIG_ALIASES_PATCHED = False
 _VLLM_DSPARK_RUNTIME_PATCHED = False
 _VLLM_DSPARK_REGISTRY_ALIAS_PATCHED = False
+_TRANSFORMERS_DSPARK_CONFIG_REGISTERED = False
 
 _DSPARK_VLLM_ARCHITECTURES = {"DSparkDraftModel", "Qwen3DSparkModel", "DeepSeekDSparkModel"}
 _TRANSFORMERS_ATTENTION_LAYER_TYPES_FALLBACK = (
@@ -491,6 +492,8 @@ def build_vllm_speculative_config_from_drafter(
         return {}
 
     algorithm = _drafter_algorithm(drafter_cfg)
+    if algorithm == "DSPARK" and _is_vllm_ascend_runtime_hint():
+        patch_transformers_dspark_config()
     method = _speculative_method_from_drafter(drafter_cfg)
     spec_model_path = _first_present(
         drafter_cfg.get("model_path"),
@@ -704,6 +707,43 @@ def patch_transformers_attention_layer_type_constants() -> bool:
         "[speco vllm compat] patched transformers.configuration_utils missing %s for vLLM import",
         ", ".join(patched_names),
     )
+    return True
+
+
+def patch_transformers_dspark_config() -> bool:
+    """Allow NPU vLLM-Ascend AutoConfig to load SPECO DSpark checkpoints.
+
+    DeepSpec release configs inherit a recognized target model type such as
+    ``qwen3``. SPECO's directly saved trainer checkpoints use the explicit
+    ``dspark`` model type instead, which Transformers must understand before
+    vLLM can apply its DFlash/DSpark architecture aliases.
+    """
+
+    global _TRANSFORMERS_DSPARK_CONFIG_REGISTERED
+    if _TRANSFORMERS_DSPARK_CONFIG_REGISTERED:
+        return True
+
+    try:
+        from transformers import AutoConfig, PretrainedConfig
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to register Transformers DSpark config: %s", exc)
+        return False
+
+    class SpecoDSparkConfig(PretrainedConfig):
+        model_type = "dspark"
+
+    try:
+        AutoConfig.register("dspark", SpecoDSparkConfig, exist_ok=True)
+    except TypeError:
+        try:
+            AutoConfig.register("dspark", SpecoDSparkConfig)
+        except ValueError:
+            pass
+    except ValueError:
+        pass
+
+    _TRANSFORMERS_DSPARK_CONFIG_REGISTERED = True
+    logger.warning("[speco vllm compat] registered Transformers config for model_type=dspark")
     return True
 
 
