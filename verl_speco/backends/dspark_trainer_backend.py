@@ -575,7 +575,6 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             confidence_head_with_markov=bool(training_cfg.get("dspark_confidence_head_with_markov", True)),
             ce_loss_alpha=float(training_cfg.get("dspark_ce_loss_alpha", 0.1)),
             l1_loss_alpha=float(training_cfg.get("dspark_l1_loss_alpha", 0.9)),
-            architectures=["DSparkDraftModel"],
         )
 
     def build_model(self):

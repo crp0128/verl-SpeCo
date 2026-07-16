@@ -103,7 +103,7 @@ def test_vllm_speculative_config_maps_dspark_to_native_gpu_contract(tmp_path, mo
     (model_path / "config.json").write_text(
         """
         {
-          "architectures": ["DSparkDraftModel"],
+          "architectures": ["Qwen3DSparkModel"],
           "markov_head_type": "vanilla",
           "target_layer_ids": [1, 9, 17, 25, 33]
         }
@@ -134,7 +134,7 @@ def test_vllm_speculative_config_maps_dspark_to_dflash_on_npu_contract(tmp_path,
     (model_path / "config.json").write_text(
         """
         {
-          "architectures": ["DSparkDraftModel"],
+          "architectures": ["Qwen3DSparkModel"],
           "markov_head_type": "vanilla",
           "target_layer_ids": [1, 9, 17, 25, 33]
         }
@@ -163,7 +163,7 @@ def test_vllm_dspark_gpu_probabilistic_sampling_requires_override(tmp_path, monk
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     (model_path / "config.json").write_text(
-        '{"architectures": ["DSparkDraftModel"], "markov_head_type": "vanilla"}',
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
         encoding="utf-8",
     )
 
@@ -184,7 +184,7 @@ def test_vllm_dflash_validator_rejects_dspark_when_algorithm_is_dflash(tmp_path)
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     (model_path / "config.json").write_text(
-        '{"architectures": ["DSparkDraftModel"], "markov_head_type": "vanilla"}',
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
         encoding="utf-8",
     )
 
@@ -196,7 +196,7 @@ def test_vllm_dspark_validator_accepts_markov_head_config(tmp_path) -> None:
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     (model_path / "config.json").write_text(
-        '{"architectures": ["Qwen3ForCausalLM"], "markov_head_type": ""}',
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
         encoding="utf-8",
     )
 
@@ -320,7 +320,7 @@ def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(monke
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     (model_path / "config.json").write_text(
-        '{"architectures": ["DSparkDraftModel"], "markov_head_type": "vanilla"}',
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
         encoding="utf-8",
     )
     config = {

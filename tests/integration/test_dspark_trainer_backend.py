@@ -16,8 +16,8 @@ DSparkDraftModel = dspark_models.DSparkDraftModel
 create_dense_attention_mask = dflash_backend._create_dflash_dense_attention_mask
 
 
-def test_dspark_checkpoint_exports_qwen3_model_type(tmp_path):
-    config = DSparkConfig(
+def test_dspark_checkpoint_preserves_source_config_and_vllm_weight_names(tmp_path) -> None:
+    initial_config = DSparkConfig(
         hidden_size=8,
         intermediate_size=16,
         num_hidden_layers=1,
@@ -31,16 +31,45 @@ def test_dspark_checkpoint_exports_qwen3_model_type(tmp_path):
         target_layer_ids=[1, 3],
         mask_token_id=31,
     )
+    source_dir = tmp_path / "source"
+    output_dir = tmp_path / "output"
+    source_dir.mkdir()
+    source_config = initial_config.to_dict()
+    source_config.update(
+        {
+            "model_type": "qwen3",
+            "architectures": ["Qwen3DSparkModel"],
+            "num_anchors": 17,
+            "source_only_field": {"preserved": True},
+        }
+    )
+    source_config.pop("enable_confidence_head", None)
+    (source_dir / "config.json").write_text(json.dumps(source_config), encoding="utf-8")
+    config = DSparkConfig.from_dspark_pretrained(str(source_dir))
+    config.num_anchors = 99
+
+    model = DSparkDraftModel(config)
+    state_keys = set(model.state_dict())
+    assert {"fc.weight", "hidden_norm.weight", "norm.weight"}.issubset(state_keys)
+    assert not {
+        "context_proj.weight",
+        "context_norm.weight",
+        "final_norm.weight",
+    }.intersection(state_keys)
 
     assert config.model_type == "dspark"
-    config.save_pretrained(tmp_path)
-    saved_config = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
-    assert saved_config["model_type"] == "qwen3"
-    assert saved_config["architectures"] == ["DSparkDraftModel"]
+    model.save_pretrained(output_dir, safe_serialization=False)
+    saved_config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
+    saved_state = torch.load(output_dir / "pytorch_model.bin", map_location="cpu", weights_only=True)
+    for key, value in source_config.items():
+        assert saved_config[key] == value
+    assert saved_config["enable_confidence_head"] is False
+    assert {"fc.weight", "hidden_norm.weight", "norm.weight"}.issubset(saved_state)
 
-    reloaded = DSparkConfig.from_dspark_pretrained(str(tmp_path))
+    reloaded = DSparkConfig.from_dspark_pretrained(str(output_dir))
     assert reloaded.model_type == "dspark"
-    assert reloaded.to_dict()["model_type"] == "qwen3"
+    assert reloaded.to_dict()["model_type"] == source_config["model_type"]
+    assert reloaded.to_dict()["architectures"] == source_config["architectures"]
 
 
 def _small_dspark_training_model(

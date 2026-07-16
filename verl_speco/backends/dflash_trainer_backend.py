@@ -542,11 +542,6 @@ class DFlashTrainerBackend:
         return state_dict
 
     def _normalize_draft_state_dict(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        key_remap = {
-            "fc.weight": "context_proj.weight",
-            "hidden_norm.weight": "context_norm.weight",
-            "norm.weight": "final_norm.weight",
-        }
         normalized_state: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             normalized_key = key
@@ -554,20 +549,19 @@ class DFlashTrainerBackend:
                 if normalized_key.startswith(prefix):
                     normalized_key = normalized_key[len(prefix) :]
                     break
-            normalized_key = key_remap.get(normalized_key, normalized_key)
             normalized_state[normalized_key] = value
         return normalized_state
 
     def _infer_num_context_layers_from_state(self, normalized_state: dict[str, torch.Tensor], target_hidden_size: int) -> int | None:
-        context_proj = normalized_state.get("context_proj.weight")
-        if context_proj is None:
+        fc_weight = normalized_state.get("fc.weight")
+        if fc_weight is None:
             return None
-        if context_proj.ndim != 2:
-            raise ValueError(f"DFlash context_proj.weight must be rank-2, got shape {tuple(context_proj.shape)}")
-        input_dim = int(context_proj.shape[1])
+        if fc_weight.ndim != 2:
+            raise ValueError(f"DFlash fc.weight must be rank-2, got shape {tuple(fc_weight.shape)}")
+        input_dim = int(fc_weight.shape[1])
         if input_dim % int(target_hidden_size) != 0:
             raise ValueError(
-                f"DFlash context_proj.weight input dim {input_dim} is not divisible by "
+                f"DFlash fc.weight input dim {input_dim} is not divisible by "
                 f"target_hidden_size={target_hidden_size}"
             )
         return input_dim // int(target_hidden_size)
@@ -612,7 +606,7 @@ class DFlashTrainerBackend:
 
         if state_num_context_layers is not None and ids_num_context_layers is not None and state_num_context_layers != ids_num_context_layers:
             raise ValueError(
-                f"DFlash checkpoint/config mismatch in {spec_model_path}: context_proj.weight implies "
+                f"DFlash checkpoint/config mismatch in {spec_model_path}: fc.weight implies "
                 f"{state_num_context_layers} context layers, but target_layer_ids has {ids_num_context_layers} entries"
             )
 
@@ -660,6 +654,13 @@ class DFlashTrainerBackend:
     ) -> None:
         if normalized_state is None:
             normalized_state = self._normalize_draft_state_dict(self._load_draft_state_dict(model_path))
+        required_backbone_keys = {"fc.weight", "hidden_norm.weight", "norm.weight"}
+        missing_backbone_keys = sorted(required_backbone_keys.difference(normalized_state))
+        if missing_backbone_keys:
+            raise ValueError(
+                "DFlash/DSpark checkpoint does not use the canonical vLLM parameter names; "
+                f"missing={missing_backbone_keys} model_path={model_path}"
+            )
 
         model_state = draft_model.state_dict()
         filtered_state: dict[str, torch.Tensor] = {}
@@ -671,9 +672,9 @@ class DFlashTrainerBackend:
                 continue
             if tuple(model_state[key].shape) != tuple(value.shape):
                 mismatched.append((key, tuple(value.shape), tuple(model_state[key].shape)))
-                if key == "context_proj.weight":
+                if key == "fc.weight":
                     raise ValueError(
-                        "DFlash context_proj.weight shape mismatch after config normalization: "
+                        "DFlash fc.weight shape mismatch after config normalization: "
                         f"checkpoint={tuple(value.shape)} model={tuple(model_state[key].shape)}"
                     )
                 continue
