@@ -8,14 +8,14 @@ speco:
 
   verl_base:
     version: "0.8.0"
-    commit: "7aed6b230776f963fa09509c10d9c3a767d1102c"
+    branch: release/v0.8.0
     source_modifications_allowed: false
 
   compatibility:
     policy: warn
     strict_env: VERL_SPECO_STRICT_VERL
-    require_verl_base_tag: v0.8.0
-    require_verl_base_commit: 7aed6b230776f963fa09509c10d9c3a767d1102c
+    require_verl_base_branch: release/v0.8.0
+    require_verl_base_version: 0.8.0
 
   trainer:
     task_runner: verl_speco.integration.task_runner.SpecoTaskRunner

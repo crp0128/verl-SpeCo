@@ -20,12 +20,11 @@ from torch.distributed.fsdp import CPUOffload, MixedPrecision, ShardingStrategy
 from torch.nn import SmoothL1Loss
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-from verl.utils.device import get_device_name, get_torch_device
+from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl_speco.trainer.data_buffer import DataBuffer
 from verl.utils.fsdp_utils import (
     get_fsdp_full_state_dict,
     get_fsdp_wrap_policy,
-    get_device_id,
     apply_fsdp2,
     fsdp2_load_full_state_dict,
     load_fsdp_model_to_gpu,

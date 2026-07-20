@@ -120,6 +120,33 @@ def test_oldlogprob_entropy_wrapper_respects_no_drafter_entropy_config() -> None
     assert _no_drafter_trainer()._speco_oldlogprob_entropy_hook_enabled() is False
 
 
+def test_no_drafter_vllm_path_disables_async_scheduling() -> None:
+    task_runner = pytest.importorskip(
+        "verl_speco.integration.task_runner",
+        reason="no-drafter scheduler contract needs verl and Ray",
+    )
+    from omegaconf import OmegaConf
+
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {
+                    "name": "vllm",
+                    "drafter": {"enable": False},
+                    "engine_kwargs": {"vllm": {}},
+                }
+            }
+        }
+    )
+
+    with task_runner._prepare_no_drafter_upstream_config(config):
+        assert "drafter" not in config.actor_rollout_ref.rollout
+        assert config.actor_rollout_ref.rollout.engine_kwargs.vllm["no-async-scheduling"] is True
+
+    assert "drafter" in config.actor_rollout_ref.rollout
+    assert "no-async-scheduling" not in config.actor_rollout_ref.rollout.engine_kwargs.vllm
+
+
 def test_oldlogprob_non_collect_step_uses_original_compute_path() -> None:
     trainer = _trainer(
         {
