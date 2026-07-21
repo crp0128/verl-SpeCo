@@ -15,6 +15,7 @@ from packaging import version
 from verl_speco.trainer.checkpoint import (
     format_checkpoint_memory_snapshot,
     release_checkpoint_host_memory,
+    trim_process_host_memory,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,19 @@ _VLLM_FUSED_MOE_MODULE = "vllm.model_executor.layers.fused_moe"
 _VERL_FSDP_ENGINE_MODULE = "verl.workers.engine.fsdp.transformer_impl"
 _IMPORT_COMPAT_APPLIED = False
 _NPU_CHECKPOINT_RECLAIM_APPLIED = False
+
+try:
+    from verl.single_controller.base.decorator import Dispatch, register
+except Exception:  # noqa: BLE001
+    Dispatch = None
+
+    def register(*args, **kwargs):
+        del args, kwargs
+
+        def decorator(func):
+            return func
+
+        return decorator
 
 
 def _module_available(module_name: str) -> bool:
@@ -140,6 +154,36 @@ def install_verl_npu_checkpoint_reclaim(
     return True
 
 
+def _is_npu_worker() -> bool:
+    if not _module_available("torch_npu"):
+        return False
+    try:
+        device_module = importlib.import_module("verl.utils.device")
+        return device_module.get_device_name() == "npu"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _reclaim_actor_update_host_memory(worker: Any, global_steps: int | None) -> None:
+    if not _is_npu_worker():
+        return
+
+    rank = int(getattr(worker, "rank", -1) or 0)
+    step = int(global_steps) if global_steps is not None else None
+    should_log = rank == 0 and (step is None or step <= 2 or step % 10 == 0)
+    before = format_checkpoint_memory_snapshot() if should_log else None
+    reclaim = trim_process_host_memory()
+    if should_log:
+        logger.warning(
+            "[actor host reclaim] step=%s elapsed=%.3fs trimmed=%s before=(%s) after=(%s)",
+            step,
+            reclaim["elapsed_sec"],
+            int(reclaim["heap_trimmed"]),
+            before,
+            format_checkpoint_memory_snapshot(),
+        )
+
+
 class VerlNPUVLLMImportCompatMixin:
     """Install import compatibility when WorkerDict constructs the worker."""
 
@@ -147,3 +191,15 @@ class VerlNPUVLLMImportCompatMixin:
         install_verl_npu_vllm_import_compat()
         install_verl_npu_checkpoint_reclaim()
         super().__init__(*args, **kwargs)
+
+    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
+    async def update_weights(self, global_steps: int = None, mode: str = "auto"):
+        try:
+            return await super().update_weights(global_steps=global_steps, mode=mode)
+        finally:
+            # Full-model FSDP materialization and NPU IPC staging finish here.
+            # Trim only now, when the inherited coroutine no longer owns them.
+            try:
+                _reclaim_actor_update_host_memory(self, global_steps)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Actor host-memory reclaim failed at step=%s: %s", global_steps, exc)

@@ -3680,7 +3680,7 @@ class DrafterBaseTrainer:
         state_dict = self._pending_publish_state_dict
         self.clear_pending_publish_state_dict()
         return True, state_dict
-    
+
     async def cleanup_training(self, clear_data: bool = True):
         # First set training as inactive to prevent further steps
         self._training_active = False
@@ -3795,10 +3795,14 @@ class DrafterBaseTrainer:
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
 
-        try:
-            self._move_target_lm_head("cpu")
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"Failed to offload drafter target lm_head during cleanup: {e}")
+        # Keep block-drafter target_lm_head on device; Eagle target_model keeps
+        # its legacy offload behavior.
+        target_model = getattr(self.backend, "target_model", None)
+        if target_model is not None:
+            try:
+                target_model.to("cpu")
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Failed to offload drafter target model during cleanup: {e}")
         
         if clear_data:
             self.collected_data.clear()
@@ -3840,10 +3844,14 @@ class DrafterBaseTrainer:
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter optimizer after activation warmup: {e}")
 
-        try:
-            self._move_target_lm_head("cpu")
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"Failed to offload drafter target lm_head after activation warmup: {e}")
+        # Keep block-drafter target_lm_head on device; Eagle target_model keeps
+        # its legacy offload behavior.
+        target_model = getattr(self.backend, "target_model", None)
+        if target_model is not None:
+            try:
+                target_model.to("cpu")
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Failed to offload drafter target model after activation warmup: {e}")
 
         if device_name != "cpu" and hasattr(self.device_module, "empty_cache"):
             if hasattr(self.device_module, "synchronize"):
