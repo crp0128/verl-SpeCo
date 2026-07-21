@@ -105,7 +105,7 @@ def test_public_checkpoint_path_rewrites_dspark_runtime_config(tmp_path):
     assert (checkpoint_dir / "speco_training_config.json").exists()
 
 
-def test_standalone_checkpoint_prunes_after_runtime_config_rewrite(tmp_path):
+def test_standalone_checkpoint_rewrites_runtime_config_after_save(tmp_path):
     checkpoint_dir = tmp_path / "draft_step_5"
     checkpoint_dir.mkdir()
     source_dir = tmp_path / "source_dspark"
@@ -120,30 +120,23 @@ def test_standalone_checkpoint_prunes_after_runtime_config_rewrite(tmp_path):
     )
     events = []
 
-    class _DeferredPruneTrainer:
+    class _CheckpointTrainer:
         backend = SimpleNamespace(model_type="dspark")
         config = SimpleNamespace(
             rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(source_dir)))
         )
 
         @staticmethod
-        def save_checkpoint(step: int, wait: bool, prune_after_save: bool):
+        def save_checkpoint(step: int, wait: bool):
             assert step == 5
             assert wait is True
-            assert prune_after_save is False
             events.append("save")
             return {"saved": True, "reason": "saved", "path": str(checkpoint_dir)}
 
-        @staticmethod
-        def prune_checkpoints():
-            runtime_config = json.loads((checkpoint_dir / "config.json").read_text(encoding="utf-8"))
-            assert runtime_config["model_type"] == "deepseek_v3"
-            events.append("prune")
-
-    result = _save_standalone_checkpoint(_DeferredPruneTrainer(), 5, wait=True)
+    result = _save_standalone_checkpoint(_CheckpointTrainer(), 5, wait=True)
 
     assert result["saved"] is True
-    assert events == ["save", "prune"]
+    assert events == ["save"]
 
 
 def test_standalone_dspark_checkpoint_preserves_source_runtime_config(tmp_path):

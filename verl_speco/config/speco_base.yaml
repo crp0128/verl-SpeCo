@@ -80,7 +80,6 @@ actor_rollout_ref:
         draft_update_flush_after: true
         skip_heavy_cleanup_after_drafter_training: false
         save_full_drafter_checkpoint: true
-        max_drafter_ckpt_to_keep: 1
         sample_last_n_steps: 20
         train_batches_per_cycle: 4
         lr: 1e-5

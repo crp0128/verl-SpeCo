@@ -339,11 +339,10 @@ def test_drafter_checkpoint_results_propagate_save_failure() -> None:
         )
 
 
-def test_drafter_pruning_runs_after_actor_checkpoint_success(monkeypatch) -> None:
+def test_drafter_checkpoint_saves_before_actor_checkpoint(monkeypatch) -> None:
     trainer = _trainer({}, step=20)
     events = []
     trainer._speco_save_drafter_checkpoint = lambda **kwargs: events.append(("drafter", kwargs))
-    trainer._speco_prune_drafter_checkpoints = lambda: events.append(("prune", {}))
     parent_cls = SpecoRayPPOTrainer.__mro__[1]
     monkeypatch.setattr(
         parent_cls,
@@ -355,7 +354,6 @@ def test_drafter_pruning_runs_after_actor_checkpoint_success(monkeypatch) -> Non
     assert events == [
         ("drafter", {"wait": True}),
         ("actor", {}),
-        ("prune", {}),
     ]
 
 
@@ -363,7 +361,6 @@ def test_actor_checkpoint_failure_preserves_previous_drafter(monkeypatch) -> Non
     trainer = _trainer({}, step=20)
     events = []
     trainer._speco_save_drafter_checkpoint = lambda **kwargs: events.append(("drafter", kwargs))
-    trainer._speco_prune_drafter_checkpoints = lambda: events.append(("prune", {}))
     parent_cls = SpecoRayPPOTrainer.__mro__[1]
 
     def fail_actor_checkpoint(self):

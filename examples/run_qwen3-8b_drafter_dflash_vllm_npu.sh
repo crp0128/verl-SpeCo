@@ -100,7 +100,5 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     trainer.default_local_dir=${CKPTS_DIR} \
     trainer.total_training_steps=200 \
     trainer.save_freq=20 \
-    trainer.max_actor_ckpt_to_keep=1 \
-    trainer.max_critic_ckpt_to_keep=1 \
     trainer.test_freq=5 \
     trainer.total_epochs=6 $@

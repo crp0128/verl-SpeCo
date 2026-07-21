@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import sys
 import time
 from glob import glob
@@ -148,53 +147,6 @@ def is_pretrained_drafter_checkpoint(model_path: Optional[Union[str, os.PathLike
     return True
 
 
-def prune_drafter_checkpoints(
-    checkpoint_root: Optional[Union[str, os.PathLike]],
-    max_to_keep: Optional[int],
-) -> list[str]:
-    """Remove old complete managed checkpoints while preserving incomplete ones."""
-    if not checkpoint_root or max_to_keep is None:
-        return []
-    try:
-        keep_count = int(max_to_keep)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"max_to_keep must be an integer or null, got {max_to_keep!r}") from exc
-    if keep_count < 1:
-        raise ValueError(f"max_to_keep must be at least 1, got {keep_count}")
-
-    root = os.fspath(checkpoint_root)
-    if not os.path.isdir(root):
-        return []
-
-    complete_checkpoints: list[tuple[int, str]] = []
-    try:
-        with os.scandir(root) as entries:
-            for entry in entries:
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-                step = _managed_checkpoint_step(entry.path)
-                if step is None:
-                    continue
-                try:
-                    if is_pretrained_drafter_checkpoint(entry.path):
-                        complete_checkpoints.append((step, entry.path))
-                except DrafterCheckpointMetadataError as exc:
-                    logger.warning("Skip pruning invalid drafter checkpoint %s: %s", entry.path, exc)
-    except OSError as exc:
-        logger.warning("Failed to inspect drafter checkpoint root %s for pruning: %s", root, exc)
-        return []
-
-    complete_checkpoints.sort(key=lambda item: item[0], reverse=True)
-    removed = []
-    for _, checkpoint_path in complete_checkpoints[keep_count:]:
-        try:
-            shutil.rmtree(checkpoint_path)
-            removed.append(checkpoint_path)
-        except OSError as exc:
-            logger.warning("Failed to prune old drafter checkpoint %s: %s", checkpoint_path, exc)
-    return removed
-
-
 def format_checkpoint_memory_snapshot() -> str:
     """Return concise Linux process/system memory counters without extra dependencies."""
 
@@ -213,12 +165,30 @@ def format_checkpoint_memory_snapshot() -> str:
             return {}
         return values
 
-    process = _read_kib("/proc/self/status", {"VmRSS"})
-    system = _read_kib("/proc/meminfo", {"MemAvailable", "Cached", "Dirty", "Writeback"})
+    process = _read_kib("/proc/self/status", {"VmRSS", "RssAnon", "RssShmem"})
+    system = _read_kib(
+        "/proc/meminfo",
+        {"MemTotal", "MemAvailable", "Cached", "Shmem", "Dirty", "Writeback"},
+    )
+    dev_shm_used_kib = None
+    try:
+        stat = os.statvfs("/dev/shm")
+        dev_shm_used_kib = ((stat.f_blocks - stat.f_bfree) * stat.f_frsize) // 1024
+    except (AttributeError, OSError):
+        pass
     counters = {
         "rss_gib": process.get("VmRSS"),
+        "anon_gib": process.get("RssAnon"),
+        "rss_shmem_gib": process.get("RssShmem"),
+        "node_unavailable_gib": (
+            system["MemTotal"] - system["MemAvailable"]
+            if "MemTotal" in system and "MemAvailable" in system
+            else None
+        ),
         "available_gib": system.get("MemAvailable"),
         "cached_gib": system.get("Cached"),
+        "node_shmem_gib": system.get("Shmem"),
+        "dev_shm_used_gib": dev_shm_used_kib,
         "dirty_gib": system.get("Dirty"),
         "writeback_gib": system.get("Writeback"),
     }
@@ -241,6 +211,17 @@ def _trim_process_heap() -> bool:
         return bool(malloc_trim(0))
     except Exception:  # noqa: BLE001
         return False
+
+
+def trim_process_host_memory() -> dict[str, Any]:
+    """Return free glibc arenas without forcing a Python GC cycle."""
+
+    started = time.perf_counter()
+    heap_trimmed = _trim_process_heap()
+    return {
+        "elapsed_sec": time.perf_counter() - started,
+        "heap_trimmed": heap_trimmed,
+    }
 
 
 def _flush_and_drop_checkpoint_file_cache(checkpoint_path: str) -> tuple[int, int]:
