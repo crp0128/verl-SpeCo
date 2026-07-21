@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -11,6 +12,7 @@ from verl_speco.trainer.checkpoint import (
     get_drafter_optimizer_checkpoint_path,
     get_drafter_trainer_state,
     is_pretrained_drafter_checkpoint,
+    prune_drafter_checkpoints,
     resolve_drafter_checkpoint_path,
 )
 
@@ -118,3 +120,37 @@ def test_resolve_rejects_checkpoint_with_mismatched_metadata_step(tmp_path) -> N
     (checkpoint / "metadata.json").write_text(json.dumps({"step": 19}), encoding="utf-8")
 
     assert resolve_drafter_checkpoint_path(original_model, checkpoint_root, 20) == str(original_model)
+
+
+def test_prune_drafter_checkpoints_keeps_latest_complete_checkpoint(tmp_path) -> None:
+    for step in (10, 20, 30):
+        checkpoint = tmp_path / f"draft_step_{step}"
+        checkpoint.mkdir()
+        (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+        (checkpoint / "pytorch_model.bin").write_bytes(b"weights")
+        (checkpoint / "metadata.json").write_text(
+            json.dumps({"step": step, "complete": True}),
+            encoding="utf-8",
+        )
+
+    incomplete = tmp_path / "draft_step_40"
+    incomplete.mkdir()
+    (incomplete / "config.json").write_text("{}", encoding="utf-8")
+    (incomplete / "pytorch_model.bin").write_bytes(b"weights")
+    corrupt = tmp_path / "draft_step_50"
+    corrupt.mkdir()
+    (corrupt / "config.json").write_text("{}", encoding="utf-8")
+    (corrupt / "pytorch_model.bin").write_bytes(b"weights")
+    (corrupt / "metadata.json").write_text("{bad-json", encoding="utf-8")
+
+    removed = prune_drafter_checkpoints(tmp_path, max_to_keep=1)
+
+    assert {os.path.basename(path) for path in removed} == {"draft_step_10", "draft_step_20"}
+    assert (tmp_path / "draft_step_30").is_dir()
+    assert incomplete.is_dir()
+    assert corrupt.is_dir()
+
+
+def test_prune_drafter_checkpoints_rejects_zero_retention(tmp_path) -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        prune_drafter_checkpoints(tmp_path, max_to_keep=0)

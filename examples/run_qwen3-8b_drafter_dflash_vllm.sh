@@ -91,7 +91,6 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     trainer.experiment_name=${exp_name} \
     trainer.n_gpus_per_node=16 \
     trainer.nnodes=1 \
-    trainer.resume_mode=disable \
     trainer.default_local_dir=${CKPTS_DIR} \
     trainer.total_training_steps=100 \
     trainer.save_freq=20 \
