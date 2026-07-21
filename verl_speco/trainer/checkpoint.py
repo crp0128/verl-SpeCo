@@ -243,17 +243,6 @@ def _trim_process_heap() -> bool:
         return False
 
 
-def trim_process_host_memory() -> dict[str, Any]:
-    """Return free glibc arenas without running a full Python GC cycle."""
-
-    started = time.perf_counter()
-    heap_trimmed = _trim_process_heap()
-    return {
-        "elapsed_sec": time.perf_counter() - started,
-        "heap_trimmed": heap_trimmed,
-    }
-
-
 def _flush_and_drop_checkpoint_file_cache(checkpoint_path: str) -> tuple[int, int]:
     """Flush completed checkpoint files and advise Linux to evict their cache."""
 
@@ -316,14 +305,9 @@ def release_checkpoint_host_memory(
             advised, failed = _flush_and_drop_checkpoint_file_cache(os.fspath(checkpoint_path))
         except Exception:  # noqa: BLE001
             failed = 1
-    try:
-        gc.collect()
-    except Exception:  # noqa: BLE001
-        pass
-    trimmed_after = _trim_process_heap()
     return {
         "elapsed_sec": time.perf_counter() - started,
-        "heap_trimmed": bool(trimmed_before or trimmed_after),
+        "heap_trimmed": trimmed_before,
         "files_advised": advised,
         "files_failed": failed,
     }

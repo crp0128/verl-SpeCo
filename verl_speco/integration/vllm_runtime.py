@@ -8,10 +8,14 @@ keeps draft-only weight publishing as a runtime method on the rollout adapter.
 
 from __future__ import annotations
 
+import atexit
+import gc
+import hashlib
 import json
 import logging
 import os
 import sys
+import threading
 import time
 from contextlib import nullcontext
 from typing import Any, Iterable
@@ -216,6 +220,185 @@ def patch_verl_bucketed_weight_transfer_rebuild_ipc(bucketed_weight_transfer: An
     if getattr(current, "_speco_compat", False):
         return False
     bucketed_weight_transfer.rebuild_ipc = _speco_rebuild_ipc_compat
+    return True
+
+
+def _speco_persistent_weight_shm_name(zmq_handle: str, bucket_size: int) -> str:
+    """Return a job/rank/bucket-scoped shared-memory name.
+
+    ``zmq_handle`` contains the Ray job id, replica id, and local rank in verl.
+    Including the bucket size keeps target and draft transfers isolated when
+    they use different bucket sizes.
+    """
+
+    identity = f"{zmq_handle}\0{int(bucket_size)}".encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()[:24]
+    return f"verl_weights_speco_{digest}"
+
+
+def patch_verl_bucketed_weight_transfer_shm_reuse(bucketed_weight_transfer: Any = None) -> bool:
+    """Reuse one stable SHM mapping per verl weight-transfer channel.
+
+    NPU cannot use torch device IPC, so verl falls back to POSIX shared memory.
+    Upstream creates a new UUID-named bucket for every actor update. If an NPU
+    runtime keeps the old mmap/pinned registration alive after ``close()``, the
+    node can retain one full bucket per rank and update. Keeping the mapping
+    open and reusing it bounds host memory to one bucket per channel.
+
+    CUDA/device IPC is delegated to the untouched upstream implementation.
+    """
+
+    if bucketed_weight_transfer is None:
+        try:
+            from verl.workers.rollout.vllm_rollout import bucketed_weight_transfer
+        except Exception:  # noqa: BLE001
+            return False
+
+    sender_cls = getattr(bucketed_weight_transfer, "BucketedWeightSender", None)
+    receiver_cls = getattr(bucketed_weight_transfer, "BucketedWeightReceiver", None)
+    if sender_cls is None or receiver_cls is None:
+        return False
+
+    sender_init = getattr(sender_cls, "_init_buffer", None)
+    receiver_init = getattr(receiver_cls, "_init_buffer", None)
+    sender_cleanup = getattr(sender_cls, "_cleanup", None)
+    receiver_cleanup = getattr(receiver_cls, "_cleanup", None)
+    methods = (sender_init, receiver_init, sender_cleanup, receiver_cleanup)
+    if not all(callable(method) for method in methods):
+        return False
+    if all(getattr(method, "_speco_shm_reuse", False) for method in methods):
+        return False
+
+    cache = getattr(bucketed_weight_transfer, "_speco_persistent_weight_shm_cache", None)
+    if cache is None:
+        cache = {}
+        bucketed_weight_transfer._speco_persistent_weight_shm_cache = cache
+    owner_names = getattr(bucketed_weight_transfer, "_speco_persistent_weight_shm_owner_names", None)
+    if owner_names is None:
+        owner_names = set()
+        bucketed_weight_transfer._speco_persistent_weight_shm_owner_names = owner_names
+    cache_lock = getattr(bucketed_weight_transfer, "_speco_persistent_weight_shm_lock", None)
+    if cache_lock is None:
+        cache_lock = threading.Lock()
+        bucketed_weight_transfer._speco_persistent_weight_shm_lock = cache_lock
+
+    if not getattr(bucketed_weight_transfer, "_speco_persistent_weight_shm_cleanup_registered", False):
+
+        def _cleanup_persistent_weight_shm() -> None:
+            with cache_lock:
+                entries = list(cache.items())
+                cache.clear()
+                owned = set(owner_names)
+                owner_names.clear()
+
+            # Drop torch.frombuffer views before closing their mmap objects.
+            shm_entries = [(name, entry[1]) for name, entry in entries]
+            entries.clear()
+            gc.collect()
+            for name, shm in shm_entries:
+                try:
+                    shm.close()
+                except (BufferError, OSError) as exc:
+                    logger.warning("[speco weight shm] close failed name=%s: %s", name, exc)
+                if name in owned:
+                    try:
+                        shm.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        logger.warning("[speco weight shm] unlink failed name=%s: %s", name, exc)
+
+        bucketed_weight_transfer._speco_cleanup_persistent_weight_shm = _cleanup_persistent_weight_shm
+        bucketed_weight_transfer._speco_persistent_weight_shm_cleanup_registered = True
+        atexit.register(_cleanup_persistent_weight_shm)
+
+    def _get_cached_buffer(shm_name: str, shm_size: int, *, owner: bool):
+        with cache_lock:
+            cached = cache.get(shm_name)
+            if cached is not None:
+                buffer, shm = cached
+                if int(getattr(shm, "size", shm_size)) < shm_size:
+                    raise RuntimeError(
+                        f"Persistent weight SHM {shm_name!r} is smaller than requested: "
+                        f"{getattr(shm, 'size', None)} < {shm_size}"
+                    )
+                if owner:
+                    owner_names.add(shm_name)
+                return buffer, shm
+
+            if owner:
+                shm = bucketed_weight_transfer.create_shared_memory(shm_size, shm_name)
+                buffer = bucketed_weight_transfer.torch.frombuffer(
+                    shm.buf,
+                    dtype=bucketed_weight_transfer.torch.uint8,
+                )
+                owner_names.add(shm_name)
+                role = "sender"
+            else:
+                buffer, shm = bucketed_weight_transfer.rebuild_shared_memory(
+                    shm_name,
+                    shm_size,
+                    dtype=bucketed_weight_transfer.torch.uint8,
+                )
+                role = "receiver"
+            cache[shm_name] = (buffer, shm)
+            logger.warning(
+                "[speco weight shm] persistent mapping ready role=%s name=%s size_mb=%.1f",
+                role,
+                shm_name,
+                shm_size / (1 << 20),
+            )
+            return buffer, shm
+
+    def _sender_init_buffer_with_shm_reuse(self):
+        if not bool(getattr(self, "use_shm", False)):
+            return sender_init(self)
+        shm_name = _speco_persistent_weight_shm_name(self.zmq_handle, self.bucket_size)
+        buffer, shm = _get_cached_buffer(shm_name, self.bucket_size, owner=True)
+        self.socket.send_pyobj({"name": shm_name, "size": self.bucket_size})
+        self.socket.recv()
+        self.buffer = buffer
+        self.shm = shm
+
+    def _receiver_init_buffer_with_shm_reuse(self):
+        if not bool(getattr(self, "use_shm", False)):
+            return receiver_init(self)
+        comm_metadata = self.socket.recv_pyobj()
+        shm_name = comm_metadata["name"]
+        shm_size = int(comm_metadata["size"])
+        buffer, shm = _get_cached_buffer(shm_name, shm_size, owner=False)
+        self.socket.send(b"")
+        self.buffer = buffer
+        self.shm = shm
+
+    def _sender_cleanup_with_shm_reuse(self):
+        if not bool(getattr(self, "use_shm", False)):
+            return sender_cleanup(self)
+        # The module-level cache owns the mapping. Let upstream clean sockets
+        # and device caches without closing or unlinking the persistent SHM.
+        self.buffer = None
+        self.shm = None
+        return sender_cleanup(self)
+
+    def _receiver_cleanup_with_shm_reuse(self):
+        if not bool(getattr(self, "use_shm", False)):
+            return receiver_cleanup(self)
+        self.buffer = None
+        self.shm = None
+        return receiver_cleanup(self)
+
+    for method in (
+        _sender_init_buffer_with_shm_reuse,
+        _receiver_init_buffer_with_shm_reuse,
+        _sender_cleanup_with_shm_reuse,
+        _receiver_cleanup_with_shm_reuse,
+    ):
+        method._speco_shm_reuse = True
+
+    sender_cls._init_buffer = _sender_init_buffer_with_shm_reuse
+    receiver_cls._init_buffer = _receiver_init_buffer_with_shm_reuse
+    sender_cls._cleanup = _sender_cleanup_with_shm_reuse
+    receiver_cls._cleanup = _receiver_cleanup_with_shm_reuse
     return True
 
 
@@ -1620,6 +1803,7 @@ async def speco_vllm_update_draft_weights(self, weights: Any, *args, global_step
             getattr(self, "use_shm", None),
         )
 
+    patch_verl_bucketed_weight_transfer_shm_reuse()
     from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
 
     start_time = time.time()
@@ -1675,6 +1859,7 @@ def attach_update_draft_weights_to_rollout(rollout: Any) -> Any:
 
 def patch_vllm_server_adapter_update() -> None:
     patch_verl_bucketed_weight_transfer_rebuild_ipc()
+    patch_verl_bucketed_weight_transfer_shm_reuse()
     try:
         from verl.workers.rollout.vllm_rollout import vllm_rollout
     except Exception:  # noqa: BLE001
@@ -1693,6 +1878,7 @@ def install_vllm_runtime_for_worker(worker: Any) -> None:
         os.environ[SPECO_DRAFTER_CONFIG_ENV] = drafter_env
     install_vllm_runtime_observability()
     patch_verl_bucketed_weight_transfer_rebuild_ipc()
+    patch_verl_bucketed_weight_transfer_shm_reuse()
     patch_vllm_server_adapter_update()
 
 
@@ -1707,6 +1893,7 @@ class SpecoVLLMWeightSyncCompatExtension(_VLLMWorkerExtensionBase):
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         patched = patch_verl_bucketed_weight_transfer_rebuild_ipc()
+        patch_verl_bucketed_weight_transfer_shm_reuse()
         if patched and int(getattr(self, "local_rank", 0) or 0) == 0:
             logger.warning("[speco vllm weight sync] installed IPC rebuild compatibility")
         return super().update_weights_from_ipc(
@@ -1862,6 +2049,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         from vllm.platforms import current_platform
 
         patch_verl_bucketed_weight_transfer_rebuild_ipc()
+        patch_verl_bucketed_weight_transfer_shm_reuse()
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
 
         is_npu = str(getattr(current_platform, "device_type", "")).lower() == "npu"
@@ -1877,9 +2065,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         all_weights: list[tuple[str, torch.Tensor]] = []
 
         def on_bucket_received(bucket_weights):
-            # Clone immediately: IPC buffer views become invalid after receive_weights()
-            # returns (the buffer is freed in _cleanup()). Cloning while the buffer is
-            # still valid gives each tensor its own GPU storage that outlives the buffer.
+            # Clone immediately: bucket views may be freed (IPC) or overwritten
+            # by the next update (persistent SHM). Give each tensor independent
+            # device storage before receive_weights() returns.
             all_weights.extend([(name, t.detach().clone()) for name, t in bucket_weights])
 
         receiver = BucketedWeightReceiver(
@@ -2029,6 +2217,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Override target weight sync to also reload drafter from checkpoint."""
         patch_verl_bucketed_weight_transfer_rebuild_ipc()
+        patch_verl_bucketed_weight_transfer_shm_reuse()
         # Diagnostic: check draft state BEFORE target sync
         self._speco_diag_draft_state("before_target_sync")
         result = super().update_weights_from_ipc(

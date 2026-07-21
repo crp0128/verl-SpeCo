@@ -163,6 +163,10 @@ def test_checkpoint_host_memory_reclaim_is_best_effort(monkeypatch, tmp_path) ->
     (checkpoint / "model.bin").write_bytes(b"weights")
     events = []
     monkeypatch.setattr(
+        "verl_speco.trainer.checkpoint.gc.collect",
+        lambda: events.append("gc"),
+    )
+    monkeypatch.setattr(
         "verl_speco.trainer.checkpoint._trim_process_heap",
         lambda: events.append("trim") or True,
     )
@@ -173,7 +177,7 @@ def test_checkpoint_host_memory_reclaim_is_best_effort(monkeypatch, tmp_path) ->
 
     result = release_checkpoint_host_memory(checkpoint, drop_file_cache=True)
 
-    assert events == ["trim", ("drop", str(checkpoint)), "trim"]
+    assert events == ["gc", "trim", ("drop", str(checkpoint))]
     assert result["heap_trimmed"] is True
     assert result["files_advised"] == 1
     assert result["files_failed"] == 0

@@ -15,7 +15,6 @@ from packaging import version
 from verl_speco.trainer.checkpoint import (
     format_checkpoint_memory_snapshot,
     release_checkpoint_host_memory,
-    trim_process_host_memory,
 )
 
 logger = logging.getLogger(__name__)
@@ -154,34 +153,14 @@ def install_verl_npu_checkpoint_reclaim(
     return True
 
 
-def _is_npu_worker() -> bool:
-    if not _module_available("torch_npu"):
-        return False
+def _install_weight_transfer_shm_reuse() -> bool:
+    """Install the sender-side SHM reuse patch in the WorkerDict process."""
+
     try:
-        device_module = importlib.import_module("verl.utils.device")
-        return device_module.get_device_name() == "npu"
+        from verl_speco.integration.vllm_runtime import patch_verl_bucketed_weight_transfer_shm_reuse
     except Exception:  # noqa: BLE001
         return False
-
-
-def _reclaim_actor_update_host_memory(worker: Any, global_steps: int | None) -> None:
-    if not _is_npu_worker():
-        return
-
-    rank = int(getattr(worker, "rank", -1) or 0)
-    step = int(global_steps) if global_steps is not None else None
-    should_log = rank == 0 and (step is None or step <= 2 or step % 10 == 0)
-    before = format_checkpoint_memory_snapshot() if should_log else None
-    reclaim = trim_process_host_memory()
-    if should_log:
-        logger.warning(
-            "[actor host reclaim] step=%s elapsed=%.3fs trimmed=%s before=(%s) after=(%s)",
-            step,
-            reclaim["elapsed_sec"],
-            int(reclaim["heap_trimmed"]),
-            before,
-            format_checkpoint_memory_snapshot(),
-        )
+    return patch_verl_bucketed_weight_transfer_shm_reuse()
 
 
 class VerlNPUVLLMImportCompatMixin:
@@ -194,12 +173,8 @@ class VerlNPUVLLMImportCompatMixin:
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
-        try:
-            return await super().update_weights(global_steps=global_steps, mode=mode)
-        finally:
-            # Full-model FSDP materialization and NPU IPC staging finish here.
-            # Trim only now, when the inherited coroutine no longer owns them.
-            try:
-                _reclaim_actor_update_host_memory(self, global_steps)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Actor host-memory reclaim failed at step=%s: %s", global_steps, exc)
+        # Both baseline and speculative runs send actor weights from this
+        # WorkerDict process. Install immediately before the upstream sender is
+        # constructed so no-drafter runs receive the same NPU SHM protection.
+        _install_weight_transfer_shm_reuse()
+        return await super().update_weights(global_steps=global_steps, mode=mode)

@@ -64,12 +64,12 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
     assert events == ["compat", "reclaim", "base"]
 
 
-def test_worker_mixin_reclaims_host_memory_after_weight_update(monkeypatch) -> None:
+def test_worker_mixin_installs_shm_reuse_before_weight_update(monkeypatch) -> None:
     events = []
     monkeypatch.setattr(
         compat,
-        "_reclaim_actor_update_host_memory",
-        lambda worker, step: events.append(("reclaim", worker.rank, step)),
+        "_install_weight_transfer_shm_reuse",
+        lambda: events.append(("shm_reuse",)) or True,
     )
 
     class BaseWorker:
@@ -86,15 +86,15 @@ def test_worker_mixin_reclaims_host_memory_after_weight_update(monkeypatch) -> N
     result = asyncio.run(worker.update_weights(global_steps=4, mode="naive"))
 
     assert result == "updated"
-    assert events == [("update", 4, "naive"), ("reclaim", 3, 4)]
+    assert events == [("shm_reuse",), ("update", 4, "naive")]
 
 
-def test_worker_mixin_reclaims_host_memory_after_weight_update_failure(monkeypatch) -> None:
+def test_worker_mixin_preserves_weight_update_failure(monkeypatch) -> None:
     events = []
     monkeypatch.setattr(
         compat,
-        "_reclaim_actor_update_host_memory",
-        lambda worker, step: events.append((worker.rank, step)),
+        "_install_weight_transfer_shm_reuse",
+        lambda: events.append(("shm_reuse",)) or True,
     )
 
     class BaseWorker:
@@ -110,7 +110,7 @@ def test_worker_mixin_reclaims_host_memory_after_weight_update_failure(monkeypat
     worker = WrappedWorker.__new__(WrappedWorker)
     with pytest.raises(RuntimeError, match="update failed"):
         asyncio.run(worker.update_weights(global_steps=6))
-    assert events == [(1, 6)]
+    assert events == [("shm_reuse",)]
 
 
 def test_npu_checkpoint_reclaim_preserves_native_save(monkeypatch) -> None:

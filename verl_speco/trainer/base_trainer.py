@@ -3,7 +3,6 @@ import json
 import os
 import glob
 import time
-import gc
 import asyncio
 import random
 import fnmatch
@@ -1284,6 +1283,7 @@ class DrafterBaseTrainer:
             write_started = time.perf_counter()
             removed = []
             checkpoint_complete = False
+            write_result = None
             try:
                 os.makedirs(checkpoint_path, exist_ok=True)
                 self._clear_existing_pretrained_weight_files(checkpoint_path)
@@ -1314,7 +1314,7 @@ class DrafterBaseTrainer:
                     len(removed),
                     format_checkpoint_memory_snapshot(),
                 )
-                return {
+                write_result = {
                     "export_elapsed": export_elapsed,
                     "write_elapsed": write_elapsed,
                     "pruned": len(removed),
@@ -1333,6 +1333,9 @@ class DrafterBaseTrainer:
                     reclaim["files_failed"],
                     format_checkpoint_memory_snapshot(),
                 )
+                if write_result is not None:
+                    write_result["reclaim_elapsed"] = reclaim["elapsed_sec"]
+            return write_result
 
         if self._full_checkpoint_executor is None:
             self._full_checkpoint_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="drafter-full-ckpt")
@@ -1406,7 +1409,6 @@ class DrafterBaseTrainer:
             finally:
                 self._pending_full_checkpoint_future = None
         self._sync_checkpoint_phase_error(previous_error, "previous save wait")
-        gc.collect()
 
         if self.model is None:
             self._build_draft_model()
@@ -1432,7 +1434,6 @@ class DrafterBaseTrainer:
             optimizer_started = time.perf_counter()
             optimizer_manifest = self._save_optimizer_checkpoint(checkpoint_path)
             optimizer_elapsed = time.perf_counter() - optimizer_started
-            gc.collect()
             if self._is_checkpoint_leader():
                 from verl_speco.trainer.checkpoint import format_checkpoint_memory_snapshot
 
@@ -1456,13 +1457,18 @@ class DrafterBaseTrainer:
                     export_elapsed = float(write_result.get("export_elapsed", 0.0) or 0.0)
                     write_elapsed = float(write_result.get("write_elapsed", 0.0) or 0.0)
                     pruned = int(write_result.get("pruned", 0) or 0)
+                    reclaim_elapsed = float(write_result.get("reclaim_elapsed", 0.0) or 0.0)
         finally:
             if is_fsdp_wrapped and not was_on_device:
                 offload_started = time.perf_counter()
                 offload_fsdp_model_to_cpu(self.model)
                 offload_elapsed = time.perf_counter() - offload_started
-            reclaim = release_checkpoint_host_memory()
-            reclaim_elapsed = reclaim["elapsed_sec"]
+            # The full-checkpoint writer already clears its state dict and
+            # reclaims once. Ranks without a full-weight write still need one
+            # local cleanup for optimizer/export staging.
+            if future is None:
+                reclaim = release_checkpoint_host_memory()
+                reclaim_elapsed = reclaim["elapsed_sec"]
 
         if self._is_checkpoint_leader():
             from verl_speco.trainer.checkpoint import format_checkpoint_memory_snapshot
@@ -1510,11 +1516,9 @@ class DrafterBaseTrainer:
             self.checkpoint_dir,
             self.max_drafter_ckpt_to_keep,
         )
-        reclaim = release_checkpoint_host_memory()
         logger.warning(
-            "[drafter checkpoint] phase=prune elapsed=%.2fs reclaim=%.2fs removed=%s %s",
+            "[drafter checkpoint] phase=prune elapsed=%.2fs removed=%s %s",
             time.perf_counter() - started,
-            reclaim["elapsed_sec"],
             len(removed),
             format_checkpoint_memory_snapshot(),
         )
@@ -1535,7 +1539,6 @@ class DrafterBaseTrainer:
             return {"waited": True, "completed": False, "reason": "failed", "error": str(exc)}
         finally:
             self._pending_full_checkpoint_future = None
-            gc.collect()
         return {"waited": True, "completed": True, "reason": "completed"}
 
     async def activate_training_model(self) -> bool:
