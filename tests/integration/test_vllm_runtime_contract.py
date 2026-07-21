@@ -369,14 +369,16 @@ def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None
     assert patch_transformers_attention_layer_type_constants() is False
 
 
-def test_transformers_attention_layer_type_patch_runs_before_vllm_worker_extension_import() -> None:
+def test_import_compat_runs_before_vllm_worker_extension_import() -> None:
     source = (
         Path(__file__).resolve().parents[2] / "verl_speco" / "integration" / "vllm_runtime.py"
     ).read_text(encoding="utf-8")
 
-    assert source.index("\npatch_transformers_attention_layer_type_constants()\n") < source.index(
+    extension_import = source.index(
         "from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension"
     )
+    assert source.index("\npatch_transformers_attention_layer_type_constants()\n") < extension_import
+    assert source.index("\ninstall_verl_npu_vllm_import_compat()\n") < extension_import
 
 
 def test_vllm_acceptance_stats_keep_stable_transport_keys() -> None:

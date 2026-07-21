@@ -16,6 +16,8 @@ import time
 from contextlib import nullcontext
 from typing import Any, Iterable
 
+from verl_speco.integration.verl_npu_vllm_compat import install_verl_npu_vllm_import_compat
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -724,9 +726,10 @@ def patch_transformers_attention_layer_type_constants() -> bool:
 
 
 # Ray imports this module to deserialize SpecoVLLMHttpServer before the normal
-# worker runtime hooks run. Patch transformers before any top-level verl/vLLM
-# imports below can transitively import vLLM.
+# worker runtime hooks run. Install both import guards before any top-level
+# verl/vLLM import below, including Worker_TP extension class resolution.
 patch_transformers_attention_layer_type_constants()
+install_verl_npu_vllm_import_compat()
 
 
 def _is_dspark_hf_config(hf_config: Any) -> bool:
