@@ -50,6 +50,7 @@ REQUIRED_MODULES: dict[str, tuple[str, ...]] = {
     "verl.utils.distributed": ("initialize_global_process_group_ray", "set_numa_affinity"),
     "verl.workers.engine_workers": ("ActorRolloutRefWorker", "TrainingWorker"),
     "verl.workers.rollout.replica": ("RolloutReplica", "TokenOutput"),
+    "verl.workers.rollout.llm_server": ("LLMServerClient",),
     "verl.workers.rollout.vllm_rollout.vllm_async_server": ("vLLMHttpServer", "vLLMReplica"),
     "verl.workers.rollout.vllm_rollout.utils": (
         "vLLMColocateWorkerExtension",

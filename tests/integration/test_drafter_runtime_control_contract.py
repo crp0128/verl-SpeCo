@@ -154,6 +154,30 @@ def test_no_drafter_vllm_path_disables_async_scheduling_without_hiding_config() 
     assert "worker_extension_cls" not in config.actor_rollout_ref.rollout.engine_kwargs.vllm
 
 
+def test_task_runner_installs_vllm_import_compat_in_its_own_process(monkeypatch) -> None:
+    task_runner = pytest.importorskip(
+        "verl_speco.integration.task_runner",
+        reason="task-runner import compatibility needs verl and Ray",
+    )
+    from omegaconf import OmegaConf
+    from verl_speco.integration import verl_npu_vllm_compat
+
+    calls = []
+    monkeypatch.setattr(
+        verl_npu_vllm_compat,
+        "install_verl_npu_vllm_import_compat",
+        lambda: calls.append("compat") or True,
+    )
+
+    assert task_runner._install_vllm_import_compat_for_task_runner(
+        OmegaConf.create({"actor_rollout_ref": {"rollout": {"name": "vllm"}}})
+    )
+    assert not task_runner._install_vllm_import_compat_for_task_runner(
+        OmegaConf.create({"actor_rollout_ref": {"rollout": {"name": "sglang"}}})
+    )
+    assert calls == ["compat"]
+
+
 def test_no_drafter_run_keeps_speco_entropy_control(monkeypatch) -> None:
     task_runner = pytest.importorskip(
         "verl_speco.integration.task_runner",

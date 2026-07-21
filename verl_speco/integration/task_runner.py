@@ -54,6 +54,14 @@ def _rollout_name(config):
         return None
 
 
+def _install_vllm_import_compat_for_task_runner(config) -> bool:
+    if _rollout_name(config) != "vllm":
+        return False
+    from verl_speco.integration.verl_npu_vllm_compat import install_verl_npu_vllm_import_compat
+
+    return install_verl_npu_vllm_import_compat()
+
+
 def _open_config_mapping(mapping):
     return open_dict(mapping) if OmegaConf.is_config(mapping) else nullcontext()
 
@@ -109,7 +117,7 @@ class SpecoTaskRunner(TaskRunner):
 
     def add_actor_rollout_worker(self, config):
         worker_cls, ray_worker_group_cls = super().add_actor_rollout_worker(config)
-        if _drafter_rollout_enabled(config) or _rollout_name(config) != "vllm":
+        if _rollout_name(config) != "vllm":
             return worker_cls, ray_worker_group_cls
 
         from verl_speco.integration.verl_npu_vllm_compat import VerlNPUVLLMImportCompatMixin
@@ -119,7 +127,7 @@ class SpecoTaskRunner(TaskRunner):
             return worker_cls, ray_worker_group_cls
 
         wrapped_cls = type(
-            f"SpecoNoDrafter{raw_worker_cls.__name__}",
+            f"SpecoVLLMCompat{raw_worker_cls.__name__}",
             (VerlNPUVLLMImportCompatMixin, raw_worker_cls),
             {
                 "__module__": __name__,
@@ -130,7 +138,7 @@ class SpecoTaskRunner(TaskRunner):
             raw_role_worker_cls = _unwrap_ray_remote_actor_class(role_worker_cls)
             if role_worker_cls is worker_cls or raw_role_worker_cls is raw_worker_cls:
                 self.role_worker_mapping[role] = _remotify_like_worker_mapping_value(role_worker_cls, wrapped_cls)
-        logger.warning("SPECO no-drafter vLLM worker import compatibility enabled: %s", wrapped_cls.__name__)
+        logger.warning("SPECO vLLM worker import compatibility enabled: %s", wrapped_cls.__name__)
         return _remotify_like_worker_mapping_value(worker_cls, wrapped_cls), ray_worker_group_cls
 
     def add_speco_drafter_worker(self, config):
@@ -171,6 +179,9 @@ class SpecoTaskRunner(TaskRunner):
         return _remotify_like_worker_mapping_value(worker_cls, wrapped_cls)
 
     def run(self, config):
+        # Ray actors do not share imported modules. Install this in the task
+        # runner process before LLMServerManager imports verl's vLLM adapter.
+        _install_vllm_import_compat_for_task_runner(config)
         if not _drafter_rollout_enabled(config):
             if _rollout_name(config) != "vllm":
                 return super().run(config)

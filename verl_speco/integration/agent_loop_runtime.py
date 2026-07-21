@@ -212,6 +212,24 @@ def _load_agent_loop_module():
         raise
 
 
+def _resolve_llm_server_client_class(agent_loop_module: Any) -> Any:
+    """Resolve the request client used by legacy and release/v0.8.0 agent loops."""
+
+    client_cls = getattr(agent_loop_module, "LLMServerClient", None)
+    if client_cls is not None:
+        return client_cls
+
+    legacy_cls = getattr(agent_loop_module, "AsyncLLMServerManager", None)
+    if legacy_cls is not None:
+        return legacy_cls
+
+    try:
+        from verl.workers.rollout.llm_server import LLMServerClient
+    except Exception:  # noqa: BLE001
+        return None
+    return LLMServerClient
+
+
 try:
     _AgentLoopModule = _load_agent_loop_module()
     _UpstreamAgentLoopManager = getattr(_AgentLoopModule, "AgentLoopManager", object)
@@ -307,8 +325,8 @@ def install_agent_loop_runtime_patch() -> bool:
 
     worker_cls = getattr(agent_loop_module, "AgentLoopWorker", None)
     manager_cls = getattr(agent_loop_module, "AgentLoopManager", None)
-    llm_server_manager_cls = getattr(agent_loop_module, "AsyncLLMServerManager", None)
-    if worker_cls is None or manager_cls is None or llm_server_manager_cls is None:
+    llm_server_client_cls = _resolve_llm_server_client_class(agent_loop_module)
+    if worker_cls is None or manager_cls is None or llm_server_client_cls is None:
         logger.warning("Unable to install SPECO agent-loop runtime patch: missing upstream classes")
         return False
 
@@ -318,7 +336,7 @@ def install_agent_loop_runtime_patch() -> bool:
     postprocess = getattr(worker_cls, "_postprocess", None)
     manager_init = getattr(manager_cls, "__init__", None)
     manager_generate_sequences = getattr(manager_cls, "generate_sequences", None)
-    llm_server_generate = getattr(llm_server_manager_cls, "generate", None)
+    llm_server_generate = getattr(llm_server_client_cls, "generate", None)
     if (
         not callable(generate_sequences)
         or not callable(run_agent_loop)
@@ -330,7 +348,7 @@ def install_agent_loop_runtime_patch() -> bool:
         logger.warning("Unable to install SPECO agent-loop runtime patch: missing upstream methods")
         return False
 
-    if not getattr(llm_server_manager_cls, "_speco_patched_generate", False):
+    if not getattr(llm_server_client_cls, "_speco_patched_generate", False):
 
         @wraps(llm_server_generate)
         async def speco_llm_server_generate(self, *args, **kwargs):
@@ -341,8 +359,8 @@ def install_agent_loop_runtime_patch() -> bool:
                 result = await result
             return result
 
-        llm_server_manager_cls.generate = speco_llm_server_generate
-        llm_server_manager_cls._speco_patched_generate = True
+        llm_server_client_cls.generate = speco_llm_server_generate
+        llm_server_client_cls._speco_patched_generate = True
 
     if not getattr(worker_cls, "_speco_patched_generate_sequences", False):
 
