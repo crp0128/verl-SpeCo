@@ -440,7 +440,7 @@ class DrafterBaseTrainer:
         self.skip_heavy_cleanup_after_drafter_training = bool(
             training_cfg.get("skip_heavy_cleanup_after_drafter_training", False)
         )
-        max_drafter_ckpt_to_keep = training_cfg.get("max_drafter_ckpt_to_keep", 2)
+        max_drafter_ckpt_to_keep = training_cfg.get("max_drafter_ckpt_to_keep", 1)
         if max_drafter_ckpt_to_keep is None:
             self.max_drafter_ckpt_to_keep = None
         else:
@@ -1223,6 +1223,7 @@ class DrafterBaseTrainer:
         checkpoint_path: str,
         step: int,
         optimizer_manifest: dict[str, Any],
+        prune_after_save: bool,
     ):
         if self._pending_full_checkpoint_future is not None:
             if not self._pending_full_checkpoint_future.done():
@@ -1294,10 +1295,11 @@ class DrafterBaseTrainer:
                     },
                     metadata_path,
                 )
-                removed = prune_drafter_checkpoints(
-                    self.checkpoint_dir,
-                    self.max_drafter_ckpt_to_keep,
-                )
+                if prune_after_save:
+                    removed = prune_drafter_checkpoints(
+                        self.checkpoint_dir,
+                        self.max_drafter_ckpt_to_keep,
+                    )
                 write_elapsed = time.perf_counter() - write_started
                 logger.warning(
                     "[drafter checkpoint] step=%s phase=write elapsed=%.2fs pruned=%s %s",
@@ -1328,12 +1330,14 @@ class DrafterBaseTrainer:
         step: int,
         optimizer_manifest: dict[str, Any],
         is_final: bool = False,
+        prune_after_save: bool = True,
     ):
         """Asynchronously save a directly loadable drafter checkpoint.
 
         Args:
             step: Current training step
             is_final: Whether this is the final checkpoint during cleanup
+            prune_after_save: Whether to prune older checkpoints immediately
 
         Returns:
             Future object for the background save, or None on non-leader ranks
@@ -1342,9 +1346,19 @@ class DrafterBaseTrainer:
             return None
 
         checkpoint_path = os.path.join(self.checkpoint_dir, f"draft_step_{step}")
-        return self._save_pretrained_checkpoint_async(checkpoint_path, step, optimizer_manifest)
+        return self._save_pretrained_checkpoint_async(
+            checkpoint_path,
+            step,
+            optimizer_manifest,
+            prune_after_save,
+        )
 
-    def save_checkpoint(self, step: int, wait: bool = True) -> dict[str, Any]:
+    def save_checkpoint(
+        self,
+        step: int,
+        wait: bool = True,
+        prune_after_save: bool = True,
+    ) -> dict[str, Any]:
         if not self.checkpoint_dir:
             return {"saved": False, "reason": "missing_checkpoint_dir"}
 
@@ -1410,7 +1424,11 @@ class DrafterBaseTrainer:
                     optimizer_elapsed,
                     format_checkpoint_memory_snapshot(),
                 )
-            future = self._save_checkpoint_async(int(step), optimizer_manifest)
+            future = self._save_checkpoint_async(
+                int(step),
+                optimizer_manifest,
+                prune_after_save=prune_after_save,
+            )
             if wait and future is not None:
                 try:
                     write_result = future.result()
@@ -1454,6 +1472,35 @@ class DrafterBaseTrainer:
             "saved": optimizer_manifest is not None,
             "path": checkpoint_path,
             "reason": reason,
+        }
+
+    def prune_checkpoints(self) -> dict[str, Any]:
+        if not self.checkpoint_dir:
+            return {"pruned": 0, "reason": "missing_checkpoint_dir"}
+        if self.rollout_dp_rank != 0 or not self._is_checkpoint_leader():
+            return {"pruned": 0, "reason": "not_checkpoint_leader"}
+
+        from verl_speco.trainer.checkpoint import (
+            format_checkpoint_memory_snapshot,
+            prune_drafter_checkpoints,
+        )
+
+        started = time.perf_counter()
+        removed = prune_drafter_checkpoints(
+            self.checkpoint_dir,
+            self.max_drafter_ckpt_to_keep,
+        )
+        gc.collect()
+        logger.warning(
+            "[drafter checkpoint] phase=prune elapsed=%.2fs removed=%s %s",
+            time.perf_counter() - started,
+            len(removed),
+            format_checkpoint_memory_snapshot(),
+        )
+        return {
+            "pruned": len(removed),
+            "paths": removed,
+            "reason": "pruned",
         }
 
     def wait_checkpoint(self) -> dict[str, Any]:

@@ -337,3 +337,45 @@ def test_drafter_checkpoint_results_propagate_save_failure() -> None:
             [{"saved": False, "reason": "missing_checkpoint_dir"}],
             require_saved=True,
         )
+
+
+def test_drafter_pruning_runs_after_actor_checkpoint_success(monkeypatch) -> None:
+    trainer = _trainer({}, step=20)
+    events = []
+    trainer._speco_save_drafter_checkpoint = lambda **kwargs: events.append(("drafter", kwargs))
+    trainer._speco_prune_drafter_checkpoints = lambda: events.append(("prune", {}))
+    parent_cls = SpecoRayPPOTrainer.__mro__[1]
+    monkeypatch.setattr(
+        parent_cls,
+        "_save_checkpoint",
+        lambda self: events.append(("actor", {})) or "saved",
+    )
+
+    assert trainer._save_checkpoint() == "saved"
+    assert events == [
+        ("drafter", {"wait": True}),
+        ("actor", {}),
+        ("prune", {}),
+    ]
+
+
+def test_actor_checkpoint_failure_preserves_previous_drafter(monkeypatch) -> None:
+    trainer = _trainer({}, step=20)
+    events = []
+    trainer._speco_save_drafter_checkpoint = lambda **kwargs: events.append(("drafter", kwargs))
+    trainer._speco_prune_drafter_checkpoints = lambda: events.append(("prune", {}))
+    parent_cls = SpecoRayPPOTrainer.__mro__[1]
+
+    def fail_actor_checkpoint(self):
+        del self
+        events.append(("actor", {}))
+        raise RuntimeError("actor save failed")
+
+    monkeypatch.setattr(parent_cls, "_save_checkpoint", fail_actor_checkpoint)
+
+    with pytest.raises(RuntimeError, match="actor save failed"):
+        trainer._save_checkpoint()
+    assert events == [
+        ("drafter", {"wait": True}),
+        ("actor", {}),
+    ]

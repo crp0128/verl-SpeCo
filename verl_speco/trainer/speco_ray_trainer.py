@@ -354,8 +354,20 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def speco_maybe_publish(self):
         return self._require_speco_worker_group().maybe_publish()
 
-    def speco_save_checkpoint(self, global_step: int, wait: bool = True):
-        return self._require_speco_worker_group().save_checkpoint(global_step, wait=wait)
+    def speco_save_checkpoint(
+        self,
+        global_step: int,
+        wait: bool = True,
+        prune_after_save: bool = True,
+    ):
+        return self._require_speco_worker_group().save_checkpoint(
+            global_step,
+            wait=wait,
+            prune_after_save=prune_after_save,
+        )
+
+    def speco_prune_checkpoints(self):
+        return self._require_speco_worker_group().prune_checkpoints()
 
     def speco_wait_checkpoint(self):
         return self._require_speco_worker_group().wait_checkpoint()
@@ -647,7 +659,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return None
         if self._speco_ensure_drafter_checkpoint_path() is None:
             return None
-        checkpoint_refs = self.speco_save_checkpoint(self.global_steps, wait=wait)
+        checkpoint_refs = self.speco_save_checkpoint(
+            self.global_steps,
+            wait=wait,
+            prune_after_save=False,
+        )
         if wait:
             results = self._ray_get_if_needed(checkpoint_refs)
             self._speco_validate_drafter_checkpoint_results(results, require_saved=True)
@@ -656,6 +672,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._pending_drafter_checkpoint_refs = []
         self._pending_drafter_checkpoint_refs.append(checkpoint_refs)
         return checkpoint_refs
+
+    def _speco_prune_drafter_checkpoints(self):
+        if not self._speco_should_save_drafter_checkpoint():
+            return None
+        try:
+            return self._ray_get_if_needed(self.speco_prune_checkpoints())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to prune old drafter checkpoints after actor save: %s", exc)
+            return None
 
     def _speco_wait_pending_drafter_checkpoint(self) -> int:
         pending_refs = getattr(self, "_pending_drafter_checkpoint_refs", None)
@@ -1999,4 +2024,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _save_checkpoint(self):
         self._speco_save_drafter_checkpoint(wait=True)
-        return super()._save_checkpoint()
+        result = super()._save_checkpoint()
+        self._speco_prune_drafter_checkpoints()
+        return result

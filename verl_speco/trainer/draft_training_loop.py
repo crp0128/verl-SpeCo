@@ -151,17 +151,24 @@ def _build_backend(draft_config):
 def _save_standalone_checkpoint(trainer: DrafterBaseTrainer, step: int, *, wait: bool = False) -> dict[str, Any]:
     save_checkpoint = getattr(trainer, "save_checkpoint", None)
     if callable(save_checkpoint):
-        result = save_checkpoint(int(step), wait=wait)
+        prune_checkpoints = getattr(trainer, "prune_checkpoints", None)
+        deferred_pruning = callable(prune_checkpoints)
+        if deferred_pruning:
+            result = save_checkpoint(int(step), wait=wait, prune_after_save=False)
+        else:
+            result = save_checkpoint(int(step), wait=wait)
         checkpoint_path = result.get("path")
         is_export_leader = result.get("reason") in {"saved", "scheduled"}
         if result.get("saved") and checkpoint_path and is_export_leader:
             if wait:
                 _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
+                if deferred_pruning:
+                    prune_checkpoints()
             else:
                 future = getattr(trainer, "_pending_full_checkpoint_future", None)
                 if future is not None:
                     future.add_done_callback(
-                        lambda completed: _rewrite_standalone_block_runtime_config(
+                        lambda completed: _finalize_standalone_checkpoint(
                             trainer,
                             checkpoint_path,
                             completed,
@@ -200,6 +207,23 @@ def _save_standalone_checkpoint(trainer: DrafterBaseTrainer, step: int, *, wait:
         "path": checkpoint_path,
         "reason": "saved" if future is not None and wait else "scheduled" if future is not None else "not_checkpoint_leader",
     }
+
+
+def _finalize_standalone_checkpoint(
+    trainer: DrafterBaseTrainer,
+    checkpoint_path: str,
+    completed_future,
+) -> None:
+    try:
+        completed_future.result()
+    except Exception:
+        _rewrite_standalone_block_runtime_config(trainer, checkpoint_path, completed_future)
+        return
+
+    _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
+    prune_checkpoints = getattr(trainer, "prune_checkpoints", None)
+    if callable(prune_checkpoints):
+        prune_checkpoints()
 
 
 def _ensure_dict_child(config: dict[str, Any], key: str) -> dict[str, Any]:

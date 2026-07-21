@@ -47,7 +47,7 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert drafter.training.min_lr_ratio == pytest.approx(0.1)
     assert drafter.training.warmup_style is None
     assert drafter.training.resume_trainer_state_from_checkpoint is True
-    assert drafter.training.max_drafter_ckpt_to_keep == 2
+    assert drafter.training.max_drafter_ckpt_to_keep == 1
     assert drafter.training.eagle1_num_hidden_layers == 1
 
 
