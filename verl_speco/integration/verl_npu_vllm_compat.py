@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import importlib
 import importlib.util
+import inspect
 import logging
 import os
 import sys
@@ -27,6 +28,7 @@ _VERL_FSDP_ENGINE_MODULE = "verl.workers.engine.fsdp.transformer_impl"
 _IMPORT_COMPAT_APPLIED = False
 _NPU_CHECKPOINT_RECLAIM_APPLIED = False
 _NPU_FSDP2_WEIGHT_EXPORT_APPLIED = False
+_FSDP_TRAIN_OUTPUT_RELEASE_APPLIED = False
 
 try:
     from verl.single_controller.base.decorator import Dispatch, register
@@ -101,7 +103,7 @@ def install_verl_npu_vllm_import_compat(
 def install_verl_npu_checkpoint_reclaim(
     module_importer: Callable[[str], Any] = importlib.import_module,
 ) -> bool:
-    """Preserve verl's native actor save path and reclaim host memory after it."""
+    """Preserve native actor saves while fixing FSDP2 CPU-offload staging."""
 
     global _NPU_CHECKPOINT_RECLAIM_APPLIED
     if _NPU_CHECKPOINT_RECLAIM_APPLIED or not _module_available("torch_npu"):
@@ -123,12 +125,53 @@ def install_verl_npu_checkpoint_reclaim(
     ):
         return False
 
+    code = getattr(original_save_checkpoint, "__code__", None)
+    has_fsdp2_cpu_offload_guard = bool(
+        code is not None and "_uses_fsdp2_cpu_offload_policy" in code.co_names
+    )
+
     @functools.wraps(original_save_checkpoint)
-    def save_checkpoint_with_reclaim(self, local_path: str, *args, **kwargs):
+    def save_checkpoint_with_reclaim(
+        self,
+        local_path: str,
+        hdfs_path: str | None = None,
+        global_step: int = 0,
+        max_ckpt_to_keep: int | None = None,
+        **kwargs,
+    ):
         started = time.perf_counter()
         saved = False
         try:
-            result = original_save_checkpoint(self, local_path, *args, **kwargs)
+            uses_fsdp2_cpu_offload = bool(
+                getattr(self, "_uses_fsdp2_cpu_offload_policy", False)
+            )
+            if uses_fsdp2_cpu_offload and not has_fsdp2_cpu_offload_guard:
+                if int(getattr(self, "rank", 0) or 0) == 0 and not getattr(
+                    self,
+                    "_speco_npu_fsdp2_checkpoint_guard_logged",
+                    False,
+                ):
+                    logger.warning(
+                        "[actor checkpoint] skipping manual model move under FSDP2 CPUOffloadPolicy"
+                    )
+                    self._speco_npu_fsdp2_checkpoint_guard_logged = True
+                self.checkpoint_manager.save_checkpoint(
+                    local_path=local_path,
+                    hdfs_path=hdfs_path,
+                    global_step=global_step,
+                    max_ckpt_to_keep=max_ckpt_to_keep,
+                )
+                engine_module.torch.distributed.barrier()
+                result = None
+            else:
+                result = original_save_checkpoint(
+                    self,
+                    local_path,
+                    hdfs_path=hdfs_path,
+                    global_step=global_step,
+                    max_ckpt_to_keep=max_ckpt_to_keep,
+                    **kwargs,
+                )
             saved = True
             return result
         finally:
@@ -153,6 +196,71 @@ def install_verl_npu_checkpoint_reclaim(
     engine_cls.save_checkpoint = save_checkpoint_with_reclaim
     _NPU_CHECKPOINT_RECLAIM_APPLIED = True
     logger.warning("Enabled post-save NPU actor checkpoint host-memory reclaim")
+    return True
+
+
+def install_verl_fsdp_training_output_release_compat(
+    module_importer: Callable[[str], Any] = importlib.import_module,
+) -> bool:
+    """Drop unused per-micro-batch model outputs during FSDP actor training.
+
+    verl release/v0.8.0 retains every training micro-batch's full-length
+    log-probability and entropy outputs until the mini-batch finishes. The
+    training worker discards these outputs after the call, so retaining them
+    only keeps tensors and their autograd graphs alive. This mirrors upstream
+    fixes dbbf0853 and 78bba31d while preserving forward-only inference output.
+    """
+
+    global _FSDP_TRAIN_OUTPUT_RELEASE_APPLIED
+    if _FSDP_TRAIN_OUTPUT_RELEASE_APPLIED:
+        return False
+
+    engine_module = module_importer(_VERL_FSDP_ENGINE_MODULE)
+    engine_cls = getattr(engine_module, "FSDPEngine", None)
+    lm_head_cls = getattr(engine_module, "FSDPEngineWithLMHead", None)
+    if engine_cls is None or lm_head_cls is None:
+        return False
+
+    forward_backward_batch = getattr(engine_cls, "forward_backward_batch", None)
+    try:
+        forward_backward_source = inspect.getsource(forward_backward_batch)
+    except (OSError, TypeError):
+        forward_backward_source = ""
+    upstream_releases_training_output = (
+        "meta_info.pop" in forward_backward_source
+        and (
+            '"model_output"' in forward_backward_source
+            or "'model_output'" in forward_backward_source
+        )
+    )
+    if upstream_releases_training_output:
+        _FSDP_TRAIN_OUTPUT_RELEASE_APPLIED = True
+        return False
+
+    original_forward_step = getattr(lm_head_cls, "forward_step", None)
+    if original_forward_step is None or getattr(
+        original_forward_step,
+        "_speco_training_output_release_compat",
+        False,
+    ):
+        return False
+
+    @functools.wraps(original_forward_step)
+    def forward_step_without_retained_training_output(self, *args, **kwargs):
+        result = original_forward_step(self, *args, **kwargs)
+        forward_only = kwargs.get("forward_only")
+        if forward_only is None and len(args) >= 3:
+            forward_only = args[2]
+        if forward_only is False and isinstance(result, tuple) and len(result) == 2:
+            meta_info = result[1]
+            if isinstance(meta_info, dict):
+                meta_info.pop("model_output", None)
+        return result
+
+    forward_step_without_retained_training_output._speco_training_output_release_compat = True
+    lm_head_cls.forward_step = forward_step_without_retained_training_output
+    _FSDP_TRAIN_OUTPUT_RELEASE_APPLIED = True
+    logger.warning("Enabled FSDP actor training output-release compatibility")
     return True
 
 
@@ -296,6 +404,7 @@ class VerlNPUVLLMImportCompatMixin:
 
     def __init__(self, *args, **kwargs):
         install_verl_npu_vllm_import_compat()
+        install_verl_fsdp_training_output_release_compat()
         install_verl_npu_checkpoint_reclaim()
         install_verl_npu_fsdp2_weight_export_compat()
         super().__init__(*args, **kwargs)

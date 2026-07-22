@@ -49,6 +49,11 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
     monkeypatch.setattr(compat, "install_verl_npu_vllm_import_compat", lambda: events.append("compat"))
     monkeypatch.setattr(
         compat,
+        "install_verl_fsdp_training_output_release_compat",
+        lambda: events.append("training_output_release"),
+    )
+    monkeypatch.setattr(
+        compat,
         "install_verl_npu_checkpoint_reclaim",
         lambda: events.append("reclaim"),
     )
@@ -66,7 +71,7 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
         pass
 
     WrappedWorker()
-    assert events == ["compat", "reclaim", "fsdp2_export", "base"]
+    assert events == ["compat", "training_output_release", "reclaim", "fsdp2_export", "base"]
 
 
 def test_worker_mixin_installs_shm_reuse_before_weight_update(monkeypatch) -> None:
@@ -150,7 +155,15 @@ def test_npu_checkpoint_reclaim_preserves_native_save(monkeypatch) -> None:
 
     assert engine.save_checkpoint("/tmp/actor", global_step=20, max_ckpt_to_keep=1) == "saved"
     assert events == [
-        ("original", ("/tmp/actor",), {"global_step": 20, "max_ckpt_to_keep": 1}),
+        (
+            "original",
+            ("/tmp/actor",),
+            {
+                "hdfs_path": None,
+                "global_step": 20,
+                "max_ckpt_to_keep": 1,
+            },
+        ),
         ("reclaim", "/tmp/actor", True),
     ]
 
@@ -184,3 +197,80 @@ def test_npu_checkpoint_reclaim_runs_after_native_save_failure(monkeypatch) -> N
     with pytest.raises(RuntimeError, match="save failed"):
         FSDPEngine().save_checkpoint("/tmp/actor")
     assert events == [(None, False)]
+
+
+def test_npu_checkpoint_skips_manual_move_with_fsdp2_cpu_offload(monkeypatch) -> None:
+    events = []
+    engine_module = types.ModuleType(compat._VERL_FSDP_ENGINE_MODULE)
+    engine_module.torch = types.SimpleNamespace(
+        distributed=types.SimpleNamespace(barrier=lambda: events.append(("barrier",)))
+    )
+
+    class CheckpointManager:
+        def save_checkpoint(self, **kwargs):
+            events.append(("manager", kwargs))
+
+    class FSDPEngine:
+        rank = 0
+        _uses_fsdp2_cpu_offload_policy = True
+        checkpoint_manager = CheckpointManager()
+
+        def save_checkpoint(self, *args, **kwargs):
+            events.append(("original", args, kwargs))
+
+    engine_module.FSDPEngine = FSDPEngine
+    modules = {
+        compat._VERL_FSDP_ENGINE_MODULE: engine_module,
+        "verl.utils.device": types.SimpleNamespace(get_device_name=lambda: "npu"),
+    }
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(compat, "_NPU_CHECKPOINT_RECLAIM_APPLIED", False)
+    monkeypatch.setattr(
+        compat,
+        "release_checkpoint_host_memory",
+        lambda path, drop_file_cache: events.append(("reclaim", path, drop_file_cache))
+        or {"elapsed_sec": 0.1, "files_advised": 0, "files_failed": 0},
+    )
+    monkeypatch.setattr(compat, "format_checkpoint_memory_snapshot", lambda: "memory")
+
+    assert compat.install_verl_npu_checkpoint_reclaim(modules.__getitem__) is True
+    FSDPEngine().save_checkpoint("/tmp/actor", global_step=20, max_ckpt_to_keep=1)
+
+    assert events == [
+        (
+            "manager",
+            {
+                "local_path": "/tmp/actor",
+                "hdfs_path": None,
+                "global_step": 20,
+                "max_ckpt_to_keep": 1,
+            },
+        ),
+        ("barrier",),
+        ("reclaim", "/tmp/actor", True),
+    ]
+
+
+def test_fsdp_training_output_release_preserves_forward_only(monkeypatch) -> None:
+    engine_module = types.ModuleType(compat._VERL_FSDP_ENGINE_MODULE)
+
+    class FSDPEngine:
+        def forward_backward_batch(self):
+            return None
+
+    class FSDPEngineWithLMHead:
+        def forward_step(self, micro_batch, loss_function, forward_only):
+            del micro_batch, loss_function
+            return "loss", {"model_output": {"log_probs": "tensor"}, "forward_only": forward_only}
+
+    engine_module.FSDPEngine = FSDPEngine
+    engine_module.FSDPEngineWithLMHead = FSDPEngineWithLMHead
+    monkeypatch.setattr(compat, "_FSDP_TRAIN_OUTPUT_RELEASE_APPLIED", False)
+
+    assert compat.install_verl_fsdp_training_output_release_compat(lambda _: engine_module) is True
+    engine = FSDPEngineWithLMHead()
+
+    _, training_output = engine.forward_step(None, None, False)
+    _, inference_output = engine.forward_step(None, None, True)
+    assert "model_output" not in training_output
+    assert inference_output["model_output"] == {"log_probs": "tensor"}

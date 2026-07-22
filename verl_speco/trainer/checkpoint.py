@@ -20,6 +20,17 @@ _OPTIMIZER_DCP_METADATA = ".metadata"
 
 logger = logging.getLogger(__name__)
 
+_PROCESS_MEMORY_GROUPS = (
+    ("agent_loop", ("agentloopworker", "agent_loop_worker")),
+    ("worker_dict", ("workerdict",)),
+    ("vllm_http", ("specovllmhttpserver", "vllmhttpserver", "vllm_server")),
+    ("engine_core", ("enginecore", "engine_core")),
+    ("worker_tp", ("worker_tp",)),
+    ("speco_worker", ("specoworker",)),
+    ("task_runner", ("specotaskrunner",)),
+    ("ray_system", ("raylet", "plasma_store", "gcs_server")),
+)
+
 
 class DrafterCheckpointMetadataError(ValueError):
     """Raised when a managed drafter checkpoint has invalid metadata."""
@@ -147,28 +158,43 @@ def is_pretrained_drafter_checkpoint(model_path: Optional[Union[str, os.PathLike
     return True
 
 
+def _read_kib(path: str, keys: set[str]) -> dict[str, int]:
+    values = {}
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            for line in stream:
+                name, separator, raw_value = line.partition(":")
+                if not separator or name not in keys:
+                    continue
+                fields = raw_value.strip().split()
+                if fields:
+                    values[name] = int(fields[0])
+    except (OSError, ValueError):
+        return {}
+    return values
+
+
 def format_checkpoint_memory_snapshot() -> str:
     """Return concise Linux process/system memory counters without extra dependencies."""
-
-    def _read_kib(path: str, keys: set[str]) -> dict[str, int]:
-        values = {}
-        try:
-            with open(path, "r", encoding="utf-8") as stream:
-                for line in stream:
-                    name, separator, raw_value = line.partition(":")
-                    if not separator or name not in keys:
-                        continue
-                    fields = raw_value.strip().split()
-                    if fields:
-                        values[name] = int(fields[0])
-        except (OSError, ValueError):
-            return {}
-        return values
 
     process = _read_kib("/proc/self/status", {"VmRSS", "RssAnon", "RssShmem"})
     system = _read_kib(
         "/proc/meminfo",
-        {"MemTotal", "MemAvailable", "Cached", "Shmem", "Dirty", "Writeback"},
+        {
+            "MemTotal",
+            "MemAvailable",
+            "Cached",
+            "Shmem",
+            "Dirty",
+            "Writeback",
+            "AnonPages",
+            "SReclaimable",
+            "SUnreclaim",
+            "PageTables",
+            "KernelStack",
+            "Mlocked",
+            "Unevictable",
+        },
     )
     dev_shm_used_kib = None
     try:
@@ -191,11 +217,74 @@ def format_checkpoint_memory_snapshot() -> str:
         "dev_shm_used_gib": dev_shm_used_kib,
         "dirty_gib": system.get("Dirty"),
         "writeback_gib": system.get("Writeback"),
+        "anon_pages_gib": system.get("AnonPages"),
+        "sreclaimable_gib": system.get("SReclaimable"),
+        "sunreclaim_gib": system.get("SUnreclaim"),
+        "pagetables_gib": system.get("PageTables"),
+        "kernel_stack_gib": system.get("KernelStack"),
+        "mlocked_gib": system.get("Mlocked"),
+        "unevictable_gib": system.get("Unevictable"),
     }
     return " ".join(
         f"{name}={value / (1024**2):.2f}" if value is not None else f"{name}=n/a"
         for name, value in counters.items()
     )
+
+
+def _classify_process_memory_group(process_text: str) -> str | None:
+    normalized = process_text.lower().replace("-", "_")
+    for group, patterns in _PROCESS_MEMORY_GROUPS:
+        if any(pattern in normalized for pattern in patterns):
+            return group
+    if "ray::" in normalized or "ray_worker" in normalized:
+        return "ray_other"
+    return None
+
+
+def format_node_process_memory_summary() -> str:
+    """Aggregate RSS/anonymous memory for the Ray and vLLM process roles."""
+
+    started = time.perf_counter()
+    groups: dict[str, list[int]] = {}
+    try:
+        process_entries = os.scandir("/proc")
+    except OSError:
+        return "proc_groups=unavailable proc_scan_ms=0.0"
+
+    with process_entries:
+        for entry in process_entries:
+            if not entry.name.isdigit():
+                continue
+            process_root = os.path.join("/proc", entry.name)
+            try:
+                with open(os.path.join(process_root, "comm"), encoding="utf-8") as stream:
+                    comm = stream.read().strip()
+                with open(os.path.join(process_root, "cmdline"), "rb") as stream:
+                    cmdline = stream.read(4096).replace(b"\0", b" ").decode("utf-8", errors="replace")
+            except OSError:
+                continue
+
+            group = _classify_process_memory_group(f"{comm} {cmdline}")
+            if group is None:
+                continue
+            memory = _read_kib(os.path.join(process_root, "status"), {"VmRSS", "RssAnon"})
+            values = groups.setdefault(group, [0, 0, 0])
+            values[0] += 1
+            values[1] += int(memory.get("VmRSS", 0))
+            values[2] += int(memory.get("RssAnon", 0))
+
+    ordered_groups = [group for group, _ in _PROCESS_MEMORY_GROUPS] + ["ray_other"]
+    formatted = []
+    for group in ordered_groups:
+        values = groups.get(group)
+        if values is None:
+            continue
+        count, rss_kib, anon_kib = values
+        formatted.append(
+            f"{group}:{count}/{rss_kib / (1024**2):.2f}/{anon_kib / (1024**2):.2f}"
+        )
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    return f"proc_groups={','.join(formatted) or 'none'} proc_scan_ms={elapsed_ms:.1f}"
 
 
 def _trim_process_heap() -> bool:

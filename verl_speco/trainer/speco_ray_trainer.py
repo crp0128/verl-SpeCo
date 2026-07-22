@@ -55,7 +55,10 @@ from verl_speco.integration.sglang_runtime import (
     should_install_sglang_base_compat_runtime,
 )
 from verl_speco.integration.vllm_runtime import SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX, configure_vllm_runtime_from_config
-from verl_speco.trainer.checkpoint import format_checkpoint_memory_snapshot
+from verl_speco.trainer.checkpoint import (
+    format_checkpoint_memory_snapshot,
+    format_node_process_memory_summary,
+)
 from verl_speco.workers import SpecoWorker
 
 
@@ -1756,11 +1759,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_log_stage_memory(self, stage: str, phase: str, call_index: int) -> None:
         if call_index > 8 and call_index % 10 != 0:
             return
+        process_summary = f" {format_node_process_memory_summary()}" if stage == "rollout" else ""
         print(
             f"[speco stage memory] stage={stage} phase={phase} "
             f"call_tag={_speco_alpha_counter(call_index)} call={call_index} "
             f"step={self.global_steps} pid={os.getpid()} "
-            f"{format_checkpoint_memory_snapshot()}",
+            f"{format_checkpoint_memory_snapshot()}{process_summary}",
             flush=True,
         )
 
@@ -1771,7 +1775,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         print(
             f"[speco stage memory] hook=enabled device_name={getattr(self, 'device_name', None)} "
             f"trainer_device={_get_nested(self.config, ('trainer', 'device'), None)} "
-            f"pid={os.getpid()}",
+            f"pid={os.getpid()} proc_group_fmt=count/rss_gib/anon_gib",
             flush=True,
         )
 
