@@ -55,6 +55,7 @@ from verl_speco.integration.sglang_runtime import (
     should_install_sglang_base_compat_runtime,
 )
 from verl_speco.integration.vllm_runtime import SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX, configure_vllm_runtime_from_config
+from verl_speco.trainer.checkpoint import format_checkpoint_memory_snapshot
 from verl_speco.workers import SpecoWorker
 
 
@@ -87,6 +88,17 @@ def _get_nested(config, path, default=None):
         else:
             current = getattr(current, key, default)
     return current
+
+
+def _speco_alpha_counter(value: int) -> str:
+    """Encode a positive counter with letters so Ray log dedup keeps each sample."""
+
+    value = max(int(value), 1)
+    chars = []
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        chars.append(chr(ord("a") + remainder))
+    return "".join(reversed(chars))
 
 
 def _speco_ref_meta_rows(meta: Any) -> int:
@@ -1741,6 +1753,82 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
         return DataProto.from_tensordict(old_log_prob), old_log_prob_mfu
 
+    def _speco_npu_stage_memory_enabled(self) -> bool:
+        device_name = str(getattr(self, "device_name", "") or "").lower()
+        if device_name:
+            return device_name.startswith("npu")
+        try:
+            from verl.utils.device import get_device_name
+
+            return str(get_device_name()).lower() == "npu"
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _speco_log_stage_memory(self, stage: str, phase: str, call_index: int) -> None:
+        if call_index > 8 and call_index % 10 != 0:
+            return
+        logger.warning(
+            "[speco stage memory] stage=%s phase=%s call_tag=%s call=%s step=%s pid=%s %s",
+            stage,
+            phase,
+            _speco_alpha_counter(call_index),
+            call_index,
+            self.global_steps,
+            os.getpid(),
+            format_checkpoint_memory_snapshot(),
+        )
+
+    @contextmanager
+    def _speco_npu_stage_memory_fit_hook(self):
+        """Measure node memory around the common PPO stages on NPU."""
+
+        if not self._speco_npu_stage_memory_enabled():
+            yield
+            return
+
+        rollout_target = self._speco_rollout_generation_target()
+        checkpoint_manager = getattr(self, "checkpoint_manager", None)
+        targets = [
+            (rollout_target, "generate_sequences", "rollout"),
+            (self, "_compute_old_log_prob", "old_log_prob"),
+            (self, "_compute_ref_log_prob", "ref_log_prob"),
+            (self, "_update_actor", "update_actor"),
+            (checkpoint_manager, "update_weights", "update_weights"),
+        ]
+        installed = []
+        call_counts: dict[str, int] = {}
+
+        for owner, method_name, stage in targets:
+            original = getattr(owner, method_name, None) if owner is not None else None
+            if not callable(original):
+                continue
+
+            def stage_wrapper(bound_owner, *args, _original=original, _stage=stage, **kwargs):
+                del bound_owner
+                call_index = call_counts.get(_stage, 0) + 1
+                call_counts[_stage] = call_index
+                self._speco_log_stage_memory(_stage, "before", call_index)
+                succeeded = False
+                try:
+                    result = _original(*args, **kwargs)
+                    succeeded = True
+                    return result
+                finally:
+                    self._speco_log_stage_memory(
+                        _stage,
+                        "after" if succeeded else "after_error",
+                        call_index,
+                    )
+
+            setattr(owner, method_name, MethodType(stage_wrapper, owner))
+            installed.append((owner, method_name, original))
+
+        try:
+            yield
+        finally:
+            for owner, method_name, original in reversed(installed):
+                setattr(owner, method_name, original)
+
     @contextmanager
     def _speco_oldlogprob_entropy_fit_hook(self):
         original_compute_old_log_prob = self._compute_old_log_prob
@@ -1991,19 +2079,31 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         try:
             if self.is_drafter_training_enabled(self.config):
                 self._speco_activate_drafter_training_model_before_fit()
-                with self._speco_tracking_metrics_hook(), self._speco_online_fit_hooks():
+                with (
+                    self._speco_tracking_metrics_hook(),
+                    self._speco_online_fit_hooks(),
+                    self._speco_npu_stage_memory_fit_hook(),
+                ):
                     return super().fit()
             if self.is_drafter_rollout_enabled(self.config):
                 with self._speco_tracking_metrics_hook(), self._speco_rollout_metrics_fit_hook():
                     if self._speco_oldlogprob_entropy_hook_enabled():
-                        with self._speco_oldlogprob_entropy_fit_hook():
+                        with (
+                            self._speco_oldlogprob_entropy_fit_hook(),
+                            self._speco_npu_stage_memory_fit_hook(),
+                        ):
                             return super().fit()
-                    return super().fit()
+                    with self._speco_npu_stage_memory_fit_hook():
+                        return super().fit()
             if self._speco_oldlogprob_entropy_hook_enabled():
-                with self._speco_oldlogprob_entropy_fit_hook():
+                with (
+                    self._speco_oldlogprob_entropy_fit_hook(),
+                    self._speco_npu_stage_memory_fit_hook(),
+                ):
                     return super().fit()
 
-            return super().fit()
+            with self._speco_npu_stage_memory_fit_hook():
+                return super().fit()
         finally:
             self._speco_wait_pending_drafter_checkpoint()
 
