@@ -26,6 +26,7 @@ _VLLM_FUSED_MOE_MODULE = "vllm.model_executor.layers.fused_moe"
 _VERL_FSDP_ENGINE_MODULE = "verl.workers.engine.fsdp.transformer_impl"
 _IMPORT_COMPAT_APPLIED = False
 _NPU_CHECKPOINT_RECLAIM_APPLIED = False
+_NPU_FSDP2_WEIGHT_EXPORT_APPLIED = False
 
 try:
     from verl.single_controller.base.decorator import Dispatch, register
@@ -155,6 +156,89 @@ def install_verl_npu_checkpoint_reclaim(
     return True
 
 
+def install_verl_npu_fsdp2_weight_export_compat(
+    module_importer: Callable[[str], Any] = importlib.import_module,
+) -> bool:
+    """Skip verl's redundant whole-shard staging during NPU FSDP2 export.
+
+    verl release/v0.8.0 moves every local FSDP2 shard to the device before
+    ``state_dict()`` and back to CPU afterwards. FSDP2 only returns DTensor
+    references there, and the returned generator already materializes each
+    full tensor on the device lazily. The extra round trip increases weight
+    sync latency and can leave NPU host-memory allocations at their high-water
+    mark. This mirrors upstream verl fix b7ff88e3 while preserving FSDP1 and
+    PEFT/LoRA behavior.
+    """
+
+    global _NPU_FSDP2_WEIGHT_EXPORT_APPLIED
+    if _NPU_FSDP2_WEIGHT_EXPORT_APPLIED or not _module_available("torch_npu"):
+        return False
+
+    device_module = module_importer("verl.utils.device")
+    if device_module.get_device_name() != "npu":
+        return False
+
+    engine_module = module_importer(_VERL_FSDP_ENGINE_MODULE)
+    engine_cls = getattr(engine_module, "FSDPEngine", None)
+    fsdp_version = getattr(engine_module, "fsdp_version", None)
+    if engine_cls is None or not callable(fsdp_version):
+        return False
+
+    original_get_per_tensor_param = getattr(engine_cls, "get_per_tensor_param", None)
+    if original_get_per_tensor_param is None or getattr(
+        original_get_per_tensor_param,
+        "_speco_npu_fsdp2_weight_export_compat",
+        False,
+    ):
+        return False
+
+    # Newer verl versions contain the upstream fix already.
+    code = getattr(original_get_per_tensor_param, "__code__", None)
+    if code is not None and "_skip_staging" in code.co_varnames:
+        _NPU_FSDP2_WEIGHT_EXPORT_APPLIED = True
+        return False
+
+    @functools.wraps(original_get_per_tensor_param)
+    def get_per_tensor_param_without_fsdp2_staging(self, *args, **kwargs):
+        module = getattr(self, "module", None)
+        peft_model = getattr(module, "_fsdp_wrapped_module", module)
+        try:
+            skip_staging = module is not None and fsdp_version(module) == 2 and not hasattr(
+                peft_model,
+                "peft_config",
+            )
+        except Exception:  # noqa: BLE001
+            skip_staging = False
+
+        if not skip_staging:
+            return original_get_per_tensor_param(self, *args, **kwargs)
+
+        uses_cpu_offload_policy = getattr(self, "_uses_fsdp2_cpu_offload_policy", False)
+        is_offload_param = getattr(self, "_is_offload_param", False)
+        self._uses_fsdp2_cpu_offload_policy = True
+        self._is_offload_param = False
+        try:
+            if int(getattr(self, "rank", 0) or 0) == 0 and not getattr(
+                self,
+                "_speco_npu_fsdp2_weight_export_logged",
+                False,
+            ):
+                logger.warning(
+                    "[speco weight export] skipping redundant whole-shard staging for NPU FSDP2"
+                )
+                self._speco_npu_fsdp2_weight_export_logged = True
+            return original_get_per_tensor_param(self, *args, **kwargs)
+        finally:
+            self._uses_fsdp2_cpu_offload_policy = uses_cpu_offload_policy
+            self._is_offload_param = is_offload_param
+
+    get_per_tensor_param_without_fsdp2_staging._speco_npu_fsdp2_weight_export_compat = True
+    engine_cls.get_per_tensor_param = get_per_tensor_param_without_fsdp2_staging
+    _NPU_FSDP2_WEIGHT_EXPORT_APPLIED = True
+    logger.warning("Enabled NPU FSDP2 weight-export staging compatibility")
+    return True
+
+
 def _install_weight_transfer_shm_reuse() -> bool:
     """Install the sender-side SHM reuse patch in the WorkerDict process."""
 
@@ -213,6 +297,7 @@ class VerlNPUVLLMImportCompatMixin:
     def __init__(self, *args, **kwargs):
         install_verl_npu_vllm_import_compat()
         install_verl_npu_checkpoint_reclaim()
+        install_verl_npu_fsdp2_weight_export_compat()
         super().__init__(*args, **kwargs)
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)

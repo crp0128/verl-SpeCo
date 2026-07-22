@@ -1753,17 +1753,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
         return DataProto.from_tensordict(old_log_prob), old_log_prob_mfu
 
-    def _speco_npu_stage_memory_enabled(self) -> bool:
-        device_name = str(getattr(self, "device_name", "") or "").lower()
-        if device_name:
-            return device_name.startswith("npu")
-        try:
-            from verl.utils.device import get_device_name
-
-            return str(get_device_name()).lower() == "npu"
-        except Exception:  # noqa: BLE001
-            return False
-
     def _speco_log_stage_memory(self, stage: str, phase: str, call_index: int) -> None:
         if call_index > 8 and call_index % 10 != 0:
             return
@@ -1780,11 +1769,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     @contextmanager
     def _speco_npu_stage_memory_fit_hook(self):
-        """Measure node memory around the common PPO stages on NPU."""
+        """Measure node memory around the common PPO stages."""
 
-        if not self._speco_npu_stage_memory_enabled():
-            yield
-            return
+        logger.warning(
+            "[speco stage memory] hook=enabled device_name=%s trainer_device=%s pid=%s",
+            getattr(self, "device_name", None),
+            _get_nested(self.config, ("trainer", "device"), None),
+            os.getpid(),
+        )
 
         rollout_target = self._speco_rollout_generation_target()
         checkpoint_manager = getattr(self, "checkpoint_manager", None)

@@ -52,6 +52,11 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
         "install_verl_npu_checkpoint_reclaim",
         lambda: events.append("reclaim"),
     )
+    monkeypatch.setattr(
+        compat,
+        "install_verl_npu_fsdp2_weight_export_compat",
+        lambda: events.append("fsdp2_export"),
+    )
 
     class BaseWorker:
         def __init__(self):
@@ -61,7 +66,7 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
         pass
 
     WrappedWorker()
-    assert events == ["compat", "reclaim", "base"]
+    assert events == ["compat", "reclaim", "fsdp2_export", "base"]
 
 
 def test_worker_mixin_installs_shm_reuse_before_weight_update(monkeypatch) -> None:
