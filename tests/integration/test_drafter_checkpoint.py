@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gc
 import json
 
 import pytest
@@ -192,7 +191,6 @@ def test_trim_process_host_memory_reports_allocator(monkeypatch) -> None:
 def test_collect_host_allocator_stats_reads_jemalloc_counters(monkeypatch) -> None:
     values = {
         "stats.allocated": 1,
-        "stats.active": 2,
         "stats.resident": 3,
         "stats.retained": 4,
     }
@@ -203,19 +201,17 @@ def test_collect_host_allocator_stats_reads_jemalloc_counters(monkeypatch) -> No
     assert checkpoint_utils.collect_host_allocator_stats() == {
         "allocator": "jemalloc",
         "allocated": 1,
-        "active": 2,
         "resident": 3,
         "retained": 4,
     }
 
 
-def test_output_lifetime_diagnostics_use_only_weak_references(monkeypatch, capsys) -> None:
+def test_process_memory_diagnostics_compare_call_boundaries(monkeypatch, capsys) -> None:
     gib = 1024**3
     stats = iter(
         {
             "allocator": "jemalloc",
             "allocated": value * gib,
-            "active": value * gib,
             "resident": value * gib,
             "retained": value * gib,
         }
@@ -231,48 +227,29 @@ def test_output_lifetime_diagnostics_use_only_weak_references(monkeypatch, capsy
     class Owner:
         pass
 
-    class Buffer:
-        def numel(self):
-            return 1024
-
-        def element_size(self):
-            return 2
-
-    class Output:
-        def __init__(self, buffer):
-            self.batch = {"tensor": buffer}
-
     owner = Owner()
-    buffer = Buffer()
-    output = Output(buffer)
-
-    first_call = checkpoint_utils.log_previous_output_lifetime(
+    first_call = checkpoint_utils.log_process_memory_before_call(
         owner,
         "worker:method",
         role="worker",
         method="method",
     )
-    checkpoint_utils.remember_output_lifetime(owner, "worker:method", first_call, output)
-    checkpoint_utils.log_previous_output_lifetime(
+    checkpoint_utils.log_process_memory_after_call(
+        owner,
+        "worker:method",
+        first_call,
+        role="worker",
+        method="method",
+    )
+    checkpoint_utils.log_process_memory_before_call(
         owner,
         "worker:method",
         role="worker",
         method="method",
     )
-    live_log = capsys.readouterr().out
-    assert "previous_output_alive=1" in live_log
-    assert "alive_buffers=1" in live_log
-    assert "jemalloc_allocated_delta_gib=+1.000" in live_log
-
-    del output
-    del buffer
-    gc.collect()
-    checkpoint_utils.log_previous_output_lifetime(
-        owner,
-        "worker:method",
-        role="worker",
-        method="method",
-    )
-    released_log = capsys.readouterr().out
-    assert "previous_output_alive=0" in released_log
-    assert "alive_buffers=0" in released_log
+    output = capsys.readouterr().out
+    assert "phase=before" in output
+    assert "phase=after" in output
+    assert "memory_delta_scope=call_1_entry" in output
+    assert "memory_delta_scope=since_after_call_1" in output
+    assert "jemalloc_allocated_delta_gib=+1.000" in output

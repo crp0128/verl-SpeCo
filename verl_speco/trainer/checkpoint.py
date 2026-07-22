@@ -6,8 +6,6 @@ import os
 import re
 import sys
 import time
-import weakref
-from collections.abc import Mapping
 from functools import lru_cache
 from glob import glob
 from typing import Any, Optional, Union
@@ -36,21 +34,6 @@ _PROCESS_MEMORY_GROUPS = (
     ("task_runner", ("specotaskrunner",)),
     ("ray_system", ("raylet", "plasma_store", "gcs_server")),
 )
-
-_SMAPS_HEADER_PATTERN = re.compile(
-    r"^[0-9A-Fa-f]+-[0-9A-Fa-f]+\s+\S+\s+\S+\s+\S+\s+\S+\s*(.*)$"
-)
-_SMAPS_MAPPING_GROUPS = (
-    "heap",
-    "anonymous",
-    "npu",
-    "torch",
-    "shmem",
-    "file",
-    "stack",
-    "special",
-)
-
 
 class DrafterCheckpointMetadataError(ValueError):
     """Raised when a managed drafter checkpoint has invalid metadata."""
@@ -346,36 +329,7 @@ def _format_process_memory_deltas(
                 f"{group}:{delta[0]:+d}/{delta[1] / (1024**2):+.2f}/{delta[2] / (1024**2):+.2f}"
             )
 
-    top_deltas = []
-    for group in ("worker_dict", "agent_loop", "vllm_http", "worker_tp", "ray_other", "user_other"):
-        candidates = []
-        for pid, process in processes.items():
-            if process["group"] != group:
-                continue
-            previous = previous_processes.get(pid)
-            previous_anon_kib = (
-                int(previous["anon_kib"])
-                if previous is not None and previous.get("group") == group
-                else 0
-            )
-            delta_kib = int(process["anon_kib"]) - previous_anon_kib
-            if delta_kib > 0:
-                candidates.append((delta_kib, pid, str(process["title"])))
-        candidates.sort(reverse=True)
-        if candidates:
-            limit = 3 if group in {"worker_dict", "agent_loop"} else 1
-            top_deltas.append(
-                f"{group}["
-                + ",".join(
-                    f"{pid}@{title}:{delta_kib / (1024**2):+.3f}"
-                    for delta_kib, pid, title in candidates[:limit]
-                )
-                + "]"
-            )
-    return (
-        f"proc_delta_scope={scope} proc_group_delta={','.join(group_deltas) or 'none'} "
-        f"proc_top_anon_delta={';'.join(top_deltas) or 'none'}"
-    )
+    return f"proc_delta_scope={scope} proc_group_delta={','.join(group_deltas) or 'none'}"
 
 
 def format_node_process_memory_summary(
@@ -384,7 +338,7 @@ def format_node_process_memory_summary(
     previous_processes: Optional[dict[int, dict[str, Any]]] = None,
     delta_scope: str = "none",
 ) -> str:
-    """Aggregate process memory and optionally report PID-level anonymous deltas."""
+    """Aggregate process memory and optionally report process-group deltas."""
 
     if processes is None:
         processes, _ = collect_node_process_memory_snapshot()
@@ -542,130 +496,48 @@ def collect_host_allocator_stats() -> dict[str, Any]:
     stats = {
         "allocator": allocator,
         "allocated": None,
-        "active": None,
         "resident": None,
         "retained": None,
     }
     if allocator != "jemalloc" or not _jemalloc_refresh_stats():
         return stats
-    for key in ("allocated", "active", "resident", "retained"):
+    for key in ("allocated", "resident", "retained"):
         stats[key] = _jemalloc_read_size(f"stats.{key}")
     return stats
 
 
-def _classify_smaps_mapping(path: str) -> str:
-    normalized = path.strip().lower()
-    if normalized == "[heap]":
-        return "heap"
-    if normalized.startswith("[stack"):
-        return "stack"
-    if not normalized or normalized.startswith("[anon") or normalized.startswith("/dev/zero"):
-        return "anonymous"
-    if any(token in normalized for token in ("/dev/shm", "/sysv", "memfd:", "plasma")):
-        return "shmem"
-    if any(token in normalized for token in ("ascend", "torch_npu", "cann", "davinci", "hccl", "libacl")):
-        return "npu"
-    if any(token in normalized for token in ("site-packages/torch", "libtorch", "torch/lib")):
-        return "torch"
-    if normalized.startswith("["):
-        return "special"
-    return "file"
-
-
 def collect_process_mapping_stats() -> dict[str, Any]:
-    """Split this process's RSS and anonymous pages by Linux memory mapping."""
+    """Collect aggregate anonymous, huge-page, and private-dirty mappings."""
 
     stats = {
         "available": False,
         "anonymous_kib": 0,
         "anon_huge_pages_kib": 0,
         "private_dirty_kib": 0,
-        "groups": {group: 0 for group in _SMAPS_MAPPING_GROUPS},
     }
-    current_group = "special"
+    keys = {
+        "Anonymous": "anonymous_kib",
+        "AnonHugePages": "anon_huge_pages_kib",
+        "Private_Dirty": "private_dirty_kib",
+    }
     try:
-        with open("/proc/self/smaps", "r", encoding="utf-8") as stream:
+        path = "/proc/self/smaps_rollup"
+        if not os.path.exists(path):
+            path = "/proc/self/smaps"
+        with open(path, "r", encoding="utf-8") as stream:
             for line in stream:
-                header = _SMAPS_HEADER_PATTERN.match(line)
-                if header is not None:
-                    current_group = _classify_smaps_mapping(header.group(1))
-                    continue
                 name, separator, raw_value = line.partition(":")
-                if not separator or name not in {
-                    "Anonymous",
-                    "AnonHugePages",
-                    "Private_Dirty",
-                }:
+                target = keys.get(name)
+                if not separator or target is None:
                     continue
                 fields = raw_value.strip().split()
                 if not fields:
                     continue
-                value = int(fields[0])
-                if name == "Anonymous":
-                    stats["anonymous_kib"] += value
-                    stats["groups"][current_group] += value
-                elif name == "AnonHugePages":
-                    stats["anon_huge_pages_kib"] += value
-                else:
-                    stats["private_dirty_kib"] += value
+                stats[target] += int(fields[0])
         stats["available"] = True
     except (OSError, ValueError):
         pass
     return stats
-
-
-def _iter_memory_buffers(value: Any, seen: set[int]):
-    if value is None:
-        return
-    identifier = id(value)
-    if identifier in seen:
-        return
-    seen.add(identifier)
-
-    numel = getattr(value, "numel", None)
-    element_size = getattr(value, "element_size", None)
-    if callable(numel) and callable(element_size):
-        try:
-            yield value, int(numel()) * int(element_size())
-        except Exception:  # noqa: BLE001
-            pass
-        return
-
-    nbytes = getattr(value, "nbytes", None)
-    if nbytes is not None:
-        try:
-            yield value, int(nbytes)
-        except (TypeError, ValueError):
-            pass
-        return
-
-    if isinstance(value, Mapping):
-        children = value.values()
-    elif isinstance(value, (list, tuple, set)):
-        children = value
-    elif type(value).__module__.startswith("tensordict") and callable(getattr(value, "values", None)):
-        try:
-            children = value.values()
-        except Exception:  # noqa: BLE001
-            children = ()
-    else:
-        children = (
-            child
-            for child in (
-                getattr(value, "batch", None),
-                getattr(value, "non_tensor_batch", None),
-            )
-            if child is not None and child is not value
-        )
-    for child in children:
-        yield from _iter_memory_buffers(child, seen)
-
-
-def _weakref_or_none(value: Any):
-    try:
-        return weakref.ref(value)
-    except TypeError:
-        return None
 
 
 def _format_allocator_stat(
@@ -691,16 +563,6 @@ def _format_mapping_stats(stats: dict[str, Any], previous: dict[str, Any]) -> st
         return "smaps_available=0"
 
     previous_available = bool(previous.get("available"))
-    group_values = stats.get("groups", {})
-    previous_groups = previous.get("groups", {})
-    if previous_available:
-        group_delta_text = "|".join(
-            f"{group}:{(int(group_values.get(group, 0)) - int(previous_groups.get(group, 0))) / (1024**2):+.3f}"
-            for group in _SMAPS_MAPPING_GROUPS
-        )
-    else:
-        group_delta_text = "n/a"
-
     fields = []
     for key in ("anonymous_kib", "anon_huge_pages_kib", "private_dirty_kib"):
         value = int(stats.get(key, 0))
@@ -710,24 +572,7 @@ def _format_mapping_stats(stats: dict[str, Any], previous: dict[str, Any]) -> st
             f"smaps_{key.removesuffix('_kib')}_gib={value / (1024**2):.3f} "
             f"smaps_{key.removesuffix('_kib')}_delta_gib={delta_text}"
         )
-    return (
-        "smaps_available=1 "
-        + " ".join(fields)
-        + f" smaps_anon_group_delta_gib={group_delta_text}"
-    )
-
-
-def _lifetime_state(
-    state: dict[str, Any],
-    prefix: str,
-) -> tuple[int, tuple[Any, ...], int, int, int]:
-    reference = state.get(f"{prefix}_ref")
-    alive = int(reference() is not None) if callable(reference) else -1
-    buffer_refs = state.get(f"{prefix}_buffer_refs", ())
-    tracked_bytes = sum(size for _, size in buffer_refs)
-    alive_buffers = sum(1 for reference, _ in buffer_refs if reference() is not None)
-    alive_bytes = sum(size for reference, size in buffer_refs if reference() is not None)
-    return alive, buffer_refs, tracked_bytes, alive_buffers, alive_bytes
+    return "smaps_available=1 " + " ".join(fields)
 
 
 def _collect_process_memory_diagnostics() -> dict[str, Any]:
@@ -738,7 +583,6 @@ def _collect_process_memory_diagnostics() -> dict[str, Any]:
             "/proc/self/status",
             {"VmRSS", "RssAnon", "VmData"},
         ),
-        "python_blocks": int(getattr(sys, "getallocatedblocks", lambda: 0)()),
     }
 
 
@@ -751,6 +595,7 @@ def _log_process_memory_diagnostics(
     delta_scope: str,
     current: dict[str, Any],
     previous: dict[str, Any],
+    extra: str = "",
 ) -> None:
     allocator_stats = current["allocator"]
     previous_allocator_stats = previous.get("allocator", {})
@@ -766,11 +611,6 @@ def _log_process_memory_diagnostics(
             return None
         return int(value) - int(previous_value)
 
-    python_blocks = int(current["python_blocks"])
-    previous_python_blocks = previous.get("python_blocks")
-    python_blocks_delta = (
-        python_blocks - int(previous_python_blocks) if previous_python_blocks is not None else None
-    )
     include_allocator_absolute = not bool(previous_allocator_stats)
     allocator_text = " ".join(
         _format_allocator_stat(
@@ -779,7 +619,7 @@ def _log_process_memory_diagnostics(
             name,
             include_absolute=include_allocator_absolute,
         )
-        for name in ("allocated", "active", "resident", "retained")
+        for name in ("allocated", "resident", "retained")
     )
     print(
         f"[speco process memory] role={role} method={method} call={call_index} "
@@ -790,46 +630,30 @@ def _log_process_memory_diagnostics(
         f"anon_delta_gib={_format_kib_delta(process_delta('RssAnon'))} "
         f"vm_data_gib={process.get('VmData', 0) / (1024**2):.3f} "
         f"vm_data_delta_gib={_format_kib_delta(process_delta('VmData'))} "
-        f"python_blocks_delta={python_blocks_delta if python_blocks_delta is not None else 'n/a'} "
         f"allocator={allocator_stats['allocator']} {allocator_text} "
-        f"{_format_mapping_stats(mapping_stats, previous_mapping_stats)}",
+        f"{_format_mapping_stats(mapping_stats, previous_mapping_stats)}"
+        f"{f' {extra}' if extra else ''}",
         flush=True,
     )
 
 
-def log_previous_output_lifetime(owner: Any, key: str, *, role: str, method: str) -> int:
-    """Log whether prior Ray-call inputs or outputs remain live without retaining them."""
+def _should_log_memory_diagnostic(call_index: int) -> bool:
+    return call_index <= 8 or call_index % 10 == 0
 
-    states = getattr(owner, "_speco_output_lifetime_states", None)
+
+def log_process_memory_before_call(owner: Any, key: str, *, role: str, method: str) -> int:
+    """Log memory accumulated since the previous instrumented call returned."""
+
+    states = getattr(owner, "_speco_process_memory_states", None)
     if not isinstance(states, dict):
         states = {}
-        setattr(owner, "_speco_output_lifetime_states", states)
+        setattr(owner, "_speco_process_memory_states", states)
     state = states.setdefault(key, {})
     call_index = int(state.get("call", 0)) + 1
     state["call"] = call_index
-    if call_index > 8 and call_index % 10 != 0:
+    if not _should_log_memory_diagnostic(call_index):
         return call_index
 
-    input_alive, input_buffer_refs, input_tracked_bytes, input_alive_buffers, input_alive_bytes = (
-        _lifetime_state(state, "input")
-    )
-    output_alive, output_buffer_refs, output_tracked_bytes, output_alive_buffers, output_alive_bytes = (
-        _lifetime_state(state, "output")
-    )
-
-    print(
-        f"[speco output lifetime] role={role} method={method} call={call_index} "
-        f"pid={os.getpid()} previous_input_call={state.get('input_tracked_call', 'none')} "
-        f"previous_input_alive={input_alive} input_tracked_buffers={len(input_buffer_refs)} "
-        f"input_alive_buffers={input_alive_buffers} "
-        f"input_tracked_mib={input_tracked_bytes / (1024**2):.2f} "
-        f"input_alive_mib={input_alive_bytes / (1024**2):.2f} "
-        f"previous_call={state.get('output_tracked_call', 'none')} "
-        f"previous_output_alive={output_alive} tracked_buffers={len(output_buffer_refs)} "
-        f"alive_buffers={output_alive_buffers} tracked_mib={output_tracked_bytes / (1024**2):.2f} "
-        f"alive_mib={output_alive_bytes / (1024**2):.2f}",
-        flush=True,
-    )
     process_memory = _collect_process_memory_diagnostics()
     previous_process_memory = state.get("after_process_memory")
     previous_after_call = state.get("after_process_memory_call")
@@ -868,9 +692,9 @@ def log_process_memory_after_call(
 ) -> None:
     """Log process growth inside one instrumented worker call."""
 
-    if call_index > 8 and call_index % 10 != 0:
+    if not _should_log_memory_diagnostic(call_index):
         return
-    states = getattr(owner, "_speco_output_lifetime_states", None)
+    states = getattr(owner, "_speco_process_memory_states", None)
     if not isinstance(states, dict):
         return
     state = states.get(key)
@@ -891,47 +715,6 @@ def log_process_memory_after_call(
     )
     state["after_process_memory"] = process_memory
     state["after_process_memory_call"] = call_index
-
-
-def _remember_lifetime_value(
-    state: dict[str, Any],
-    prefix: str,
-    call_index: int,
-    value: Any,
-) -> None:
-    if call_index < int(state.get(f"{prefix}_tracked_call", 0)):
-        return
-    buffer_refs = []
-    for buffer, size in _iter_memory_buffers(value, set()):
-        reference = _weakref_or_none(buffer)
-        if reference is not None:
-            buffer_refs.append((reference, max(0, int(size))))
-    state[f"{prefix}_tracked_call"] = call_index
-    state[f"{prefix}_ref"] = _weakref_or_none(value)
-    state[f"{prefix}_buffer_refs"] = tuple(buffer_refs)
-
-
-def remember_input_lifetime(owner: Any, key: str, call_index: int, value: Any) -> None:
-    """Store weak references to a Ray-call input for the next call check."""
-
-    states = getattr(owner, "_speco_output_lifetime_states", None)
-    if not isinstance(states, dict):
-        return
-    state = states.get(key)
-    if isinstance(state, dict):
-        _remember_lifetime_value(state, "input", call_index, value)
-
-
-def remember_output_lifetime(owner: Any, key: str, call_index: int, output: Any) -> None:
-    """Store only weak references for the next output-lifetime check."""
-
-    states = getattr(owner, "_speco_output_lifetime_states", None)
-    if not isinstance(states, dict):
-        return
-    state = states.get(key)
-    if not isinstance(state, dict):
-        return
-    _remember_lifetime_value(state, "output", call_index, output)
 
 
 def _jemalloc_reclaim_mode() -> str:
@@ -981,6 +764,62 @@ def trim_process_host_memory() -> dict[str, Any]:
             _jemalloc_reclaim_mode() if allocator == "jemalloc" else "malloc_trim"
         ),
     }
+
+
+def trim_process_host_memory_with_diagnostics(
+    owner: Any,
+    key: str,
+    *,
+    role: str,
+    method: str,
+) -> dict[str, Any]:
+    """Measure memory accumulated before trim and pages released by this trim."""
+
+    states = getattr(owner, "_speco_host_memory_reclaim_states", None)
+    if not isinstance(states, dict):
+        states = {}
+        setattr(owner, "_speco_host_memory_reclaim_states", states)
+    state = states.setdefault(key, {})
+    call_index = int(state.get("call", 0)) + 1
+    state["call"] = call_index
+
+    if not _should_log_memory_diagnostic(call_index):
+        return trim_process_host_memory()
+
+    before = _collect_process_memory_diagnostics()
+    previous_after = state.get("after_trim_process_memory", {})
+    previous_call = state.get("after_trim_call")
+    _log_process_memory_diagnostics(
+        role=role,
+        method=method,
+        call_index=call_index,
+        phase="before_trim",
+        delta_scope=(
+            f"since_after_trim_call_{previous_call}" if previous_call is not None else "none"
+        ),
+        current=before,
+        previous=previous_after,
+    )
+
+    result = trim_process_host_memory()
+    after = _collect_process_memory_diagnostics()
+    _log_process_memory_diagnostics(
+        role=role,
+        method=method,
+        call_index=call_index,
+        phase="after_trim",
+        delta_scope=f"before_trim_call_{call_index}",
+        current=after,
+        previous=before,
+        extra=(
+            f"heap_trimmed={int(bool(result.get('heap_trimmed')))} "
+            f"reclaim_action={result.get('reclaim_action', 'unknown')} "
+            f"trim_elapsed_sec={float(result.get('elapsed_sec', 0.0)):.4f}"
+        ),
+    )
+    state["after_trim_process_memory"] = after
+    state["after_trim_call"] = call_index
+    return result
 
 
 def _flush_and_drop_checkpoint_file_cache(checkpoint_path: str) -> tuple[int, int]:

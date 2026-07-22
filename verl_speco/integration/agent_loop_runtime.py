@@ -10,10 +10,8 @@ from typing import Any
 
 from verl_speco.trainer.checkpoint import (
     log_process_memory_after_call,
-    log_previous_output_lifetime,
-    remember_input_lifetime,
-    remember_output_lifetime,
-    trim_process_host_memory,
+    log_process_memory_before_call,
+    trim_process_host_memory_with_diagnostics,
 )
 
 logger = logging.getLogger(__file__)
@@ -72,7 +70,12 @@ def _is_npu_config(config: Any) -> bool:
 def _trim_agent_loop_host_memory(worker: Any) -> None:
     if not _is_npu_config(getattr(worker, "config", None)):
         return
-    trim_process_host_memory()
+    trim_process_host_memory_with_diagnostics(
+        worker,
+        "agent_loop:generate_sequences:trim",
+        role="agent_loop",
+        method="generate_sequences",
+    )
 
 
 def _ensure_extra_field_defaults(result: Any) -> Any:
@@ -175,7 +178,7 @@ async def _speco_worker_generate_sequences(self, batch):
     _trim_agent_loop_host_memory(self)
     diagnose_host_memory = _is_npu_config(getattr(self, "config", None))
     call_index = (
-        log_previous_output_lifetime(
+        log_process_memory_before_call(
             self,
             "agent_loop:generate_sequences",
             role="agent_loop",
@@ -184,13 +187,6 @@ async def _speco_worker_generate_sequences(self, batch):
         if diagnose_host_memory
         else 0
     )
-    if diagnose_host_memory:
-        remember_input_lifetime(
-            self,
-            "agent_loop:generate_sequences",
-            call_index,
-            batch,
-        )
     global_steps_token, validate_token = _speco_context_from_batch(batch)
     succeeded = False
     try:
@@ -201,13 +197,6 @@ async def _speco_worker_generate_sequences(self, batch):
         if inspect.isawaitable(result):
             result = await result
         result = _ensure_extra_field_defaults(result)
-        if diagnose_host_memory:
-            remember_output_lifetime(
-                self,
-                "agent_loop:generate_sequences",
-                call_index,
-                result,
-            )
         succeeded = True
         return result
     finally:
@@ -227,7 +216,7 @@ async def _speco_host_memory_worker_generate_sequences(self, batch):
     _trim_agent_loop_host_memory(self)
     diagnose_host_memory = _is_npu_config(getattr(self, "config", None))
     call_index = (
-        log_previous_output_lifetime(
+        log_process_memory_before_call(
             self,
             "agent_loop:generate_sequences",
             role="agent_loop",
@@ -236,13 +225,6 @@ async def _speco_host_memory_worker_generate_sequences(self, batch):
         if diagnose_host_memory
         else 0
     )
-    if diagnose_host_memory:
-        remember_input_lifetime(
-            self,
-            "agent_loop:generate_sequences",
-            call_index,
-            batch,
-        )
     succeeded = False
     try:
         generate_sequences = _speco_parent_method(self, "generate_sequences")
@@ -251,13 +233,6 @@ async def _speco_host_memory_worker_generate_sequences(self, batch):
         result = generate_sequences(self, batch)
         if inspect.isawaitable(result):
             result = await result
-        if diagnose_host_memory:
-            remember_output_lifetime(
-                self,
-                "agent_loop:generate_sequences",
-                call_index,
-                result,
-            )
         succeeded = True
         return result
     finally:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import functools
 import importlib
 import importlib.util
@@ -18,11 +19,10 @@ from packaging import version
 from verl_speco.trainer.checkpoint import (
     format_checkpoint_memory_snapshot,
     log_process_memory_after_call,
-    log_previous_output_lifetime,
-    remember_input_lifetime,
-    remember_output_lifetime,
+    log_process_memory_before_call,
     release_checkpoint_host_memory,
     trim_process_host_memory,
+    trim_process_host_memory_with_diagnostics,
 )
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,10 @@ _NPU_CHECKPOINT_RECLAIM_APPLIED = False
 _NPU_FSDP2_WEIGHT_EXPORT_APPLIED = False
 _FSDP_TRAIN_OUTPUT_RELEASE_APPLIED = False
 _NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED = False
+_NPU_FSDP_DIAGNOSTIC_METHOD = contextvars.ContextVar(
+    "speco_npu_fsdp_diagnostic_method",
+    default="forward_backward_batch",
+)
 
 try:
     from verl.single_controller.base.decorator import Dispatch, register
@@ -300,7 +304,16 @@ def install_verl_npu_fsdp_host_memory_reclaim(
 
     @functools.wraps(original_forward_backward_batch)
     def forward_backward_batch_with_entry_reclaim(self, *args, **kwargs):
-        trim_process_host_memory()
+        if int(getattr(self, "rank", 0) or 0) == 0:
+            diagnostic_method = _NPU_FSDP_DIAGNOSTIC_METHOD.get()
+            trim_process_host_memory_with_diagnostics(
+                self,
+                f"fsdp:{diagnostic_method}:trim",
+                role="worker_dict",
+                method=diagnostic_method,
+            )
+        else:
+            trim_process_host_memory()
         return original_forward_backward_batch(self, *args, **kwargs)
 
     forward_backward_batch_with_entry_reclaim._speco_npu_entry_host_memory_reclaim = True
@@ -412,10 +425,10 @@ def _is_npu_worker() -> bool:
         return False
 
 
-def _install_npu_worker_output_lifetime_diagnostics(worker: Any) -> bool:
+def _install_npu_worker_memory_diagnostics(worker: Any) -> bool:
     if not _is_npu_worker() or int(getattr(worker, "rank", 0) or 0) != 0:
         return False
-    if getattr(worker, "_speco_output_lifetime_diagnostics_installed", False):
+    if getattr(worker, "_speco_memory_diagnostics_installed", False):
         return False
 
     installed = []
@@ -425,38 +438,27 @@ def _install_npu_worker_output_lifetime_diagnostics(worker: Any) -> bool:
             continue
 
         @functools.wraps(original)
-        def output_lifetime_wrapper(
+        def process_memory_wrapper(
             bound_worker,
             *args,
             _original=original,
             _method_name=method_name,
             **kwargs,
         ):
-            call_index = log_previous_output_lifetime(
+            call_index = log_process_memory_before_call(
                 bound_worker,
                 f"worker_dict:{_method_name}",
                 role="worker_dict",
                 method=_method_name,
             )
-            primary_input = args[0] if args else kwargs
-            remember_input_lifetime(
-                bound_worker,
-                f"worker_dict:{_method_name}",
-                call_index,
-                primary_input,
-            )
             succeeded = False
+            diagnostic_token = _NPU_FSDP_DIAGNOSTIC_METHOD.set(_method_name)
             try:
                 result = _original(*args, **kwargs)
-                remember_output_lifetime(
-                    bound_worker,
-                    f"worker_dict:{_method_name}",
-                    call_index,
-                    result,
-                )
                 succeeded = True
                 return result
             finally:
+                _NPU_FSDP_DIAGNOSTIC_METHOD.reset(diagnostic_token)
                 log_process_memory_after_call(
                     bound_worker,
                     f"worker_dict:{_method_name}",
@@ -466,14 +468,14 @@ def _install_npu_worker_output_lifetime_diagnostics(worker: Any) -> bool:
                     phase="after" if succeeded else "after_error",
                 )
 
-        setattr(worker, method_name, MethodType(output_lifetime_wrapper, worker))
+        setattr(worker, method_name, MethodType(process_memory_wrapper, worker))
         installed.append(method_name)
 
     if not installed:
         return False
-    worker._speco_output_lifetime_diagnostics_installed = True
+    worker._speco_memory_diagnostics_installed = True
     print(
-        "[speco output lifetime] WorkerDict diagnostics installed "
+        "[speco process memory] WorkerDict diagnostics installed "
         f"pid={os.getpid()} rank={getattr(worker, 'rank', None)} "
         f"methods={','.join(installed)}",
         flush=True,
@@ -491,7 +493,7 @@ class VerlNPUVLLMImportCompatMixin:
         install_verl_npu_checkpoint_reclaim()
         install_verl_npu_fsdp2_weight_export_compat()
         super().__init__(*args, **kwargs)
-        _install_npu_worker_output_lifetime_diagnostics(self)
+        _install_npu_worker_memory_diagnostics(self)
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):

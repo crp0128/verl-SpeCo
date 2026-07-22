@@ -69,8 +69,8 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         compat,
-        "_install_npu_worker_output_lifetime_diagnostics",
-        lambda worker: events.append(("output_lifetime", worker)),
+        "_install_npu_worker_memory_diagnostics",
+        lambda worker: events.append(("memory_diagnostics", worker)),
     )
 
     class BaseWorker:
@@ -89,10 +89,10 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
         "fsdp2_export",
         "base",
     ]
-    assert events[-1] == ("output_lifetime", worker)
+    assert events[-1] == ("memory_diagnostics", worker)
 
 
-def test_npu_worker_output_lifetime_diagnostics_wrap_worker_results(monkeypatch) -> None:
+def test_npu_worker_memory_diagnostics_wrap_worker_calls(monkeypatch) -> None:
     events = []
 
     class Worker:
@@ -106,21 +106,31 @@ def test_npu_worker_output_lifetime_diagnostics_wrap_worker_results(monkeypatch)
     monkeypatch.setattr(compat, "_is_npu_worker", lambda: True)
     monkeypatch.setattr(
         compat,
-        "log_previous_output_lifetime",
+        "log_process_memory_before_call",
         lambda owner, key, role, method: events.append(("log", owner, key, role, method)) or 7,
     )
     monkeypatch.setattr(
         compat,
-        "remember_output_lifetime",
-        lambda owner, key, call, output: events.append(("remember", owner, key, call, output)),
+        "log_process_memory_after_call",
+        lambda owner, key, call, role, method, phase: events.append(
+            ("after", owner, key, call, role, method, phase)
+        ),
     )
 
-    assert compat._install_npu_worker_output_lifetime_diagnostics(worker) is True
+    assert compat._install_npu_worker_memory_diagnostics(worker) is True
     assert worker.compute_log_prob("batch") == "output:batch"
     assert events == [
         ("log", worker, "worker_dict:compute_log_prob", "worker_dict", "compute_log_prob"),
         ("compute", "batch"),
-        ("remember", worker, "worker_dict:compute_log_prob", 7, "output:batch"),
+        (
+            "after",
+            worker,
+            "worker_dict:compute_log_prob",
+            7,
+            "worker_dict",
+            "compute_log_prob",
+            "after",
+        ),
     ]
 
 
