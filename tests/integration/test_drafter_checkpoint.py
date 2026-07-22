@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import pytest
 
+from verl_speco.trainer import checkpoint as checkpoint_utils
 from verl_speco.trainer.checkpoint import (
     DrafterCheckpointMetadataError,
     get_drafter_checkpoint_metadata,
@@ -12,6 +13,7 @@ from verl_speco.trainer.checkpoint import (
     is_pretrained_drafter_checkpoint,
     release_checkpoint_host_memory,
     resolve_drafter_checkpoint_path,
+    trim_process_host_memory,
 )
 
 
@@ -144,3 +146,42 @@ def test_checkpoint_host_memory_reclaim_is_best_effort(monkeypatch, tmp_path) ->
     assert result["heap_trimmed"] is True
     assert result["files_advised"] == 1
     assert result["files_failed"] == 0
+
+
+def test_process_heap_reclaim_prefers_jemalloc(monkeypatch) -> None:
+    events = []
+    monkeypatch.setattr(checkpoint_utils.sys, "platform", "linux")
+    monkeypatch.setattr(checkpoint_utils, "_jemalloc_is_active", lambda: True)
+    monkeypatch.setattr(
+        checkpoint_utils,
+        "_reclaim_jemalloc_heap",
+        lambda: events.append("jemalloc") or True,
+    )
+
+    assert checkpoint_utils._trim_process_heap() is True
+    assert events == ["jemalloc"]
+
+
+def test_jemalloc_reclaim_flushes_tcache_and_decays_all_arenas(monkeypatch) -> None:
+    controls = []
+    monkeypatch.setattr(
+        checkpoint_utils,
+        "_jemalloc_mallctl",
+        lambda name: controls.append(name) or True,
+    )
+    monkeypatch.delenv("SPECO_JEMALLOC_RECLAIM_MODE", raising=False)
+
+    assert checkpoint_utils._reclaim_jemalloc_heap() is True
+    assert controls == ["thread.tcache.flush", "arena.4096.decay"]
+
+
+def test_trim_process_host_memory_reports_allocator(monkeypatch) -> None:
+    monkeypatch.setattr(checkpoint_utils, "_host_allocator_name", lambda: "jemalloc")
+    monkeypatch.setattr(checkpoint_utils, "_trim_process_heap", lambda: True)
+    monkeypatch.setenv("SPECO_JEMALLOC_RECLAIM_MODE", "invalid")
+
+    result = trim_process_host_memory()
+
+    assert result["heap_trimmed"] is True
+    assert result["allocator"] == "jemalloc"
+    assert result["reclaim_action"] == "decay"

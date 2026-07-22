@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextvars
 import inspect
 import logging
+import os
 from functools import wraps
 from typing import Any
 
@@ -13,7 +14,6 @@ from verl_speco.trainer.checkpoint import trim_process_host_memory
 logger = logging.getLogger(__file__)
 
 _PATCHED = False
-_HOST_MEMORY_RECLAIM_PATCHED = False
 _DEFAULT_EXTRA_KEYS = {
     "turn_scores",
     "tool_rewards",
@@ -31,6 +31,7 @@ SPECO_HOST_MEMORY_AGENT_LOOP_MANAGER_CLASS = (
 _SPECO_WORKER_WRAPPER_METHOD_NAMES = {
     "_speco_worker_init",
     "_speco_worker_generate_sequences",
+    "_speco_host_memory_worker_generate_sequences",
     "_speco_worker_run_agent_loop",
     "_speco_worker_agent_loop_postprocess",
     "_speco_worker_postprocess",
@@ -71,6 +72,8 @@ def _trim_agent_loop_host_memory(worker: Any) -> None:
         return
     print(
         "[speco host memory] AgentLoop entry reclaim active "
+        f"allocator={reclaim.get('allocator', 'unknown')} "
+        f"action={reclaim.get('reclaim_action', 'unknown')} "
         f"heap_trimmed={int(bool(reclaim['heap_trimmed']))} "
         f"elapsed_sec={reclaim['elapsed_sec']:.4f}",
         flush=True,
@@ -175,6 +178,7 @@ def _speco_worker_init(self, *args, **kwargs):
 
 
 async def _speco_worker_generate_sequences(self, batch):
+    _trim_agent_loop_host_memory(self)
     global_steps_token, validate_token = _speco_context_from_batch(batch)
     try:
         generate_sequences = _speco_parent_method(self, "generate_sequences")
@@ -186,6 +190,17 @@ async def _speco_worker_generate_sequences(self, batch):
         return _ensure_extra_field_defaults(result)
     finally:
         _speco_reset_context(global_steps_token, validate_token)
+
+
+async def _speco_host_memory_worker_generate_sequences(self, batch):
+    _trim_agent_loop_host_memory(self)
+    generate_sequences = _speco_parent_method(self, "generate_sequences")
+    if not callable(generate_sequences):
+        raise AttributeError("SPECO AgentLoop worker parent has no generate_sequences method")
+    result = generate_sequences(self, batch)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
 
 
 async def _speco_worker_run_agent_loop(self, sampling_params, trajectory, *args, **kwargs):
@@ -303,6 +318,39 @@ def _build_speco_agent_loop_worker_class(worker_cls):
     return speco_worker_cls
 
 
+def _build_host_memory_agent_loop_worker_class(worker_cls):
+    host_memory_worker_cls = getattr(worker_cls, "_speco_host_memory_remote_worker_cls", None)
+    if host_memory_worker_cls is not None:
+        return host_memory_worker_cls
+
+    attrs = {
+        "__module__": __name__,
+        "__doc__": "Ray-serializable AgentLoopWorker subclass with NPU host-memory reclaim.",
+        "generate_sequences": _speco_host_memory_worker_generate_sequences,
+    }
+    host_memory_worker_cls = type("SpecoHostMemoryAgentLoopWorker", (worker_cls,), attrs)
+    host_memory_worker_cls.__qualname__ = "SpecoHostMemoryAgentLoopWorker"
+    worker_cls._speco_host_memory_remote_worker_cls = host_memory_worker_cls
+    return host_memory_worker_cls
+
+
+def _configure_host_memory_agent_loop_manager_instance(manager: Any, worker_cls: Any) -> bool:
+    if not _is_npu_config(getattr(manager, "config", None)):
+        return False
+
+    import ray
+
+    host_memory_worker_cls = _build_host_memory_agent_loop_worker_class(worker_cls)
+    manager.agent_loop_workers_class = ray.remote(host_memory_worker_cls)
+    print(
+        "[speco host memory] AgentLoop manager active "
+        f"pid={os.getpid()} manager={type(manager).__name__} "
+        f"worker_class={host_memory_worker_cls.__name__}",
+        flush=True,
+    )
+    return True
+
+
 def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) -> None:
     if not _is_sglang_rollout_config(getattr(manager, "config", None)):
         return
@@ -337,59 +385,23 @@ class SpecoAgentLoopManager(_UpstreamAgentLoopManager):
     """Explicit AgentLoopManager bridge used by upstream config loading."""
 
     def __init__(self, *args, **kwargs):
-        config = kwargs.get("config") if "config" in kwargs else (args[0] if args else None)
-        if _is_npu_config(config):
-            install_agent_loop_host_memory_reclaim()
         install_agent_loop_runtime_patch()
         super().__init__(*args, **kwargs)
         agent_loop_module = _AgentLoopModule or _load_agent_loop_module()
         worker_cls = getattr(agent_loop_module, "AgentLoopWorker")
         _configure_speco_agent_loop_manager_instance(self, worker_cls)
+        if not _is_sglang_rollout_config(getattr(self, "config", None)):
+            _configure_host_memory_agent_loop_manager_instance(self, worker_cls)
 
 
 class SpecoHostMemoryAgentLoopManager(_UpstreamAgentLoopManager):
     """Use upstream agent-loop behavior with NPU cross-call heap reclaim."""
 
     def __init__(self, *args, **kwargs):
-        install_agent_loop_host_memory_reclaim()
         super().__init__(*args, **kwargs)
-
-
-def install_agent_loop_host_memory_reclaim() -> bool:
-    """Trim the previous Ray result allocation at the next AgentLoop call."""
-
-    global _HOST_MEMORY_RECLAIM_PATCHED
-    if _HOST_MEMORY_RECLAIM_PATCHED:
-        return True
-
-    try:
-        agent_loop_module = _load_agent_loop_module()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Unable to install AgentLoop host-memory reclaim: %s", exc)
-        return False
-
-    worker_cls = getattr(agent_loop_module, "AgentLoopWorker", None)
-    generate_sequences = getattr(worker_cls, "generate_sequences", None)
-    if worker_cls is None or not callable(generate_sequences):
-        logger.warning("Unable to install AgentLoop host-memory reclaim: missing upstream worker method")
-        return False
-    if getattr(generate_sequences, "_speco_agent_loop_host_memory_reclaim", False):
-        _HOST_MEMORY_RECLAIM_PATCHED = True
-        return True
-
-    @wraps(generate_sequences)
-    async def generate_sequences_with_entry_reclaim(self, batch):
-        _trim_agent_loop_host_memory(self)
-        result = generate_sequences(self, batch)
-        if inspect.isawaitable(result):
-            result = await result
-        return result
-
-    generate_sequences_with_entry_reclaim._speco_agent_loop_host_memory_reclaim = True
-    worker_cls.generate_sequences = generate_sequences_with_entry_reclaim
-    _HOST_MEMORY_RECLAIM_PATCHED = True
-    logger.warning("Enabled NPU AgentLoop cross-call host-memory reclaim")
-    return True
+        agent_loop_module = _AgentLoopModule or _load_agent_loop_module()
+        worker_cls = getattr(agent_loop_module, "AgentLoopWorker")
+        _configure_host_memory_agent_loop_manager_instance(self, worker_cls)
 
 
 def install_agent_loop_runtime_patch() -> bool:

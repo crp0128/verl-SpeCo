@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+from functools import lru_cache
 from glob import glob
 from typing import Any, Optional, Union
 
@@ -19,6 +20,9 @@ _WEIGHT_PATTERNS = (
 _OPTIMIZER_DCP_METADATA = ".metadata"
 
 logger = logging.getLogger(__name__)
+
+_JEMALLOC_ARENAS_ALL = 4096
+_JEMALLOC_RECLAIM_MODE_ENV = "SPECO_JEMALLOC_RECLAIM_MODE"
 
 _PROCESS_MEMORY_GROUPS = (
     ("agent_loop", ("agentloopworker", "agent_loop_worker")),
@@ -385,11 +389,72 @@ def format_node_process_memory_summary(
     )
 
 
+@lru_cache(maxsize=1)
+def _jemalloc_is_active() -> bool:
+    if not sys.platform.startswith("linux"):
+        return False
+    if "jemalloc" in os.getenv("LD_PRELOAD", "").lower():
+        return True
+    try:
+        with open("/proc/self/maps", encoding="utf-8") as stream:
+            return any("jemalloc" in line.lower() for line in stream)
+    except OSError:
+        return False
+
+
+@lru_cache(maxsize=1)
+def _jemalloc_mallctl_function() -> Any:
+    try:
+        runtime = ctypes.CDLL(None)
+        mallctl = getattr(runtime, "mallctl", None) or getattr(runtime, "je_mallctl", None)
+        if mallctl is None:
+            return None
+        mallctl.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+        mallctl.restype = ctypes.c_int
+        return mallctl
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _jemalloc_mallctl(name: str) -> bool:
+    try:
+        mallctl = _jemalloc_mallctl_function()
+        if mallctl is None:
+            return False
+        return mallctl(name.encode("ascii"), None, None, None, 0) == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _jemalloc_reclaim_mode() -> str:
+    mode = os.getenv(_JEMALLOC_RECLAIM_MODE_ENV, "decay").strip().lower()
+    return mode if mode in {"decay", "purge"} else "decay"
+
+
+def _reclaim_jemalloc_heap() -> bool:
+    _jemalloc_mallctl("thread.tcache.flush")
+    return _jemalloc_mallctl(f"arena.{_JEMALLOC_ARENAS_ALL}.{_jemalloc_reclaim_mode()}")
+
+
+def _host_allocator_name() -> str:
+    if not sys.platform.startswith("linux"):
+        return "unsupported"
+    return "jemalloc" if _jemalloc_is_active() else "glibc"
+
+
 def _trim_process_heap() -> bool:
-    """Return free glibc heap arenas to the operating system when available."""
+    """Return unused allocator pages to the operating system when available."""
 
     if not sys.platform.startswith("linux"):
         return False
+    if _jemalloc_is_active():
+        return _reclaim_jemalloc_heap()
     try:
         libc = ctypes.CDLL(None)
         malloc_trim = libc.malloc_trim
@@ -401,13 +466,18 @@ def _trim_process_heap() -> bool:
 
 
 def trim_process_host_memory() -> dict[str, Any]:
-    """Return free glibc arenas without forcing a Python GC cycle."""
+    """Return unused jemalloc/glibc pages without forcing a Python GC cycle."""
 
     started = time.perf_counter()
+    allocator = _host_allocator_name()
     heap_trimmed = _trim_process_heap()
     return {
         "elapsed_sec": time.perf_counter() - started,
         "heap_trimmed": heap_trimmed,
+        "allocator": allocator,
+        "reclaim_action": (
+            _jemalloc_reclaim_mode() if allocator == "jemalloc" else "malloc_trim"
+        ),
     }
 
 
@@ -465,6 +535,7 @@ def release_checkpoint_host_memory(
         gc.collect()
     except Exception:  # noqa: BLE001
         pass
+    allocator = _host_allocator_name()
     trimmed_before = _trim_process_heap()
     advised = 0
     failed = 0
@@ -476,6 +547,10 @@ def release_checkpoint_host_memory(
     return {
         "elapsed_sec": time.perf_counter() - started,
         "heap_trimmed": trimmed_before,
+        "allocator": allocator,
+        "reclaim_action": (
+            _jemalloc_reclaim_mode() if allocator == "jemalloc" else "malloc_trim"
+        ),
         "files_advised": advised,
         "files_failed": failed,
     }

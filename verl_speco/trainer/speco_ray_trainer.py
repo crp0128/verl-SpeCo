@@ -419,6 +419,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             yield
             return
 
+        print(
+            "[speco host memory] AgentLoop manager selected "
+            f"pid={os.getpid()} trainer_device={_get_nested(self.config, ('trainer', 'device'), None)} "
+            f"online_drafter={int(enabled)} manager_class={manager_class}",
+            flush=True,
+        )
+
         rollout_config = _get_nested(self.config, ("actor_rollout_ref", "rollout"), None)
         if rollout_config is None:
             yield

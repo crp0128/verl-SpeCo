@@ -281,16 +281,32 @@ def install_verl_npu_fsdp_host_memory_reclaim(
         return False
 
     device_module = module_importer("verl.utils.device")
-    if device_module.get_device_name() != "npu":
+    device_name = device_module.get_device_name()
+    if device_name != "npu":
+        print(
+            "[speco host memory] NPU FSDP reclaim unavailable "
+            f"pid={os.getpid()} reason=device:{device_name}",
+            flush=True,
+        )
         return False
 
     engine_module = module_importer(_VERL_FSDP_ENGINE_MODULE)
     engine_cls = getattr(engine_module, "FSDPEngine", None)
     original_forward_backward_batch = getattr(engine_cls, "forward_backward_batch", None)
     if engine_cls is None or not callable(original_forward_backward_batch):
+        print(
+            "[speco host memory] NPU FSDP reclaim unavailable "
+            f"pid={os.getpid()} reason=missing_forward_backward_batch",
+            flush=True,
+        )
         return False
     if getattr(original_forward_backward_batch, "_speco_npu_entry_host_memory_reclaim", False):
         _NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED = True
+        print(
+            "[speco host memory] NPU FSDP reclaim installed "
+            f"pid={os.getpid()} engine={engine_cls.__module__}.{engine_cls.__name__} already_active=1",
+            flush=True,
+        )
         return False
 
     @functools.wraps(original_forward_backward_batch)
@@ -301,11 +317,15 @@ def install_verl_npu_fsdp_host_memory_reclaim(
             "_speco_npu_entry_host_memory_reclaim_logged",
             False,
         ):
-            logger.warning(
-                "[speco host memory] NPU FSDP entry reclaim active: "
-                "heap_trimmed=%s elapsed_sec=%.4f",
-                reclaim["heap_trimmed"],
-                reclaim["elapsed_sec"],
+            print(
+                "[speco host memory] NPU FSDP entry reclaim active "
+                f"pid={os.getpid()} rank={getattr(self, 'rank', None)} "
+                f"engine={type(self).__module__}.{type(self).__name__} "
+                f"allocator={reclaim.get('allocator', 'unknown')} "
+                f"action={reclaim.get('reclaim_action', 'unknown')} "
+                f"heap_trimmed={int(bool(reclaim['heap_trimmed']))} "
+                f"elapsed_sec={reclaim['elapsed_sec']:.4f}",
+                flush=True,
             )
             self._speco_npu_entry_host_memory_reclaim_logged = True
         return original_forward_backward_batch(self, *args, **kwargs)
@@ -313,6 +333,11 @@ def install_verl_npu_fsdp_host_memory_reclaim(
     forward_backward_batch_with_entry_reclaim._speco_npu_entry_host_memory_reclaim = True
     engine_cls.forward_backward_batch = forward_backward_batch_with_entry_reclaim
     _NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED = True
+    print(
+        "[speco host memory] NPU FSDP reclaim installed "
+        f"pid={os.getpid()} engine={engine_cls.__module__}.{engine_cls.__name__} already_active=0",
+        flush=True,
+    )
     logger.warning("Enabled NPU FSDP cross-call host-memory reclaim")
     return True
 
