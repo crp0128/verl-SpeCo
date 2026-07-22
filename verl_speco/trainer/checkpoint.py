@@ -243,15 +243,18 @@ def _classify_process_memory_group(process_text: str) -> str | None:
 
 def _process_memory_title(comm: str, cmdline: str) -> str:
     ray_title = re.search(r"ray::[^\s]+", f"{comm} {cmdline}", flags=re.IGNORECASE)
-    title = ray_title.group(0) if ray_title is not None else comm
+    command_prefix = " ".join(cmdline.strip().split()[:3])
+    title = ray_title.group(0) if ray_title is not None else (command_prefix or comm)
     return re.sub(r"[^A-Za-z0-9_.:+-]+", "_", title)[:64] or "unknown"
 
 
 def collect_node_process_memory_snapshot() -> tuple[dict[int, dict[str, Any]], float]:
-    """Collect compact per-process memory data for relevant Ray and vLLM roles."""
+    """Collect compact memory data for this user's Ray and related processes."""
 
     started = time.perf_counter()
     processes: dict[int, dict[str, Any]] = {}
+    getuid = getattr(os, "getuid", None)
+    current_uid = getuid() if callable(getuid) else None
     try:
         process_entries = os.scandir("/proc")
     except OSError:
@@ -263,6 +266,8 @@ def collect_node_process_memory_snapshot() -> tuple[dict[int, dict[str, Any]], f
                 continue
             process_root = os.path.join("/proc", entry.name)
             try:
+                if current_uid is not None and entry.stat(follow_symlinks=False).st_uid != current_uid:
+                    continue
                 with open(os.path.join(process_root, "comm"), encoding="utf-8") as stream:
                     comm = stream.read().strip()
                 with open(os.path.join(process_root, "cmdline"), "rb") as stream:
@@ -272,7 +277,9 @@ def collect_node_process_memory_snapshot() -> tuple[dict[int, dict[str, Any]], f
 
             group = _classify_process_memory_group(f"{comm} {cmdline}")
             if group is None:
-                continue
+                if current_uid is None:
+                    continue
+                group = "user_other"
             memory = _read_kib(os.path.join(process_root, "status"), {"VmRSS", "RssAnon"})
             processes[int(entry.name)] = {
                 "group": group,
@@ -300,7 +307,7 @@ def _format_process_memory_deltas(
 ) -> str:
     groups = _aggregate_process_memory_groups(processes)
     previous_groups = _aggregate_process_memory_groups(previous_processes)
-    ordered_groups = [group for group, _ in _PROCESS_MEMORY_GROUPS] + ["ray_other"]
+    ordered_groups = [group for group, _ in _PROCESS_MEMORY_GROUPS] + ["ray_other", "user_other"]
     group_deltas = []
     for group in ordered_groups:
         current = groups.get(group, [0, 0, 0])
@@ -312,7 +319,7 @@ def _format_process_memory_deltas(
             )
 
     top_deltas = []
-    for group in ("ray_other", "worker_tp"):
+    for group in ("worker_dict", "agent_loop", "vllm_http", "worker_tp", "ray_other", "user_other"):
         candidates = []
         for pid, process in processes.items():
             if process["group"] != group:
@@ -355,7 +362,7 @@ def format_node_process_memory_summary(
         processes, scan_ms = collect_node_process_memory_snapshot()
     groups = _aggregate_process_memory_groups(processes)
 
-    ordered_groups = [group for group, _ in _PROCESS_MEMORY_GROUPS] + ["ray_other"]
+    ordered_groups = [group for group, _ in _PROCESS_MEMORY_GROUPS] + ["ray_other", "user_other"]
     formatted = []
     for group in ordered_groups:
         values = groups.get(group)

@@ -534,29 +534,61 @@ def patch_verl_bucketed_weight_transfer_npu_staging(bucketed_weight_transfer: An
     return True
 
 
-def _speco_can_use_npu_target_staging(worker: Any, *, peft_config: dict | None, use_shm: bool) -> bool:
+def _speco_npu_target_staging_decision(
+    worker: Any,
+    *,
+    peft_config: dict | None,
+    use_shm: bool,
+) -> tuple[bool, str]:
     if _bool_or_none(os.getenv(SPECO_VLLM_NPU_STAGING_ENV)) is False:
-        return False
-    if not use_shm or peft_config is not None or not _speco_is_npu_vllm_worker(worker):
-        return False
+        return False, "disabled_by_env"
+    if not use_shm:
+        return False, "not_shm"
+    if peft_config is not None:
+        return False, "peft"
+    if not _speco_is_npu_vllm_worker(worker):
+        return False, "not_npu"
     if bool(getattr(worker, "_is_qat_model", False)) or bool(getattr(worker, "_is_modelopt_qat", False)):
-        return False
+        return False, "qat"
     use_mtp_sync = getattr(worker, "_use_mtp_drafter_weight_sync", None)
     if callable(use_mtp_sync) and use_mtp_sync():
-        return False
+        return False, "mtp"
     runner = getattr(worker, "model_runner", None)
     vllm_config = getattr(runner, "vllm_config", None)
-    return vllm_config is not None and getattr(vllm_config, "quant_config", None) is None
+    if vllm_config is None:
+        return False, "missing_vllm_config"
+    quant_config = getattr(vllm_config, "quant_config", None)
+    if quant_config is not None:
+        return False, f"quantized:{type(quant_config).__name__}"
+    return True, "eligible"
+
+
+def _speco_can_use_npu_target_staging(worker: Any, *, peft_config: dict | None, use_shm: bool) -> bool:
+    enabled, _ = _speco_npu_target_staging_decision(
+        worker,
+        peft_config=peft_config,
+        use_shm=use_shm,
+    )
+    return enabled
 
 
 @contextmanager
 def _speco_npu_target_staging(worker: Any, *, peft_config: dict | None, use_shm: bool):
     previous = bool(getattr(_NPU_TARGET_STAGING_STATE, "enabled", False))
-    _NPU_TARGET_STAGING_STATE.enabled = _speco_can_use_npu_target_staging(
+    enabled, reason = _speco_npu_target_staging_decision(
         worker,
         peft_config=peft_config,
         use_shm=use_shm,
     )
+    _NPU_TARGET_STAGING_STATE.enabled = enabled
+    if not bool(getattr(worker, "_speco_npu_staging_decision_logged", False)):
+        worker._speco_npu_staging_decision_logged = True
+        print(
+            "[speco vllm weight sync] NPU staging decision "
+            f"enabled={int(enabled)} reason={reason} pid={os.getpid()} "
+            f"local_rank={getattr(worker, 'local_rank', None)} use_shm={int(bool(use_shm))}",
+            flush=True,
+        )
     try:
         yield
     finally:

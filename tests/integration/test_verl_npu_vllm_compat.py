@@ -59,6 +59,11 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         compat,
+        "install_verl_npu_fsdp_host_memory_reclaim",
+        lambda: events.append("host_memory_reclaim"),
+    )
+    monkeypatch.setattr(
+        compat,
         "install_verl_npu_fsdp2_weight_export_compat",
         lambda: events.append("fsdp2_export"),
     )
@@ -71,7 +76,14 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
         pass
 
     WrappedWorker()
-    assert events == ["compat", "training_output_release", "reclaim", "fsdp2_export", "base"]
+    assert events == [
+        "compat",
+        "training_output_release",
+        "host_memory_reclaim",
+        "reclaim",
+        "fsdp2_export",
+        "base",
+    ]
 
 
 def test_worker_mixin_installs_shm_reuse_before_weight_update(monkeypatch) -> None:
@@ -165,6 +177,42 @@ def test_npu_checkpoint_reclaim_preserves_native_save(monkeypatch) -> None:
             },
         ),
         ("reclaim", "/tmp/actor", True),
+    ]
+
+
+def test_npu_fsdp_host_memory_reclaim_runs_at_each_call_entry(monkeypatch) -> None:
+    events = []
+    engine_module = types.ModuleType(compat._VERL_FSDP_ENGINE_MODULE)
+
+    class FSDPEngine:
+        rank = 0
+
+        def forward_backward_batch(self, value):
+            events.append(("forward_backward_batch", value))
+            return value
+
+    engine_module.FSDPEngine = FSDPEngine
+    modules = {
+        compat._VERL_FSDP_ENGINE_MODULE: engine_module,
+        "verl.utils.device": types.SimpleNamespace(get_device_name=lambda: "npu"),
+    }
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(compat, "_NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED", False)
+    monkeypatch.setattr(
+        compat,
+        "trim_process_host_memory",
+        lambda: events.append(("trim",)) or {"heap_trimmed": True, "elapsed_sec": 0.0},
+    )
+
+    assert compat.install_verl_npu_fsdp_host_memory_reclaim(modules.__getitem__) is True
+    engine = FSDPEngine()
+    assert engine.forward_backward_batch(1) == 1
+    assert engine.forward_backward_batch(2) == 2
+    assert events == [
+        ("trim",),
+        ("forward_backward_batch", 1),
+        ("trim",),
+        ("forward_backward_batch", 2),
     ]
 
 

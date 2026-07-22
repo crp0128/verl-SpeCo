@@ -20,6 +20,7 @@ from verl.utils import tensordict_utils as tu
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 from verl_speco.integration.agent_loop_runtime import (
     SPECO_AGENT_LOOP_MANAGER_CLASS,
+    SPECO_HOST_MEMORY_AGENT_LOOP_MANAGER_CLASS,
     install_agent_loop_runtime_patch,
 )
 from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
@@ -410,7 +411,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     @contextmanager
     def _use_speco_agent_loop_manager(self, enabled: bool):
-        if not enabled:
+        if enabled:
+            manager_class = SPECO_AGENT_LOOP_MANAGER_CLASS
+        elif str(_get_nested(self.config, ("trainer", "device"), "")).lower() == "npu":
+            manager_class = SPECO_HOST_MEMORY_AGENT_LOOP_MANAGER_CLASS
+        else:
             yield
             return
 
@@ -428,7 +433,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         with open_dict(rollout_config):
             if "agent" not in rollout_config or rollout_config["agent"] is None:
                 rollout_config["agent"] = {}
-            rollout_config["agent"]["agent_loop_manager_class"] = SPECO_AGENT_LOOP_MANAGER_CLASS
+            rollout_config["agent"]["agent_loop_manager_class"] = manager_class
         try:
             yield
         finally:

@@ -29,6 +29,7 @@ _IMPORT_COMPAT_APPLIED = False
 _NPU_CHECKPOINT_RECLAIM_APPLIED = False
 _NPU_FSDP2_WEIGHT_EXPORT_APPLIED = False
 _FSDP_TRAIN_OUTPUT_RELEASE_APPLIED = False
+_NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED = False
 
 try:
     from verl.single_controller.base.decorator import Dispatch, register
@@ -264,6 +265,58 @@ def install_verl_fsdp_training_output_release_compat(
     return True
 
 
+def install_verl_npu_fsdp_host_memory_reclaim(
+    module_importer: Callable[[str], Any] = importlib.import_module,
+) -> bool:
+    """Trim completed Ray-call allocations at the next NPU FSDP call entry.
+
+    Ray may still be serializing the previous ``forward_backward_batch`` result
+    when that call returns. Trimming at the next entry avoids retaining glibc's
+    previous high-water mark without touching live return values or forcing a
+    Python GC cycle.
+    """
+
+    global _NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED
+    if _NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED or not _module_available("torch_npu"):
+        return False
+
+    device_module = module_importer("verl.utils.device")
+    if device_module.get_device_name() != "npu":
+        return False
+
+    engine_module = module_importer(_VERL_FSDP_ENGINE_MODULE)
+    engine_cls = getattr(engine_module, "FSDPEngine", None)
+    original_forward_backward_batch = getattr(engine_cls, "forward_backward_batch", None)
+    if engine_cls is None or not callable(original_forward_backward_batch):
+        return False
+    if getattr(original_forward_backward_batch, "_speco_npu_entry_host_memory_reclaim", False):
+        _NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED = True
+        return False
+
+    @functools.wraps(original_forward_backward_batch)
+    def forward_backward_batch_with_entry_reclaim(self, *args, **kwargs):
+        reclaim = trim_process_host_memory()
+        if int(getattr(self, "rank", 0) or 0) == 0 and not getattr(
+            self,
+            "_speco_npu_entry_host_memory_reclaim_logged",
+            False,
+        ):
+            logger.warning(
+                "[speco host memory] NPU FSDP entry reclaim active: "
+                "heap_trimmed=%s elapsed_sec=%.4f",
+                reclaim["heap_trimmed"],
+                reclaim["elapsed_sec"],
+            )
+            self._speco_npu_entry_host_memory_reclaim_logged = True
+        return original_forward_backward_batch(self, *args, **kwargs)
+
+    forward_backward_batch_with_entry_reclaim._speco_npu_entry_host_memory_reclaim = True
+    engine_cls.forward_backward_batch = forward_backward_batch_with_entry_reclaim
+    _NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED = True
+    logger.warning("Enabled NPU FSDP cross-call host-memory reclaim")
+    return True
+
+
 def install_verl_npu_fsdp2_weight_export_compat(
     module_importer: Callable[[str], Any] = importlib.import_module,
 ) -> bool:
@@ -373,6 +426,7 @@ class VerlNPUVLLMImportCompatMixin:
     def __init__(self, *args, **kwargs):
         install_verl_npu_vllm_import_compat()
         install_verl_fsdp_training_output_release_compat()
+        install_verl_npu_fsdp_host_memory_reclaim()
         install_verl_npu_checkpoint_reclaim()
         install_verl_npu_fsdp2_weight_export_compat()
         super().__init__(*args, **kwargs)

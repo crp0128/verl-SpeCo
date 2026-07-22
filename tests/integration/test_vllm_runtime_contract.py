@@ -19,6 +19,8 @@ from verl_speco.integration.vllm_runtime import (
     _normalize_dflash_target_layer_aliases,
     _record_vllm_spec_decode_scheduler_stats,
     _speco_can_use_npu_target_staging,
+    _speco_npu_target_staging,
+    _speco_npu_target_staging_decision,
     _speco_persistent_weight_shm_name,
     _validate_vllm_dflash_drafter_config,
     _vllm_ascend_has_dspark_pr11153_k_query_runtime,
@@ -96,7 +98,8 @@ def test_vllm_weight_sync_extension_has_stable_runtime_path() -> None:
 
 
 def test_vllm_npu_staging_is_guarded_and_preserves_upstream_fallback() -> None:
-    guard_source = getsource(_speco_can_use_npu_target_staging)
+    guard_source = getsource(_speco_npu_target_staging_decision)
+    context_source = getsource(_speco_npu_target_staging)
     patch_source = getsource(patch_verl_bucketed_weight_transfer_npu_staging)
 
     assert "not use_shm" in guard_source
@@ -107,6 +110,9 @@ def test_vllm_npu_staging_is_guarded_and_preserves_upstream_fallback() -> None:
     assert "SPECO_VLLM_NPU_STAGING_COPY_CHUNK_BYTES" in patch_source
     assert "staging_buffer[start:end].copy_(self.buffer[start:end], non_blocking=False)" in patch_source
     assert "get_torch_device().synchronize()" in patch_source
+    assert "NPU staging decision" in context_source
+    assert "flush=True" in context_source
+    assert "return enabled" in getsource(_speco_can_use_npu_target_staging)
 
 
 def test_vllm_weight_shm_name_is_stable_and_channel_scoped() -> None:
