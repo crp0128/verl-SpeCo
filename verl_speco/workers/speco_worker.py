@@ -583,6 +583,11 @@ class SpecoWorker(Worker):
         *,
         collection_id: Optional[str] = None,
     ) -> bool:
+        # Collection RPCs execute on every tensor-parallel member.  They must all
+        # acknowledge the sample for the transaction to succeed, but feature-store
+        # shards are replica-owned: only the drafter group leader may persist them.
+        if not self.is_drafter_group_leader:
+            return True
         writer = self._get_feature_writer()
         if writer is None:
             logger.warning(
@@ -631,6 +636,7 @@ class SpecoWorker(Worker):
         )
         metadata = {
             "source": batch.get("hidden_target_logprobs_source", "rl_rollout"),
+            "collection_id": str(collection_id) if collection_id is not None else None,
             "global_step": batch.get("global_step", self.last_global_step),
             "target_model_path": target_model_path,
             "drafter_model_path": _config_str(

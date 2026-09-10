@@ -119,6 +119,38 @@ do not enable dynamic verification length. The Qwen checkpoint must declare
 it for the native default); the fixed verification length must not exceed the
 checkpoint's training `block_size`.
 
+### verl V1 runner (Phase 1)
+
+On `release/v0.9.0`, SPECO can now enter verl's native V1
+`TransferQueue` trainer with `trainer.use_v1=true`. Fixed-drafter serving
+preserves verl's trainer mode (`sync`, `colocate_async`, or `separate_async`).
+Phase-1 online drafter training supports `sync` only. The adapter preserves the
+configured agent-loop manager while wrapping vLLM actor workers with SPECO's
+runtime compatibility and draft-weight publication hooks. It does not add
+Uni-Agent fields.
+
+Use the Phase 1 overlay from a checkout that exposes the `verl` config package:
+
+```bash
+export PYTHONPATH=/path/to/verl:/path/to/verl-SpeCo
+python -m verl_speco.main --config-name=speco_v1_trainer \
+  actor_rollout_ref.model.path=/path/to/target \
+  data.train_files=/path/to/train.parquet \
+  data.val_files=/path/to/val.parquet \
+  trainer.v1.trainer_mode=sync
+```
+
+For `trainer.v1.trainer_mode=sync`, online drafter training uses the same
+old-logprob collector, scheduler, feature store, and weight-publication
+protocol as the legacy trainer, with V1's `KVBatchMeta`/TransferQueue boundary
+preserved. Start with ordinary single-turn PPO/GRPO batches and the existing
+fixed feature window. Agent trajectories, per-turn masking, context-plus-
+assistant layouts, and sliding-window-aware training are Phase 2 work; do not
+enable those options with this overlay yet. Online drafter training also
+requires actor old-logprob inference, so it rejects
+`algorithm.rollout_correction.bypass_mode=true`. The asynchronous V1 modes are
+currently limited to fixed-drafter serving.
+
 ### VeOmni Actor Compatibility
 
 VeOmni is an actor training engine in this integration; the drafter itself

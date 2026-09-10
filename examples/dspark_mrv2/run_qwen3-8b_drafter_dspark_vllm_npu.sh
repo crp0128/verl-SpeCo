@@ -28,16 +28,16 @@ exp_name='qwen3_8b_dspark_mrv2_drafter_vllm_npu'
 
 gen_tp=2
 train_sp=4
-ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-16}
+ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-4}
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-16}
 spec_verify_tokens=${SPECO_DSPARK_VERIFY_TOKENS:-7}
 
-MODEL_PATH=/path/to/model
-CKPTS_DIR=/path/to/checkpoint
-TRAIN_FILE=/path/to/train_file
-TEST_FILE=/path/to/test_file
-DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter
+MODEL_PATH=/data/c00954340/qwen3-8b
+CKPTS_DIR=/data/c00954340/checkpoint/${exp_name}
+TRAIN_FILE=/data/c00954340/DAPO-Math-17k/dapo-math-17k.parquet
+TEST_FILE=/data/c00954340/AIME-2024/aime-2024.parquet
+DRAFTER_PATH=/data/c00954340/qwen3-8b-dspark
 
 
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
@@ -48,11 +48,12 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     +ray_kwargs.ray_init._system_config.num_workers_soft_limit=${ray_worker_soft_limit} \
     data.train_files=${TRAIN_FILE} \
     data.val_files=${TEST_FILE} \
-    data.train_batch_size=64 \
+    data.train_batch_size=16 \
     data.max_prompt_length=512 \
-    data.max_response_length=8192 \
+    data.max_response_length=2048 \
     data.filter_overlong_prompts=False \
     data.filter_overlong_prompts_workers=256 \
+    data.val_batch_size=null \
     data.truncation='error' \
     actor_rollout_ref.rollout.temperature=1 \
     actor_rollout_ref.model.path=${MODEL_PATH} \
@@ -80,6 +81,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.max_cudagraph_capture_size=512 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode="FULL_DECODE_ONLY" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling=False \
+    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=3072 \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
@@ -135,7 +137,9 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     trainer.n_gpus_per_node=${ppo_gpus_per_node} \
     trainer.nnodes=1 \
     trainer.default_local_dir=${CKPTS_DIR} \
-    trainer.total_training_steps=200 \
+    trainer.total_training_steps=10 \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
-    trainer.total_epochs=6 $@
+    trainer.test_freq=5 \
+    trainer.total_epochs=6 \
+    > ${exp_name}_$(date +%Y%m%d_%H%M).log 2>&1 &

@@ -38,12 +38,17 @@ from typing import Any, Iterable, cast
 from verl_speco.integration.verl_npu_vllm_compat import (
     install_verl_npu_vllm_import_compat,
 )
+from verl_speco.integration.drafter_config_env import (
+    SPECO_DRAFTER_CONFIG_ENV,
+    clear_drafter_config_env,
+    get_drafter_config_env,
+    set_drafter_config_env,
+)
 from verl_speco.trainer.checkpoint import trim_process_host_memory
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-SPECO_DRAFTER_CONFIG_ENV = "VERL_SPECO_SGLANG_DRAFTER_CONFIG"
 SPECO_VLLM_DRAFT_UPDATE_USE_SHM_ENV = "VERL_SPECO_VLLM_DRAFT_UPDATE_USE_SHM"
 SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS = (
     "verl_speco.integration.vllm_runtime.SpecoVLLMWeightSyncCompatExtension"
@@ -167,6 +172,22 @@ def _open_dict_if_needed(config: Any):
     except Exception:  # noqa: BLE001
         pass
     return nullcontext()
+
+
+def _rollout_config_without_drafter(config: Any) -> Any:
+    """Copy a rollout config after removing SPECO-only upstream-incompatible keys."""
+    plain_config = _plain_container(config)
+    if not isinstance(plain_config, dict) or "drafter" not in plain_config:
+        return config
+    plain_config.pop("drafter")
+    try:
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(config):
+            return OmegaConf.create(plain_config)
+    except Exception:  # noqa: BLE001
+        pass
+    return plain_config
 
 
 def _set_child(container: Any, key: str, value: Any) -> None:
@@ -932,7 +953,7 @@ def _validate_vllm_dflash_drafter_config(
 
 
 def _load_env_drafter_config() -> dict[str, Any]:
-    raw = os.getenv(SPECO_DRAFTER_CONFIG_ENV)
+    raw = get_drafter_config_env()
     if not raw:
         return {}
     try:
@@ -2240,7 +2261,18 @@ def install_upstream_vllm_runtime_bridge() -> bool:
     upstream_replica_base = cast(type[Any], upstream_replica)
 
     def _speco_vllm_replica_init(self, *args, **kwargs):
-        upstream_replica_base.__init__(self, *args, **kwargs)
+        # ``LLMServerManager`` creates replicas after the actor worker has
+        # restored its raw config. Pass the upstream replica a private copy that
+        # excludes SPECO's extension while the runtime receives it via env.
+        replica_args = list(args)
+        replica_kwargs = dict(kwargs)
+        if "config" in replica_kwargs:
+            replica_kwargs["config"] = _rollout_config_without_drafter(
+                replica_kwargs["config"]
+            )
+        elif len(replica_args) >= 2:
+            replica_args[1] = _rollout_config_without_drafter(replica_args[1])
+        upstream_replica_base.__init__(self, *replica_args, **replica_kwargs)
         self.server_class = ray.remote(speco_http_server_cls)
 
     SpecoVLLMReplica = types.new_class(
@@ -2269,11 +2301,11 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     drafter_cfg = _drafter_config_from_config(config)
     enabled = bool(drafter_cfg.get("enable"))
     if not enabled:
-        os.environ.pop(SPECO_DRAFTER_CONFIG_ENV, None)
+        clear_drafter_config_env()
         return {}
 
-    os.environ[SPECO_DRAFTER_CONFIG_ENV] = json.dumps(
-        _vllm_drafter_env_payload(drafter_cfg), sort_keys=True
+    set_drafter_config_env(
+        json.dumps(_vllm_drafter_env_payload(drafter_cfg), sort_keys=True)
     )
     rollout_cfg = _rollout_config_from_config(config)
     speculative_config = build_vllm_speculative_config_from_drafter(
@@ -2568,9 +2600,9 @@ def patch_vllm_server_adapter_update() -> None:
 def install_vllm_runtime_for_worker(worker: Any) -> None:
     """Install SPECO vLLM runtime hooks inside an actor-rollout worker process."""
 
-    drafter_env = getattr(type(worker), "_speco_sglang_drafter_config_env", None)
+    drafter_env = getattr(type(worker), "_speco_drafter_config_env", None)
     if drafter_env:
-        os.environ[SPECO_DRAFTER_CONFIG_ENV] = drafter_env
+        set_drafter_config_env(drafter_env)
     install_vllm_runtime_observability()
     patch_verl_bucketed_weight_transfer_rebuild_ipc()
     patch_verl_bucketed_weight_transfer_shm_reuse()
@@ -2963,7 +2995,10 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                     "Draft metadata rebuild cannot restore graph-captured storage "
                     f"for {path}: {type(old_value).__name__}.copy_ is unavailable"
                 )
-            copy(new_value, non_blocking=False)
+            import torch
+
+            with torch.inference_mode():
+                copy(new_value, non_blocking=False)
             return old_value
 
         inner_model = getattr(draft_model, "model", None)

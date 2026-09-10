@@ -1275,6 +1275,36 @@ def test_vllm_fullgraph_metadata_refresh_preserves_captured_storage() -> None:
     assert inner._k_norm_weights[1].value == 4.5
 
 
+def test_vllm_fullgraph_metadata_refresh_supports_inference_buffers() -> None:
+    import torch
+
+    with torch.inference_mode():
+        old_kv = torch.zeros((2, 3))
+        old_norm = [torch.zeros((2, 3))]
+    inner = SimpleNamespace(
+        _fused_kv_weight=old_kv,
+        _fused_kv_bias=None,
+        _k_norm_weights=old_norm,
+    )
+
+    def rebuild() -> None:
+        with torch.inference_mode():
+            inner._fused_kv_weight = torch.full((2, 3), 3.0)
+            inner._fused_kv_bias = None
+            inner._k_norm_weights = [torch.full((2, 3), 4.0)]
+
+    inner._build_fused_kv_buffers = rebuild
+
+    SpecoVLLMColocateWorkerExtension._speco_rebuild_draft_metadata_buffers(
+        SimpleNamespace(model=inner)
+    )
+
+    assert inner._fused_kv_weight is old_kv
+    assert inner._k_norm_weights is old_norm
+    assert torch.allclose(old_kv, torch.full((2, 3), 3.0))
+    assert torch.allclose(old_norm[0], torch.full((2, 3), 4.0))
+
+
 def test_vllm_fullgraph_metadata_refresh_rejects_sequence_length_change() -> None:
     class Buffer:
         shape = (2, 3)

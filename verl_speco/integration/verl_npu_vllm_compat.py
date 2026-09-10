@@ -160,7 +160,13 @@ def install_verl_npu_vllm_import_compat(
     """Eagerly import the installed release's NPU vLLM initialization safely."""
 
     global _IMPORT_COMPAT_APPLIED
-    if _IMPORT_COMPAT_APPLIED or _VERL_NPU_VLLM_PATCH_MODULE in sys.modules:
+    # A custom importer is used by the compatibility contract tests and must be
+    # able to exercise the patch even if a prior test imported the real module.
+    # The production importer remains idempotent once the module is present.
+    if _IMPORT_COMPAT_APPLIED or (
+        module_importer is importlib.import_module
+        and _VERL_NPU_VLLM_PATCH_MODULE in sys.modules
+    ):
         return False
     if not _module_available("torch_npu"):
         return False

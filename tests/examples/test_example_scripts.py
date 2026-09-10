@@ -135,12 +135,20 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     mrv2 = _launch_assignments(mrv2_source)
     added_keys = {
         "+actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling",
+        "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes",
         "actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha",
+        "data.val_batch_size",
     }
+    # MRV2 is intentionally the 4-NPU smoke-oriented variant: these resource
+    # limits are not semantic changes to the baseline training recipe.
     changed_keys = {
         "data.filter_overlong_prompts",
+        "data.train_batch_size",
+        "data.max_response_length",
         "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens",
         "actor_rollout_ref.rollout.drafter.training.publish_async",
+        "trainer.total_training_steps",
+        "trainer.total_epochs",
     }
 
     assert set(mrv2) - set(baseline) == added_keys
@@ -181,7 +189,7 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     assert "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES" not in mrv2_source
     assert "SPECO_WORKSPACE_ROOT" not in mrv2_source
     assert "PYTHONPATH" not in mrv2_source
-    assert "ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-16}" in mrv2_source
+    assert "ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-4}" in mrv2_source
     assert "ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-16}" in mrv2_source
     assert "spec_verify_tokens=${SPECO_DSPARK_VERIFY_TOKENS:-7}" in mrv2_source
     assert "validation_batch_size" not in mrv2_source
@@ -192,8 +200,8 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     assert "dynamic_spec" not in mrv2_source
     assert "SPECO MRV2 run directory" not in mrv2_source
     assert "tee -a" not in mrv2_source
-    assert "MODEL_PATH=/path/to/model" in mrv2_source
-    assert "CKPTS_DIR=/path/to/checkpoint" in mrv2_source
-    assert "TRAIN_FILE=/path/to/train_file" in mrv2_source
-    assert "TEST_FILE=/path/to/test_file" in mrv2_source
-    assert "DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter" in mrv2_source
+    assert "MODEL_PATH=/data/c00954340/qwen3-8b" in mrv2_source
+    assert "CKPTS_DIR=/data/c00954340/checkpoint/" in mrv2_source
+    assert "TRAIN_FILE=/data/c00954340/DAPO-Math-17k/dapo-math-17k.parquet" in mrv2_source
+    assert "TEST_FILE=/data/c00954340/AIME-2024/aime-2024.parquet" in mrv2_source
+    assert "DRAFTER_PATH=/data/c00954340/qwen3-8b-dspark" in mrv2_source
