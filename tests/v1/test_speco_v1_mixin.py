@@ -55,10 +55,11 @@ def test_worker_group_facade_delegates_attach_and_require(monkeypatch):
     worker_group = object()
 
     class FakeSpecoRayPPOTrainer:
-        attach_speco_worker_group = staticmethod(
-            lambda trainer, group: attached.append((trainer, group))
-        )
-        _require_speco_worker_group = staticmethod(lambda trainer: worker_group)
+        def attach_speco_worker_group(self, group):
+            attached.append((self, group))
+
+        def _require_speco_worker_group(self):
+            return worker_group
 
     fake_module = types.ModuleType("verl_speco.trainer.speco_ray_trainer")
     fake_module.SpecoRayPPOTrainer = FakeSpecoRayPPOTrainer
@@ -634,6 +635,7 @@ def test_feature_store_resume_rejects_conflicting_worker_cursors(tmp_path):
 
 
 def test_collect_only_resume_skips_drafter_checkpoint_resolution():
+    pytest.importorskip("ray")
     from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
 
     class Harness:
