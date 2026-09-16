@@ -180,15 +180,24 @@ def install_verl_npu_vllm_import_compat(
     if not _module_available("torch_npu"):
         return False
 
-    if _uses_verl_v090_runner():
+    runner_api = "0.9" if _uses_verl_v090_runner() else "0.8"
+    if runner_api == "0.9":
         with _temporary_verl_v090_fused_moe_import(module_importer):
             module_importer(_VERL_NPU_VLLM_PATCH_MODULE)
     elif not _install_verl_v080_npu_vllm_import_compat(module_importer):
-        return False
+        # Some downstream 0.9 builds retain ``verl.trainer.main_ppo`` rather
+        # than ``main_ppo_v0``.  The layout check above consequently identifies
+        # them as 0.8, while their NPU patch still unconditionally accesses
+        # ``FusedMoE.weight_loader``.  Do not leave that import to the Ray HTTP
+        # actor: retry it with the version-independent temporary namespace
+        # compatibility used for 0.9.
+        runner_api = "fallback"
+        with _temporary_verl_v090_fused_moe_import(module_importer):
+            module_importer(_VERL_NPU_VLLM_PATCH_MODULE)
     _IMPORT_COMPAT_APPLIED = True
     logger.warning(
         "Applied verl NPU vLLM import compatibility for legacy runner API %s",
-        "0.9" if _uses_verl_v090_runner() else "0.8",
+        runner_api,
     )
     return True
 
