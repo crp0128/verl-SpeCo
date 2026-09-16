@@ -66,8 +66,11 @@ def _get_nested(config: Any, path: tuple[str, ...], default=None):
 def _without_speco_drafter_rollout_config(worker: Any):
     """Hide SPECO-only rollout config while VERL builds its upstream dataclass."""
     worker_config = getattr(worker, "config", None)
+    if worker_config is None:
+        yield
+        return
     rollout_config = (
-        worker_config.get("rollout")
+        cast(Any, worker_config).get("rollout")
         if hasattr(worker_config, "get")
         else getattr(worker_config, "rollout", None)
     )
@@ -268,7 +271,9 @@ def install_sglang_runtime_for_worker(worker: Any) -> None:
             get_drafter_config_env,
             set_drafter_config_env,
         )
-        from verl_speco.integration.sglang_runtime import patch_sglang_server_adapter_update
+        from verl_speco.integration.sglang_runtime import (
+            patch_sglang_server_adapter_update,
+        )
     except Exception:  # noqa: BLE001
         return
 
@@ -315,9 +320,7 @@ def install_oldlogprob_hidden_runtime_for_worker(worker: Any) -> None:
     except Exception:  # noqa: BLE001
         return
 
-    drafter_env = (
-        getattr(type(worker), "_speco_drafter_config_env", None) or None
-    )
+    drafter_env = getattr(type(worker), "_speco_drafter_config_env", None) or None
     if not oldlogprob_hidden_runtime_enabled(
         getattr(worker, "config", None), drafter_env=drafter_env
     ):
@@ -357,9 +360,7 @@ def validate_oldlogprob_hidden_runtime_for_worker(worker: Any) -> None:
             "SPECO could not import the VeOmni hidden-state validator"
         ) from exc
 
-    drafter_env = (
-        getattr(type(worker), "_speco_drafter_config_env", None) or None
-    )
+    drafter_env = getattr(type(worker), "_speco_drafter_config_env", None) or None
     if not oldlogprob_hidden_runtime_enabled(config, drafter_env=drafter_env):
         return
 

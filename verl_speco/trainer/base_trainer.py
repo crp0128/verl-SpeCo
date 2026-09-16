@@ -1271,12 +1271,21 @@ class DrafterBaseTrainer:
                     )
         self.optimizer_steps_total = resume_optimizer_steps
         self.training_steps = resume_training_steps
-        buffer_state_file = resume_metadata.get("buffer_state_file") if resume_enabled else None
+        buffer_state_file = (
+            resume_metadata.get("buffer_state_file") if resume_enabled else None
+        )
         if buffer_state_file:
-            buffer_state_path = os.path.join(str(spec_model_path), str(buffer_state_file))
+            buffer_state_path = os.path.join(
+                str(spec_model_path), str(buffer_state_file)
+            )
             try:
-                buffer_state = torch.load(buffer_state_path, map_location="cpu", weights_only=False)
-                if not isinstance(buffer_state, dict) or int(buffer_state.get("version", 0)) != 1:
+                buffer_state = torch.load(
+                    buffer_state_path, map_location="cpu", weights_only=False
+                )
+                if (
+                    not isinstance(buffer_state, dict)
+                    or int(buffer_state.get("version", 0)) != 1
+                ):
                     raise RuntimeError("invalid buffer state")
                 self.data_buffer.buffer.clear()
                 self.data_buffer.buffer.extend(buffer_state.get("data_buffer", []))
@@ -1286,7 +1295,9 @@ class DrafterBaseTrainer:
                 self.buffer_version = int(buffer_state.get("buffer_version", 0))
                 self.current_rl_step = int(buffer_state.get("current_rl_step", 0))
             except Exception as exc:
-                raise RuntimeError(f"Failed to restore drafter buffer checkpoint from {buffer_state_path}: {exc}") from exc
+                raise RuntimeError(
+                    f"Failed to restore drafter buffer checkpoint from {buffer_state_path}: {exc}"
+                ) from exc
         self.drafter_train_config = drafter_train_config
         self.model_config = drafter_model_config
         self.pad_token_id = int(
@@ -1428,9 +1439,8 @@ class DrafterBaseTrainer:
         model = self.model.module if hasattr(self.model, "module") else self.model
         # A standalone export helper may be exercised before backend attachment;
         # a training wrapper with draft_model is still safe to unwrap.
-        if (
-            hasattr(model, "draft_model")
-            and (self._is_block_drafter_backend() or not hasattr(self, "backend"))
+        if hasattr(model, "draft_model") and (
+            self._is_block_drafter_backend() or not hasattr(self, "backend")
         ):
             return model.draft_model, (
                 "draft_model.",
@@ -1795,7 +1805,9 @@ class DrafterBaseTrainer:
                 )
                 self._copy_drafter_auxiliary_files(checkpoint_path)
                 if buffer_state_file is not None:
-                    self._atomic_torch_save(buffer_state, os.path.join(checkpoint_path, buffer_state_file))
+                    self._atomic_torch_save(
+                        buffer_state, os.path.join(checkpoint_path, buffer_state_file)
+                    )
                 self._atomic_json_dump(
                     {
                         "step": step,
@@ -3870,7 +3882,12 @@ class DrafterBaseTrainer:
             packed_tokens_before_shift += train_seq_len
             if self.backend.model_type == "peagle":
                 packed_loss_tokens += int(
-                    item_loss_mask[1 : 1 + train_seq_len].detach().float().sum().cpu().item()
+                    item_loss_mask[1 : 1 + train_seq_len]
+                    .detach()
+                    .float()
+                    .sum()
+                    .cpu()
+                    .item()
                 )
             elif self._is_block_drafter_backend():
                 packed_loss_tokens += int(

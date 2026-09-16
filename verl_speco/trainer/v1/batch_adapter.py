@@ -40,15 +40,21 @@ def to_legacy_padded_batch(data, pad_token_id=0):
     ):
         padded[key] = rows[0].new_full((count, field_width), fill)
     padded["attention_mask"] = inputs[0].new_zeros((count, width))
-    for i, (prompt, response, tokens) in enumerate(zip(prompts, responses, inputs, strict=True)):
+    for i, (prompt, response, tokens) in enumerate(
+        zip(prompts, responses, inputs, strict=True)
+    ):
         length = prompt.numel() + response.numel()
-        if tokens.numel() != length or not torch.equal(tokens, torch.cat((prompt, response))):
-            raise ValueError("V1 input_ids must equal the concatenation of prompts and responses")
+        if tokens.numel() != length or not torch.equal(
+            tokens, torch.cat((prompt, response))
+        ):
+            raise ValueError(
+                "V1 input_ids must equal the concatenation of prompts and responses"
+            )
         start = prompt_width - prompt.numel()
         padded["prompts"][i, start:] = prompt
-        padded["responses"][i, :response.numel()] = response
-        padded["input_ids"][i, start:start + length] = tokens
-        padded["attention_mask"][i, start:start + length] = 1
+        padded["responses"][i, : response.numel()] = response
+        padded["input_ids"][i, start : start + length] = tokens
+        padded["attention_mask"][i, start : start + length] = 1
 
     for key in ("response_mask", "rollout_log_probs", "position_ids", "routed_experts"):
         if key not in data.keys():
@@ -58,7 +64,9 @@ def to_legacy_padded_batch(data, pad_token_id=0):
         # and response fields use their first dimension as the token axis.
         axis = rows[0].ndim - 1 if key == "position_ids" else 0
         shape = list(rows[0].shape)
-        shape[axis] = response_width if key in ("response_mask", "rollout_log_probs") else width
+        shape[axis] = (
+            response_width if key in ("response_mask", "rollout_log_probs") else width
+        )
         output = rows[0].new_zeros((count, *shape))
         for i, row in enumerate(rows):
             response_field = key in ("response_mask", "rollout_log_probs")

@@ -1204,7 +1204,9 @@ class SpecoWorker(Worker):
             raise ValueError("Feature-store checkpoint cursor must be a mapping")
         writer = self._get_feature_writer()
         if writer is None:
-            raise RuntimeError("Feature-store checkpoint configured but writer is unavailable")
+            raise RuntimeError(
+                "Feature-store checkpoint configured but writer is unavailable"
+            )
         restored = writer.restore_checkpoint_state(cursor)
         return {
             "restored": True,

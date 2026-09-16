@@ -455,6 +455,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     ``verl_speco`` instead of requiring external ``verl`` source edits.
     """
 
+    _speco_last_published_drafter_step: object = 0
+    _pending_drafter_publish_step: object | None = None
+
     def __init__(self, *args, **kwargs):
         self.speco_worker_cls = kwargs.pop("speco_worker_cls", None)
         config = kwargs.get("config", args[0] if args else None)
@@ -605,8 +608,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
 
     def speco_restore_feature_store_checkpoint_state(self, state: dict[str, Any]):
-        return self._require_speco_worker_group().restore_feature_store_checkpoint_state(
-            state
+        return (
+            self._require_speco_worker_group().restore_feature_store_checkpoint_state(
+                state
+            )
         )
 
     def init_workers(self):
@@ -2182,9 +2187,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_restore_last_published_drafter_weights()
             raise
         if pending_payload:
-            self._speco_record_published_drafter_weights(
-                pending_payload, pending_step
-            )
+            self._speco_record_published_drafter_weights(pending_payload, pending_step)
         return len(pending_refs) if isinstance(pending_refs, (list, tuple)) else 1
 
     def _speco_wait_pending_drafter_publish(self) -> int:

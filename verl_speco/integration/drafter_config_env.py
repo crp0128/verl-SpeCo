@@ -25,8 +25,10 @@ LEGACY_SPECO_SGLANG_DRAFTER_CONFIG_ENV = "VERL_SPECO_SGLANG_DRAFTER_CONFIG"
 def get_drafter_config_env(default: str = "") -> str:
     """Return the canonical value, falling back to the legacy environment name."""
 
-    return os.getenv(SPECO_DRAFTER_CONFIG_ENV) or os.getenv(
-        LEGACY_SPECO_SGLANG_DRAFTER_CONFIG_ENV, default
+    return (
+        os.getenv(SPECO_DRAFTER_CONFIG_ENV)
+        or os.getenv(LEGACY_SPECO_SGLANG_DRAFTER_CONFIG_ENV)
+        or default
     )
 
 

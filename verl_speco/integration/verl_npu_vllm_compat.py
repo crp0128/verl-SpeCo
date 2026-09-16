@@ -150,15 +150,16 @@ def _temporary_verl_v090_fused_moe_import(
 
     added_weight_loader = not hasattr(fused_moe, "weight_loader")
     if added_weight_loader:
-        fused_moe.weight_loader = _unused_factory_weight_loader
+        setattr(fused_moe, "weight_loader", _unused_factory_weight_loader)
     try:
         yield
     finally:
         if added_weight_loader and hasattr(fused_moe, "weight_loader"):
-            del fused_moe.weight_loader
-        if added_package_export and getattr(
-            fused_moe_package, "FusedMoE", None
-        ) is fused_moe:
+            delattr(fused_moe, "weight_loader")
+        if (
+            added_package_export
+            and getattr(fused_moe_package, "FusedMoE", None) is fused_moe
+        ):
             del fused_moe_package.FusedMoE
 
 

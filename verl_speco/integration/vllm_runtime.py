@@ -1172,13 +1172,16 @@ def _write_vllm_spec_decode_sidecar(scheduler: Any) -> bool:
     )
     directory = (
         additional.get(SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY)
-        if isinstance(additional, dict) else None
+        if isinstance(additional, dict)
+        else None
     )
     directory = directory or _vllm_spec_decode_sidecar_dir()
     if directory is None:
         if not getattr(scheduler, "_speco_acceptance_missing_dir_warned", False):
             scheduler._speco_acceptance_missing_dir_warned = True
-            logger.warning("[speco acceptance sidecar] missing stats directory; no counters published")
+            logger.warning(
+                "[speco acceptance sidecar] missing stats directory; no counters published"
+            )
         return False
     try:
         os.makedirs(directory, exist_ok=True)
@@ -1194,7 +1197,10 @@ def _write_vllm_spec_decode_sidecar(scheduler: Any) -> bool:
         os.replace(temporary, target)
         if not getattr(scheduler, "_speco_acceptance_published", False):
             scheduler._speco_acceptance_published = True
-            logger.warning("[speco acceptance sidecar] first worker counters published path=%s", target)
+            logger.warning(
+                "[speco acceptance sidecar] first worker counters published path=%s",
+                target,
+            )
         return True
     except OSError as exc:
         if not getattr(scheduler, "_speco_acceptance_write_warned", False):
@@ -1248,26 +1254,29 @@ def _record_vllm_worker_spec_decode_output(
         int(parallel.world_size)
         - int(parallel.tensor_parallel_size)
         * int(getattr(parallel, "prefill_context_parallel_size", 1))
-        if parallel is not None else 0
+        if parallel is not None
+        else 0
     )
     if rank != output_rank:
         return
     scheduled = getattr(scheduler_output, "scheduled_spec_decode_tokens", None)
     sampled = getattr(model_runner_output, "sampled_token_ids", None)
     req_id_to_index = getattr(model_runner_output, "req_id_to_index", None)
-    if not isinstance(scheduled, dict) or not sampled or not isinstance(
-        req_id_to_index, dict
+    if (
+        not isinstance(scheduled, dict)
+        or not sampled
+        or not isinstance(req_id_to_index, dict)
     ):
         return
-    invalid_by_request = getattr(
-        scheduler_output, "num_invalid_spec_tokens", None
-    )
+    invalid_by_request = getattr(scheduler_output, "num_invalid_spec_tokens", None)
     before = getattr(worker, "_speco_spec_decode_total_drafts", 0)
     if scheduled and not getattr(worker, "_speco_acceptance_resolved_seen", False):
         worker._speco_acceptance_resolved_seen = True
         logger.warning(
             "[speco acceptance] resolved speculative output rank=%s scheduled_requests=%d sampled_rows=%d",
-            rank, len(scheduled), len(sampled),
+            rank,
+            len(scheduled),
+            len(sampled),
         )
     for request_id, draft_token_ids in scheduled.items():
         if not draft_token_ids or request_id not in req_id_to_index:
@@ -1310,7 +1319,9 @@ def _observe_vllm_worker_output(worker: Any, scheduler_output: Any, output: Any)
     scheduled = getattr(scheduler_output, "scheduled_spec_decode_tokens", {}) or {}
     invalid = getattr(scheduler_output, "num_invalid_spec_tokens", None)
     scheduler_output = types.SimpleNamespace(
-        scheduled_spec_decode_tokens={key: list(value) for key, value in scheduled.items()},
+        scheduled_spec_decode_tokens={
+            key: list(value) for key, value in scheduled.items()
+        },
         num_invalid_spec_tokens=dict(invalid) if invalid else None,
     )
 
@@ -1320,7 +1331,9 @@ def _observe_vllm_worker_output(worker: Any, scheduler_output: Any, output: Any)
         except Exception as exc:  # noqa: BLE001
             if not getattr(worker, "_speco_acceptance_record_warned", False):
                 worker._speco_acceptance_record_warned = True
-                logger.warning("[speco acceptance] cannot record resolved output: %s", exc)
+                logger.warning(
+                    "[speco acceptance] cannot record resolved output: %s", exc
+                )
 
     get_output = getattr(output, "get_output", None)
     if callable(get_output):
@@ -2140,11 +2153,13 @@ def patch_vllm_dspark_draft_load_config(
     if dspark_utils_module is None or dspark_speculator_module is None:
         try:
             from vllm.v1.worker.gpu.spec_decode.dspark import (
-                speculator as dspark_speculator_module,
+                speculator as imported_dspark_speculator_module,
             )
             from vllm.v1.worker.gpu.spec_decode.dspark import (
-                utils as dspark_utils_module,
+                utils as imported_dspark_utils_module,
             )
+            dspark_speculator_module = imported_dspark_speculator_module
+            dspark_utils_module = imported_dspark_utils_module
         except Exception as exc:  # noqa: BLE001
             logger.debug("Unable to install vLLM DSpark draft-load patch: %s", exc)
             return False
@@ -2158,9 +2173,7 @@ def patch_vllm_dspark_draft_load_config(
 
     def load_dspark_model_with_draft_load_config(target_model, vllm_config):
         speculative_config = getattr(vllm_config, "speculative_config", None)
-        draft_load_config = getattr(
-            speculative_config, "draft_load_config", None
-        )
+        draft_load_config = getattr(speculative_config, "draft_load_config", None)
         if draft_load_config is None:
             return current(target_model, vllm_config)
 
@@ -2258,9 +2271,10 @@ def _record_vllm_spec_decode_acceptance(
     scheduler._speco_spec_decode_total_accepted = int(
         getattr(scheduler, "_speco_spec_decode_total_accepted", 0)
     ) + min(accepted, draft_tokens)
-    scheduler._speco_spec_decode_total_draft_tokens = int(
-        getattr(scheduler, "_speco_spec_decode_total_draft_tokens", 0)
-    ) + draft_tokens
+    scheduler._speco_spec_decode_total_draft_tokens = (
+        int(getattr(scheduler, "_speco_spec_decode_total_draft_tokens", 0))
+        + draft_tokens
+    )
     # ``disable_log_stats`` controls vLLM's periodic log output, not trainer
     # metrics. The worker output observer publishes these cumulative counts
     # after recording the entire model batch, independently of this flag.
@@ -2603,9 +2617,7 @@ def _vllm_request_spec_decode_stats_to_metrics(request_stats: Any) -> dict[str, 
         return {}
     verify_steps = _int_or_zero(getattr(request_stats, "num_verify_steps", 0))
     draft_tokens = _int_or_zero(getattr(request_stats, "num_draft_tokens", 0))
-    accepted_tokens = _int_or_zero(
-        getattr(request_stats, "num_accepted_tokens", 0)
-    )
+    accepted_tokens = _int_or_zero(getattr(request_stats, "num_accepted_tokens", 0))
     if verify_steps <= 0:
         return {}
     return _vllm_spec_decode_stats_to_metrics(
@@ -2637,9 +2649,10 @@ def _build_speco_vllm_stat_logger(server: Any):
             engine_idx: int = 0,
         ):
             del iteration_stats, mm_cache_stats
-            server._speco_vllm_spec_decode_logger_record_count = int(
-                getattr(server, "_speco_vllm_spec_decode_logger_record_count", 0)
-            ) + 1
+            server._speco_vllm_spec_decode_logger_record_count = (
+                int(getattr(server, "_speco_vllm_spec_decode_logger_record_count", 0))
+                + 1
+            )
             if server._speco_vllm_spec_decode_logger_record_count == 1:
                 logger.warning(
                     "[speco acceptance bridge] first stat logger record "
@@ -2653,13 +2666,16 @@ def _build_speco_vllm_stat_logger(server: Any):
             drafts_before = float(stats.get("drafts", 0.0) or 0.0)
             _record_vllm_spec_decode_scheduler_stats(stats, scheduler_stats)
             if float(stats.get("drafts", 0.0) or 0.0) > drafts_before:
-                server._speco_vllm_spec_decode_logger_nonempty_count = int(
-                    getattr(
-                        server,
-                        "_speco_vllm_spec_decode_logger_nonempty_count",
-                        0,
+                server._speco_vllm_spec_decode_logger_nonempty_count = (
+                    int(
+                        getattr(
+                            server,
+                            "_speco_vllm_spec_decode_logger_nonempty_count",
+                            0,
+                        )
                     )
-                ) + 1
+                    + 1
+                )
             if bool(os.getenv(SPECO_VLLM_SPEC_DECODE_PROBE_ENV)):
                 probe_count = int(
                     getattr(server, "_speco_vllm_spec_decode_probe_scheduler_count", 0)
@@ -2831,9 +2847,7 @@ class _SpecoVLLMHttpServerMixin:
                         False,
                     )
                 ),
-                int(
-                    getattr(self, "_speco_vllm_spec_decode_logger_record_count", 0)
-                ),
+                int(getattr(self, "_speco_vllm_spec_decode_logger_record_count", 0)),
                 int(
                     getattr(
                         self,
@@ -3074,9 +3088,9 @@ def _patch_upstream_vllm_http_server_methods(upstream_cls: type[Any]) -> bool:
             self._speco_vllm_bad_extra_fields_warned = True
         return output
 
-    launch_server_with_speco_stats._speco_vllm_http_method_bridge = True
-    run_server_with_speco_stats._speco_vllm_http_method_bridge = True
-    generate_with_speco_stats._speco_vllm_http_method_bridge = True
+    setattr(launch_server_with_speco_stats, "_speco_vllm_http_method_bridge", True)
+    setattr(run_server_with_speco_stats, "_speco_vllm_http_method_bridge", True)
+    setattr(generate_with_speco_stats, "_speco_vllm_http_method_bridge", True)
     upstream_cls.launch_server = launch_server_with_speco_stats
     upstream_cls.run_server = run_server_with_speco_stats
     upstream_cls.generate = generate_with_speco_stats
@@ -3138,7 +3152,7 @@ def install_upstream_vllm_runtime_bridge() -> bool:
     )
 
     SpecoVLLMReplica.__module__ = __name__
-    SpecoVLLMReplica._speco_vllm_replica_bridge = True
+    setattr(SpecoVLLMReplica, "_speco_vllm_replica_bridge", True)
     # Some verl 0.9 Ray workers resolve the server class from the module at
     # actor construction time rather than from ``replica.server_class``. Patch
     # both entry points; otherwise the replica bridge is present but the live
@@ -3636,8 +3650,11 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 result = _orig_execute_model(*args, **kwargs)
                 if not getattr(instance, "_speco_acceptance_execute_seen", False):
                     instance._speco_acceptance_execute_seen = True
-                    logger.warning("[speco acceptance] execute_model entered result_type=%s sample_hook=%s",
-                                   type(result).__name__, callable(_orig_sample_tokens))
+                    logger.warning(
+                        "[speco acceptance] execute_model entered result_type=%s sample_hook=%s",
+                        type(result).__name__,
+                        callable(_orig_sample_tokens),
+                    )
                 if result is not None:
                     instance._speco_acceptance_pending_schedule = None
                 return _observe_vllm_worker_output(instance, scheduler_output, result)
@@ -3654,8 +3671,11 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 result = _orig_sample_tokens(*args, **kwargs)
                 if not getattr(instance, "_speco_acceptance_sample_seen", False):
                     instance._speco_acceptance_sample_seen = True
-                    logger.warning("[speco acceptance] sample_tokens entered result_type=%s schedule_present=%s",
-                                   type(result).__name__, scheduler_output is not None)
+                    logger.warning(
+                        "[speco acceptance] sample_tokens entered result_type=%s schedule_present=%s",
+                        type(result).__name__,
+                        scheduler_output is not None,
+                    )
                 return _observe_vllm_worker_output(instance, scheduler_output, result)
 
             instance.sample_tokens = _speco_sample_tokens_hook

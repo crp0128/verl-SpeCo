@@ -248,9 +248,9 @@ def _speco_worker_idle_event(worker: Any) -> asyncio.Event:
 
 def _speco_worker_request_started(worker: Any) -> None:
     event = _speco_worker_idle_event(worker)
-    worker._speco_agent_loop_inflight = int(
-        getattr(worker, "_speco_agent_loop_inflight", 0)
-    ) + 1
+    worker._speco_agent_loop_inflight = (
+        int(getattr(worker, "_speco_agent_loop_inflight", 0)) + 1
+    )
     event.clear()
 
 
