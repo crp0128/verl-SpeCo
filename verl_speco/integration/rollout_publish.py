@@ -829,8 +829,10 @@ def export_actor_lm_head_weight(
         )
 
     normalized_row_indices = _normalize_lm_head_row_indices(row_indices)
+    # Block drafters that train against the target's own lm_head rows.
     is_dflash = drafter_speculative_algorithm(getattr(worker, "config", None)) in {
         "DFLASH",
+        "DFLASH2",
         "DSPARK",
     }
     if (
@@ -1020,13 +1022,17 @@ class DraftWeightPublishMixin:
 
     def _attach_update_draft_weights_to_rollout(self):
         backend = rollout_backend_name(getattr(self, "config", None))
+        rollout = getattr(self, "rollout", None)
         if backend == "vllm":
-            from verl_speco.integration.vllm_runtime import (
-                attach_update_draft_weights_to_rollout,
-            )
-        else:
-            from verl_speco.integration.sglang_runtime import (
-                attach_update_draft_weights_to_rollout,
+            from verl_speco.integration.native_draft_update import (
+                attach_draft_weight_updater,
             )
 
-        attach_update_draft_weights_to_rollout(getattr(self, "rollout", None))
+            attach_draft_weight_updater(getattr(self, "config", None), rollout)
+            return
+
+        from verl_speco.integration.sglang_runtime import (
+            attach_update_draft_weights_to_rollout,
+        )
+
+        attach_update_draft_weights_to_rollout(rollout)

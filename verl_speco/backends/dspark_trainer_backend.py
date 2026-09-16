@@ -744,6 +744,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         target_layer_ids = self._training_value(
             training_cfg, "dspark_target_layer_ids", "dflash_target_layer_ids", None
         )
+        target_head_dim = getattr(target_text_config, "head_dim", None)
         if target_layer_ids is None:
             from verl_speco.models.dflash import build_target_layer_ids
 
@@ -771,6 +772,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                     getattr(target_text_config, "num_attention_heads"),
                 )
             ),
+            head_dim=int(target_head_dim) if target_head_dim is not None else None,
             vocab_size=int(target_text_config.vocab_size),
             rms_norm_eps=float(getattr(target_text_config, "rms_norm_eps", 1e-6)),
             max_position_embeddings=int(
@@ -955,10 +957,12 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
                 item_loss_mask[:] = 1.0
 
-            valid_len = min(ids.size(0), full_h.size(0), item_loss_mask.size(0))
-            ids = ids[:valid_len]
-            full_h = full_h[:valid_len]
-            item_loss_mask = item_loss_mask[:valid_len]
+            if not (ids.size(0) == full_h.size(0) == item_loss_mask.size(0)):
+                raise ValueError(
+                    "DSpark input/hidden/mask row mismatch: "
+                    f"input_rows={ids.size(0)}, hidden_rows={full_h.size(0)}, "
+                    f"mask_rows={item_loss_mask.size(0)}"
+                )
             nonzero = torch.nonzero(item_loss_mask)
             if nonzero.numel() > 0:
                 r_start = nonzero[0, 0]

@@ -828,7 +828,7 @@ class DrafterBaseTrainer:
 
     def _block_drafter_metric_prefix(self) -> str:
         model_type = str(getattr(self.backend, "model_type", "dflash") or "dflash")
-        if model_type in {"dspark", "domino", "dflash2"}:
+        if model_type in {"dspark", "domino", "eagle3", "dflash2"}:
             return model_type
         return "dflash"
 
@@ -874,6 +874,14 @@ class DrafterBaseTrainer:
             metrics[f"{prefix}/top5_acc"] = (
                 sums.get(f"{prefix}/top5_correct_count", 0.0) / quality_tokens
             )
+        simulated_accept_blocks = sums.get(
+            f"{prefix}/simulated_accept_block_count", 0.0
+        )
+        if simulated_accept_blocks > 0:
+            metrics[f"{prefix}/simulated_acc_len"] = (
+                sums.get(f"{prefix}/simulated_accept_length_sum", 0.0)
+                / simulated_accept_blocks
+            )
         ce_tokens = sums.get(f"{prefix}/ce_weighted_token_count", 0.0)
         if ce_tokens > 0:
             metrics[f"{prefix}/ce_loss"] = (
@@ -904,7 +912,17 @@ class DrafterBaseTrainer:
         if self.optimizer is not None and self.optimizer.param_groups:
             metrics["drafter/current_lr"] = float(self.optimizer.param_groups[0]["lr"])
 
-        for pos in range(int(self._block_drafter_config_value("block_size", 16))):
+        count_prefix = f"{prefix}/count_per_position/"
+        positions = sorted(
+            int(key.removeprefix(count_prefix))
+            for key in sums
+            if key.startswith(count_prefix) and key.removeprefix(count_prefix).isdigit()
+        )
+        if not positions:
+            positions = list(
+                range(int(self._block_drafter_config_value("block_size", 16)))
+            )
+        for pos in positions:
             count_key = f"{prefix}/count_per_position/{pos}"
             count = sums.get(count_key, 0.0)
             if count <= 0:
@@ -961,6 +979,8 @@ class DrafterBaseTrainer:
             "quality_token_count": f"{prefix}/quality_token_count",
             "valid_token_count": f"{prefix}/valid_token_count",
             "weighted_token_count": f"{prefix}/weighted_token_count",
+            "simulated_accept_length_sum": f"{prefix}/simulated_accept_length_sum",
+            "simulated_accept_block_count": f"{prefix}/simulated_accept_block_count",
             "ce_loss_sum": f"{prefix}/ce_loss_sum",
             "ce_weighted_token_count": f"{prefix}/ce_weighted_token_count",
             "l1_loss_sum": f"{prefix}/l1_loss_sum",
@@ -1341,7 +1361,12 @@ class DrafterBaseTrainer:
             # inherited from an older checkpoint is frozen and must not enter
             # the native fixed-K online update payload.
             return True
-        return name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight")
+        if name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight"):
+            # Most backends seed the draft embedding from the target and freeze it,
+            # so the engine already holds the same rows. Backends that fine-tune it
+            # (P-EAGLE) must publish it or the engine keeps the seed forever.
+            return not getattr(self.backend, "trains_draft_embeddings", False)
+        return False
 
     def _get_trainable_state_dict(self) -> dict[str, torch.Tensor]:
         """Get floating state dict entries excluding weights shared with the target model."""
@@ -1364,10 +1389,11 @@ class DrafterBaseTrainer:
                     f"Skipping non-floating drafter state: {name}, dtype={param.dtype}"
                 )
                 continue
-            # EAGLE3 trains and publishes its own lm_head; other backends skip lm_head by default.
+            # Backends whose draft owns an lm_head (EAGLE-3, P-EAGLE) publish it;
+            # the block drafters read logits off the target head, so theirs stays out.
             if self._is_frozen_publish_param(name) or (
                 "lm_head.weight" in name
-                and getattr(self.backend, "model_type", None) != "eagle3"
+                and not getattr(self.backend, "trains_draft_lm_head", False)
             ):
                 logger.debug(f"Skipping frozen parameter: {name}")
                 continue
@@ -4691,10 +4717,12 @@ class DrafterBaseTrainer:
         self, batch: dict[str, torch.Tensor], step: int
     ) -> bool:
         """Execute one optimizer step from a pre-built standalone batch."""
+        self.last_standalone_training_error = None
         try:
             with torch.enable_grad():
                 return await self._training_step_on_batch(batch, step)
         except Exception as e:  # noqa: BLE001
+            self.last_standalone_training_error = e
             logger.exception(f"Standalone training step {step} failed with error: {e}")
             return False
 
