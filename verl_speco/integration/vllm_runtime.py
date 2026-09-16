@@ -36,7 +36,9 @@ import uuid
 from contextlib import contextmanager, nullcontext
 from typing import Any, Iterable, cast
 
-from verl_speco.integration.verl_npu_vllm_compat import install_verl_npu_vllm_import_compat
+from verl_speco.integration.verl_npu_vllm_compat import (
+    install_verl_npu_vllm_import_compat,
+)
 from verl_speco.integration.drafter_config_env import (
     SPECO_DRAFTER_CONFIG_ENV,
     clear_drafter_config_env,
