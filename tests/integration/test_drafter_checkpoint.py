@@ -18,6 +18,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("torch")
+
 from verl_speco.trainer import checkpoint as checkpoint_utils
 from verl_speco.trainer.base_trainer import DrafterBaseTrainer
 from verl_speco.trainer.checkpoint import (

@@ -15,9 +15,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import torch
-
 import pytest
+
+torch = pytest.importorskip("torch")
 
 from verl_speco.trainer.scheduler import CallbackDrafterWorkerExecutor
 
