@@ -64,6 +64,7 @@ def test_vllm_replica_config_excludes_speco_drafter(use_omegaconf: bool) -> None
 
 
 def test_v1_agent_loop_config_excludes_speco_drafter() -> None:
+    pytest.importorskip("ray")
     from verl_speco.integration.task_runner import SpecoTaskRunner
 
     config = OmegaConf.create(

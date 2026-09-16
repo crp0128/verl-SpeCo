@@ -202,6 +202,18 @@ def install_verl_npu_vllm_import_compat(
     return True
 
 
+def install_verl_npu_vllm_worker_process_compat() -> None:
+    """Install the import guard before a Ray worker deserializes its actor.
+
+    Ray runs ``worker_process_setup_hook`` before it imports the actor class.
+    That ordering matters for the vLLM HTTP actor: deserializing its upstream
+    base class imports verl's NPU patch, so an ``__init__`` or module-level
+    hook on the derived SPECO class runs too late.
+    """
+
+    install_verl_npu_vllm_import_compat()
+
+
 def install_verl_npu_checkpoint_reclaim(
     module_importer: Callable[[str], Any] = importlib.import_module,
 ) -> bool:

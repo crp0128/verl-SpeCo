@@ -38,6 +38,7 @@ from typing import Any, Iterable, cast
 
 from verl_speco.integration.verl_npu_vllm_compat import (
     install_verl_npu_vllm_import_compat,
+    install_verl_npu_vllm_worker_process_compat,
 )
 from verl_speco.integration.drafter_config_env import (
     SPECO_DRAFTER_CONFIG_ENV,
@@ -2158,6 +2159,7 @@ def patch_vllm_dspark_draft_load_config(
             from vllm.v1.worker.gpu.spec_decode.dspark import (
                 utils as imported_dspark_utils_module,
             )
+
             dspark_speculator_module = imported_dspark_speculator_module
             dspark_utils_module = imported_dspark_utils_module
         except Exception as exc:  # noqa: BLE001
@@ -2983,6 +2985,32 @@ def _build_speco_vllm_http_server_class(upstream_module: Any):
     )
 
 
+class _SpecoVLLMHttpServerActorClass:
+    """Keep the worker setup hook when upstream supplies its own runtime env."""
+
+    def __init__(self, actor_class: Any):
+        self._actor_class = actor_class
+
+    def options(self, **options):
+        runtime_env = dict(options.get("runtime_env", {}) or {})
+        runtime_env["worker_process_setup_hook"] = (
+            install_verl_npu_vllm_worker_process_compat
+        )
+        return self._actor_class.options(**{**options, "runtime_env": runtime_env})
+
+    def remote(self, *args, **kwargs):
+        return self.options().remote(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._actor_class, name)
+
+
+def _remote_speco_vllm_http_server(ray_module: Any, server_cls: type[Any]) -> Any:
+    """Create the HTTP actor with import compatibility active at process start."""
+
+    return _SpecoVLLMHttpServerActorClass(ray_module.remote(server_cls))
+
+
 def _patch_upstream_vllm_http_server_methods(upstream_cls: type[Any]) -> bool:
     """Patch methods before ``ray.remote`` builds the actor method table.
 
@@ -3141,7 +3169,7 @@ def install_upstream_vllm_runtime_bridge() -> bool:
         elif len(replica_args) >= 2:
             replica_args[1] = _rollout_config_without_drafter(replica_args[1])
         upstream_replica_base.__init__(self, *replica_args, **replica_kwargs)
-        self.server_class = ray.remote(speco_http_server_cls)
+        self.server_class = _remote_speco_vllm_http_server(ray, speco_http_server_cls)
 
     SpecoVLLMReplica = types.new_class(
         "SpecoVLLMReplica",
@@ -4017,9 +4045,17 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                     "Draft metadata rebuild cannot restore graph-captured storage "
                     f"for {path}: {type(old_value).__name__}.copy_ is unavailable"
                 )
-            import torch
+            try:
+                import torch
 
-            with torch.inference_mode():
+                inference_context = torch.inference_mode()
+            except ImportError:
+                # Lightweight contract tests use tensor-like buffers without
+                # installing torch. Their copy contract is identical and does
+                # not require inference-mode version-counter suppression.
+                inference_context = nullcontext()
+
+            with inference_context:
                 copy(new_value, non_blocking=False)
             return old_value
 

@@ -51,19 +51,19 @@ def _config(*, mode="sync", bypass=False, rollout_name="vllm"):
 
 
 def test_worker_group_facade_delegates_attach_and_require(monkeypatch):
-    from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
-
     attached = []
     worker_group = object()
-    monkeypatch.setattr(
-        SpecoRayPPOTrainer,
-        "attach_speco_worker_group",
-        lambda trainer, group: attached.append((trainer, group)),
-    )
-    monkeypatch.setattr(
-        SpecoRayPPOTrainer,
-        "_require_speco_worker_group",
-        lambda trainer: worker_group,
+
+    class FakeSpecoRayPPOTrainer:
+        attach_speco_worker_group = staticmethod(
+            lambda trainer, group: attached.append((trainer, group))
+        )
+        _require_speco_worker_group = staticmethod(lambda trainer: worker_group)
+
+    fake_module = types.ModuleType("verl_speco.trainer.speco_ray_trainer")
+    fake_module.SpecoRayPPOTrainer = FakeSpecoRayPPOTrainer
+    monkeypatch.setitem(
+        sys.modules, "verl_speco.trainer.speco_ray_trainer", fake_module
     )
 
     class Harness(SpecoV1Mixin):
@@ -377,7 +377,7 @@ def test_fit_drains_agent_loop_before_releasing_drafter_runtime():
 def test_fixed_drafter_async_fit_also_drains_agent_loop():
     events = []
     config = _config(mode="colocate_async")
-    config.actor_rollout_ref.rollout.drafter.enable_drafter_training = False
+    config.actor_rollout_ref.rollout.drafter["enable_drafter_training"] = False
 
     class Upstream:
         def fit(self, manager):
@@ -445,10 +445,12 @@ def test_async_prefit_warmup_is_sampleable_before_upstream_fit(monkeypatch):
         init=lambda config: events.append("skip_init"),
         set_step=lambda step: events.append(("skip_step", step)),
     )
-    monkeypatch.setattr(
-        __import__("verl.utils.skip", fromlist=["SkipManager"]),
-        "SkipManager",
-        fake_skip_manager,
+    fake_skip_module = types.ModuleType("verl.utils.skip")
+    fake_skip_module.SkipManager = fake_skip_manager
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.utils.skip",
+        fake_skip_module,
     )
 
     config = _config(mode="colocate_async")

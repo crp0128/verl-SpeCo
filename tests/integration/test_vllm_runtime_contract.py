@@ -986,6 +986,38 @@ def test_vllm_runtime_installs_replica_bridge_without_drafter(monkeypatch) -> No
     assert bridge_calls == [True]
 
 
+def test_vllm_http_actor_installs_import_guard_before_deserialization() -> None:
+    captured = {}
+
+    class FakeRemoteActorClass:
+        def options(self, **options):
+            captured["options"] = options
+            return "configured"
+
+    class FakeRay:
+        @staticmethod
+        def remote(actor_cls):
+            captured["actor_cls"] = actor_cls
+            return FakeRemoteActorClass()
+
+    class Server:
+        pass
+
+    actor_class = vllm_runtime._remote_speco_vllm_http_server(FakeRay, Server)
+    assert (
+        actor_class.options(
+            name="server",
+            runtime_env={"env_vars": {"EXISTING": "1"}},
+        )
+        == "configured"
+    )
+    assert captured["actor_cls"] is Server
+    assert captured["options"]["name"] == "server"
+    assert captured["options"]["runtime_env"]["env_vars"] == {"EXISTING": "1"}
+    setup_hook = captured["options"]["runtime_env"]["worker_process_setup_hook"]
+    assert setup_hook is vllm_runtime.install_verl_npu_vllm_worker_process_compat
+
+
 def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(
     monkeypatch, tmp_path
 ) -> None:
@@ -1745,7 +1777,7 @@ def test_vllm_fullgraph_metadata_refresh_preserves_captured_storage() -> None:
 
 
 def test_vllm_fullgraph_metadata_refresh_supports_inference_buffers() -> None:
-    import torch
+    torch = pytest.importorskip("torch")
 
     with torch.inference_mode():
         old_kv = torch.zeros((2, 3))
