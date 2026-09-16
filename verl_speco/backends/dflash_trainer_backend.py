@@ -652,9 +652,12 @@ class DFlashTrainingModel(nn.Module):
             loss_sum_per_position = (
                 loss_per_token.view(bsz, n_blocks, self.block_size) * binary_weights
             ).sum(dim=(0, 1))
-            correct_per_position = (
-                correct.view(bsz, n_blocks, self.block_size).float().sum(dim=(0, 1))
-            )
+            correct_3d = correct.view(bsz, n_blocks, self.block_size)
+            pred_valid_3d = binary_weights[:, :, 1:].bool()
+            pred_correct_3d = correct_3d[:, :, 1:] & pred_valid_3d
+            simulated_accept_length_sum = pred_correct_3d.float().cumprod(dim=-1).sum()
+            simulated_accept_block_count = pred_valid_3d.any(dim=-1).float().sum()
+            correct_per_position = correct_3d.float().sum(dim=(0, 1))
             loss_per_position = loss_sum_per_position / count_per_pos
             acc_per_position = correct_per_position / count_per_pos
             # Prefix acceptance per block; the per-position accuracies above are
@@ -681,6 +684,8 @@ class DFlashTrainingModel(nn.Module):
                 "quality_token_count": quality_token_count,
                 "valid_token_count": binary_eval_mask.sum().float(),
                 "weighted_token_count": flat_weights.sum().float(),
+                "simulated_accept_length_sum": simulated_accept_length_sum,
+                "simulated_accept_block_count": simulated_accept_block_count,
                 "sanitized_rows": sanitized_rows,
                 "masked_rows": masked_rows,
                 "loss_sum_per_position": loss_sum_per_position,
@@ -721,6 +726,12 @@ class DFlashTrainerBackend:
     # as ``{checkpoint key: model key}``. Variants fill this in when the released
     # checkpoint holds a tensor in a different module type than the overlay does.
     _CHECKPOINT_KEY_ALIASES: dict[str, str] = {}
+
+    # Hot-publish contract: the block drafters read logits off the frozen target
+    # head and keep the target-seeded embedding frozen, so neither belongs in the
+    # published delta. DSpark and Domino inherit this.
+    trains_draft_lm_head = False
+    trains_draft_embeddings = False
 
     def __init__(self, config, target_model_config):
         self.config = config
@@ -784,6 +795,7 @@ class DFlashTrainerBackend:
             if mask_token_id_cfg is not None
             else target_text_config.vocab_size - 1
         )
+        target_head_dim = getattr(target_text_config, "head_dim", None)
         target_layer_ids = training_cfg.get("dflash_target_layer_ids", None)
         if target_layer_ids is None:
             target_layer_ids = build_target_layer_ids(
@@ -803,6 +815,7 @@ class DFlashTrainerBackend:
                     getattr(target_text_config, "num_attention_heads"),
                 )
             ),
+            head_dim=int(target_head_dim) if target_head_dim is not None else None,
             vocab_size=int(target_text_config.vocab_size),
             rms_norm_eps=float(getattr(target_text_config, "rms_norm_eps", 1e-6)),
             max_position_embeddings=int(
@@ -817,6 +830,19 @@ class DFlashTrainerBackend:
             mask_token_id=mask_token_id,
             architectures=["DFlashDraftModel"],
         )
+
+    @staticmethod
+    def _target_rope_theta(target_text_config) -> float:
+        rope_theta = getattr(target_text_config, "rope_theta", None)
+        if rope_theta is not None:
+            return float(rope_theta)
+        rope_parameters = getattr(target_text_config, "rope_parameters", None)
+        if (
+            isinstance(rope_parameters, dict)
+            and rope_parameters.get("rope_theta") is not None
+        ):
+            return float(rope_parameters["rope_theta"])
+        return 10000.0
 
     def _load_state_file(self, path: str) -> dict:
         if path.endswith(".safetensors"):
@@ -1230,10 +1256,12 @@ class DFlashTrainerBackend:
             else:
                 item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
                 item_loss_mask[:] = 1.0
-            valid_len = min(ids.size(0), full_h.size(0), item_loss_mask.size(0))
-            ids = ids[:valid_len]
-            full_h = full_h[:valid_len]
-            item_loss_mask = item_loss_mask[:valid_len]
+            if not (ids.size(0) == full_h.size(0) == item_loss_mask.size(0)):
+                raise ValueError(
+                    "DFlash input/hidden/mask row mismatch: "
+                    f"input_rows={ids.size(0)}, hidden_rows={full_h.size(0)}, "
+                    f"mask_rows={item_loss_mask.size(0)}"
+                )
             nonzero = torch.nonzero(item_loss_mask)
             if nonzero.numel() > 0:
                 r_start = nonzero[0, 0]
