@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import inspect
 import logging
@@ -169,8 +170,11 @@ def _speco_worker_init(self, *args, **kwargs):
 
 
 async def _speco_worker_generate_sequences(self, batch):
-    global_steps_token, validate_token = _speco_context_from_batch(batch)
+    _speco_worker_request_started(self)
+    global_steps_token = None
+    validate_token = None
     try:
+        global_steps_token, validate_token = _speco_context_from_batch(batch)
         generate_sequences = _speco_parent_method(self, "generate_sequences")
         if not callable(generate_sequences):
             raise AttributeError(
@@ -182,7 +186,9 @@ async def _speco_worker_generate_sequences(self, batch):
         result = _ensure_extra_field_defaults(result)
         return result
     finally:
-        _speco_reset_context(global_steps_token, validate_token)
+        if global_steps_token is not None and validate_token is not None:
+            _speco_reset_context(global_steps_token, validate_token)
+        _speco_worker_request_finished(self)
 
 
 async def _speco_worker_run_agent_loop(
@@ -219,13 +225,41 @@ async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs)
 
 
 async def _speco_worker_drain(self) -> None:
-    """A FIFO barrier for requests already submitted to an agent-loop worker.
+    """Wait until all generation calls submitted before this barrier finish.
 
-    Ray executes actor calls in submission order.  A no-op submitted after the
-    trainer's last rollout request therefore completes only after the worker has
-    awaited all preceding agent-loop generation/post-processing work.
+    Agent-loop workers are async Ray actors: a later RPC can run while an
+    earlier ``generate_sequences`` call is suspended at an ``await``.  A no-op
+    RPC is therefore not a completion barrier.  The wrapper records live
+    generation calls and waits for their shared idle event instead.
     """
-    return None
+    event = _speco_worker_idle_event(self)
+    await event.wait()
+
+
+def _speco_worker_idle_event(worker: Any) -> asyncio.Event:
+    event = getattr(worker, "_speco_agent_loop_idle_event", None)
+    if event is None:
+        event = asyncio.Event()
+        event.set()
+        worker._speco_agent_loop_idle_event = event
+        worker._speco_agent_loop_inflight = 0
+    return event
+
+
+def _speco_worker_request_started(worker: Any) -> None:
+    event = _speco_worker_idle_event(worker)
+    worker._speco_agent_loop_inflight = int(
+        getattr(worker, "_speco_agent_loop_inflight", 0)
+    ) + 1
+    event.clear()
+
+
+def _speco_worker_request_finished(worker: Any) -> None:
+    event = _speco_worker_idle_event(worker)
+    remaining = max(int(getattr(worker, "_speco_agent_loop_inflight", 0)) - 1, 0)
+    worker._speco_agent_loop_inflight = remaining
+    if remaining == 0:
+        event.set()
 
 
 def _speco_worker_postprocess(
@@ -444,22 +478,27 @@ def install_agent_loop_runtime_patch() -> bool:
 
         @wraps(generate_sequences)
         async def speco_generate_sequences(self, batch):
-            meta_info = getattr(batch, "meta_info", None)
-            meta_info = meta_info if isinstance(meta_info, dict) else {}
-            global_steps_token = _CURRENT_GLOBAL_STEPS.set(
-                meta_info.get("global_steps")
-            )
-            validate_token = _CURRENT_VALIDATE.set(
-                bool(meta_info.get("validate", False))
-            )
+            _speco_worker_request_started(self)
+            global_steps_token = None
+            validate_token = None
             try:
+                meta_info = getattr(batch, "meta_info", None)
+                meta_info = meta_info if isinstance(meta_info, dict) else {}
+                global_steps_token = _CURRENT_GLOBAL_STEPS.set(
+                    meta_info.get("global_steps")
+                )
+                validate_token = _CURRENT_VALIDATE.set(
+                    bool(meta_info.get("validate", False))
+                )
                 result = generate_sequences(self, batch)
                 if inspect.isawaitable(result):
                     result = await result
                 return _ensure_extra_field_defaults(result)
             finally:
-                _CURRENT_VALIDATE.reset(validate_token)
-                _CURRENT_GLOBAL_STEPS.reset(global_steps_token)
+                if global_steps_token is not None and validate_token is not None:
+                    _CURRENT_VALIDATE.reset(validate_token)
+                    _CURRENT_GLOBAL_STEPS.reset(global_steps_token)
+                _speco_worker_request_finished(self)
 
         worker_cls.generate_sequences = speco_generate_sequences
         worker_cls._speco_patched_generate_sequences = True

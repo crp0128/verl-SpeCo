@@ -1,3 +1,17 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import json
@@ -334,13 +348,11 @@ def test_fit_drains_agent_loop_before_releasing_drafter_runtime():
             return "done"
 
     class Harness(SpecoV1Mixin, Upstream):
-        config = _config()
+        config = _config(mode="colocate_async")
+        _speco_prepared_for_fit = True
 
         def _speco_online_enabled_from_config(self, config):
             return True
-
-        def _speco_activate_drafter_training_model_before_fit(self):
-            events.append("activate")
 
         def _speco_v1_drain_agent_loop(self, manager):
             events.append(("drain", manager))
@@ -355,12 +367,41 @@ def test_fit_drains_agent_loop_before_releasing_drafter_runtime():
     manager = object()
     assert Harness().fit(manager) == "done"
     assert events == [
-        "activate",
         "upstream_fit",
         ("drain", manager),
         "publish",
         "checkpoint",
     ]
+
+
+def test_fixed_drafter_async_fit_also_drains_agent_loop():
+    events = []
+    config = _config(mode="colocate_async")
+    config.actor_rollout_ref.rollout.drafter.enable_drafter_training = False
+
+    class Upstream:
+        def fit(self, manager):
+            events.append("upstream_fit")
+            return "done"
+
+    class Harness(SpecoV1Mixin, Upstream):
+        _speco_prepared_for_fit = True
+
+        def __init__(self):
+            self.config = config
+
+        def _speco_v1_drain_agent_loop(self, manager):
+            events.append(("drain", manager))
+
+        def _speco_wait_pending_drafter_publish(self):
+            events.append("publish")
+
+        def _speco_wait_pending_drafter_checkpoint(self):
+            events.append("checkpoint")
+
+    manager = object()
+    assert Harness().fit(manager) == "done"
+    assert events == ["upstream_fit", ("drain", manager)]
 
 
 def test_fit_shuts_down_stateful_dataloader_workers_before_ray_teardown():

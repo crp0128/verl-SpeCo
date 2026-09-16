@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 import types
+import uuid
 from contextlib import contextmanager, nullcontext
 from typing import Any, Iterable, cast
 
@@ -3168,12 +3169,27 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
         install_upstream_vllm_runtime_bridge()
         return {}
 
-    drafter_env_payload = _vllm_drafter_env_payload(drafter_cfg)
     run_dir = _get_nested(config, ("trainer", "default_local_dir"), None)
-    if run_dir:
-        drafter_env_payload[SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY] = os.path.join(
-            os.fspath(run_dir), ".spec_decode_stats"
+    engine_kwargs = _ensure_nested_mapping(
+        config, ("actor_rollout_ref", "rollout", "engine_kwargs", "vllm")
+    )
+    additional_config = _get_nested(engine_kwargs, ("additional_config",), {}) or {}
+    additional_config = dict(additional_config)
+    sidecar_dir = additional_config.get(SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY)
+    if run_dir and not sidecar_dir:
+        # Checkpoint directories are commonly reused for retries and resumes.
+        # Keep cumulative worker counters per run so stale PID files cannot
+        # affect the first acceptance metric of a new launch.
+        sidecar_dir = os.path.join(
+            os.fspath(run_dir), ".spec_decode_stats", f"run-{uuid.uuid4().hex}"
         )
+        additional_config[SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY] = os.path.abspath(
+            sidecar_dir
+        )
+
+    drafter_env_payload = _vllm_drafter_env_payload(drafter_cfg)
+    if run_dir:
+        drafter_env_payload[SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY] = sidecar_dir
     set_drafter_config_env(json.dumps(drafter_env_payload, sort_keys=True))
     rollout_cfg = _rollout_config_from_config(config)
     speculative_config = build_vllm_speculative_config_from_drafter(
@@ -3181,15 +3197,7 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     )
     install_upstream_vllm_runtime_bridge()
 
-    engine_kwargs = _ensure_nested_mapping(
-        config, ("actor_rollout_ref", "rollout", "engine_kwargs", "vllm")
-    )
     if run_dir:
-        additional_config = _get_nested(engine_kwargs, ("additional_config",), {}) or {}
-        additional_config = dict(additional_config)
-        additional_config[SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY] = os.path.abspath(
-            os.path.join(os.fspath(run_dir), ".spec_decode_stats")
-        )
         _set_child(engine_kwargs, "additional_config", additional_config)
     existing_spec = _get_nested(engine_kwargs, ("speculative_config",), None)
     merged_speculative_config = _merge_speculative_config(

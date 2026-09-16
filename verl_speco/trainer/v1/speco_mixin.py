@@ -1,10 +1,24 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Thin lifecycle integration for the verl V1 PPO trainers."""
 
 from __future__ import annotations
 
-import logging
-import json
 import inspect
+import json
+import logging
 import os
 import tempfile
 import time
@@ -365,6 +379,13 @@ class SpecoV1Mixin:
     def _speco_online_enabled_from_config(config) -> bool:
         drafter = config.actor_rollout_ref.rollout.get("drafter", {}) or {}
         return bool(drafter.get("enable", False) and drafter.get("enable_drafter_training", False))
+
+    def _speco_v1_async_rollout_enabled(self) -> bool:
+        mode = str(self.config.trainer.v1.get("trainer_mode", "sync")).lower()
+        drafter = self.config.actor_rollout_ref.rollout.get("drafter", {}) or {}
+        return mode in {"colocate_async", "separate_async"} and bool(
+            drafter.get("enable", False)
+        )
 
     @staticmethod
     def _speco_validate_v1_training_config(config) -> None:
@@ -872,6 +893,7 @@ class SpecoV1Mixin:
         """Read cumulative EngineCore counters when RequestOutput has no stats."""
 
         from verl_speco.integration.vllm_runtime import (
+            SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY,
             read_vllm_spec_decode_sidecar_totals,
         )
 
@@ -880,11 +902,16 @@ class SpecoV1Mixin:
             "default_local_dir",
             None,
         )
-        directory = (
-            os.path.join(os.fspath(run_dir), ".spec_decode_stats")
-            if run_dir
-            else None
-        )
+        actor_rollout_ref = getattr(self.config, "actor_rollout_ref", None)
+        rollout = getattr(actor_rollout_ref, "rollout", {}) or {}
+        engine_kwargs = rollout.get("engine_kwargs", {}) or {}
+        vllm_kwargs = engine_kwargs.get("vllm", {}) or {}
+        additional_config = vllm_kwargs.get("additional_config", {}) or {}
+        directory = additional_config.get(SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY)
+        if not directory and run_dir:
+            # Compatibility fallback for launchers configured before per-run
+            # sidecar directories were introduced.
+            directory = os.path.join(os.fspath(run_dir), ".spec_decode_stats")
         current = read_vllm_spec_decode_sidecar_totals(directory)
         previous = getattr(
             self,
@@ -1092,6 +1119,7 @@ class SpecoV1Mixin:
             return
         if self._speco_online_enabled_from_config(self.config):
             self._speco_activate_drafter_training_model_before_fit()
+        if self._speco_v1_async_rollout_enabled():
             self._speco_run_async_prefit_rollout_warmup(agent_loop_manager)
         self._speco_prepared_for_fit = True
 
@@ -1116,14 +1144,13 @@ class SpecoV1Mixin:
             if not bool(getattr(self, "_speco_prepared_for_fit", False)):
                 # Compatibility fallback for callers other than SpecoTaskRunner.
                 self.prepare_for_fit(agent_loop_manager)
-            result = super().fit(agent_loop_manager)
-            if self._speco_online_enabled_from_config(self.config):
-                # ``fit`` returns immediately after the final V1 step.  Do not
-                # let its owning Ray worker exit while agent-loop actors still
-                # own vLLM requests or output handlers.
-                self._speco_v1_drain_agent_loop(agent_loop_manager)
-            return result
+            return super().fit(agent_loop_manager)
         finally:
+            if self._speco_v1_async_rollout_enabled():
+                # ``fit`` may return or raise while async agent-loop actors
+                # still own vLLM requests or output handlers.  Drain them
+                # before any rollout/DataLoader teardown in either path.
+                self._speco_v1_drain_agent_loop(agent_loop_manager)
             if self._speco_online_enabled_from_config(self.config):
                 self._speco_wait_pending_drafter_publish()
                 self._speco_wait_pending_drafter_checkpoint()

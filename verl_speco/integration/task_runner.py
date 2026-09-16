@@ -227,6 +227,9 @@ class SpecoTaskRunner(_TaskRunnerBase):
 
         from verl.trainer.ppo.v1 import AgentLoopManagerTQ
         from verl.utils.import_utils import load_class_from_fqn
+        from verl_speco.integration.agent_loop_runtime import (
+            install_agent_loop_runtime_patch,
+        )
         from verl_speco.trainer.v1.factory import get_speco_v1_trainer_cls
 
         OmegaConf.resolve(config)
@@ -251,6 +254,11 @@ class SpecoTaskRunner(_TaskRunnerBase):
                 if manager_fqn
                 else AgentLoopManagerTQ
             )
+            # V1 constructs agent-loop actors directly rather than through the
+            # legacy trainer.  Install the request-context and drain bridge
+            # before Ray snapshots their method table.
+            if _drafter_rollout_enabled(config):
+                install_agent_loop_runtime_patch()
             manager = manager_cls.create(
                 config=self._v1_agent_loop_config(config),
                 llm_client=trainer.get_llm_client(),
