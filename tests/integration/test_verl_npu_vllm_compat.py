@@ -50,6 +50,36 @@ def test_v080_npu_patch_temporarily_adds_factory_weight_loader(monkeypatch) -> N
     assert compat._IMPORT_COMPAT_APPLIED is True
 
 
+def test_unrecognized_runner_layout_falls_back_to_safe_factory_import(monkeypatch) -> None:
+    vllm = types.ModuleType("vllm")
+    # CI's release/0.9 packaging keeps main_ppo.py, so the old layout probe
+    # returns false and the v0.8 version gate rejects this vLLM revision.
+    vllm.__version__ = "0.13.0"
+    fused_moe_package = types.ModuleType(compat._VLLM_FUSED_MOE_PACKAGE)
+
+    def fused_moe_factory(*args, **kwargs):
+        return args, kwargs
+
+    fused_moe_package.FusedMoE = fused_moe_factory
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
+    monkeypatch.setattr(compat, "_uses_verl_v090_runner", lambda: False)
+
+    def module_importer(module_name: str):
+        if module_name == "vllm":
+            return vllm
+        if module_name == compat._VLLM_FUSED_MOE_PACKAGE:
+            return fused_moe_package
+        if module_name == compat._VERL_NPU_VLLM_PATCH_MODULE:
+            assert fused_moe_factory.weight_loader is compat._unused_factory_weight_loader
+            return types.ModuleType(module_name)
+        raise AssertionError(f"unexpected import: {module_name}")
+
+    assert compat.install_verl_npu_vllm_import_compat(module_importer) is True
+    assert not hasattr(fused_moe_factory, "weight_loader")
+    assert compat._IMPORT_COMPAT_APPLIED is True
+
+
 def test_v090_npu_patch_temporarily_adds_factory_weight_loader(monkeypatch) -> None:
     def fused_moe_factory(*args, **kwargs):
         return args, kwargs
