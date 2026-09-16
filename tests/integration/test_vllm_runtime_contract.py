@@ -1013,9 +1013,17 @@ def test_vllm_http_actor_installs_import_guard_before_deserialization() -> None:
     )
     assert captured["actor_cls"] is Server
     assert captured["options"]["name"] == "server"
-    assert captured["options"]["runtime_env"]["env_vars"] == {"EXISTING": "1"}
-    setup_hook = captured["options"]["runtime_env"]["worker_process_setup_hook"]
-    assert setup_hook is vllm_runtime.install_verl_npu_vllm_worker_process_compat
+    runtime_env = captured["options"]["runtime_env"]
+    setup_hook_path = (
+        "verl_speco.integration.verl_npu_vllm_compat."
+        "install_verl_npu_vllm_worker_process_compat"
+    )
+    assert runtime_env["env_vars"] == {
+        "EXISTING": "1",
+        "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR": setup_hook_path,
+    }
+    assert runtime_env["worker_process_setup_hook"] == setup_hook_path
+    assert json.loads(json.dumps(runtime_env)) == runtime_env
 
 
 def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(

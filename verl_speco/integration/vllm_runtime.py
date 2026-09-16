@@ -36,10 +36,7 @@ import uuid
 from contextlib import contextmanager, nullcontext
 from typing import Any, Iterable, cast
 
-from verl_speco.integration.verl_npu_vllm_compat import (
-    install_verl_npu_vllm_import_compat,
-    install_verl_npu_vllm_worker_process_compat,
-)
+from verl_speco.integration.verl_npu_vllm_compat import install_verl_npu_vllm_import_compat
 from verl_speco.integration.drafter_config_env import (
     SPECO_DRAFTER_CONFIG_ENV,
     clear_drafter_config_env,
@@ -2988,14 +2985,26 @@ def _build_speco_vllm_http_server_class(upstream_module: Any):
 class _SpecoVLLMHttpServerActorClass:
     """Keep the worker setup hook when upstream supplies its own runtime env."""
 
+    _SETUP_HOOK_PATH = (
+        "verl_speco.integration.verl_npu_vllm_compat."
+        "install_verl_npu_vllm_worker_process_compat"
+    )
+    _SETUP_HOOK_ENV_VAR = "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR"
+
     def __init__(self, actor_class: Any):
         self._actor_class = actor_class
 
     def options(self, **options):
         runtime_env = dict(options.get("runtime_env", {}) or {})
-        runtime_env["worker_process_setup_hook"] = (
-            install_verl_npu_vllm_worker_process_compat
-        )
+        env_vars = dict(runtime_env.get("env_vars", {}) or {})
+        env_vars[self._SETUP_HOOK_ENV_VAR] = self._SETUP_HOOK_PATH
+        runtime_env["env_vars"] = env_vars
+        # Ray serializes per-actor runtime_env values as JSON before starting
+        # the worker.  A callable works for ray.init(), but remains a raw
+        # function in ActorClass.options() on supported Ray releases.  Use the
+        # importable module path and populate Ray's worker bootstrap env var so
+        # the guard runs before the actor class is deserialized.
+        runtime_env["worker_process_setup_hook"] = self._SETUP_HOOK_PATH
         return self._actor_class.options(**{**options, "runtime_env": runtime_env})
 
     def remote(self, *args, **kwargs):
