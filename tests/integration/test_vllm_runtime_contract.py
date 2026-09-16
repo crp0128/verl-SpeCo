@@ -952,10 +952,22 @@ def test_vllm_runtime_injects_native_config_and_worker_extension(monkeypatch, tm
     engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
     assert engine_kwargs["speculative_config"]["method"] == "eagle3"
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
-    assert engine_kwargs["additional_config"] == {
-        "existing_option": 1,
-        vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY: str(tmp_path / ".spec_decode_stats"),
-    }
+    assert engine_kwargs["additional_config"]["existing_option"] == 1
+    sidecar_dir = engine_kwargs["additional_config"][
+        vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY
+    ]
+    assert sidecar_dir.startswith(str(tmp_path / ".spec_decode_stats"))
+    assert "/run-" in sidecar_dir.replace("\\", "/")
+
+    # Reconfiguration in the same driver process must reuse its run-scoped
+    # directory rather than splitting counters between two locations.
+    configure_vllm_runtime_from_config(config)
+    assert (
+        engine_kwargs["additional_config"][
+            vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY
+        ]
+        == sidecar_dir
+    )
 
 
 def test_vllm_runtime_installs_replica_bridge_without_drafter(monkeypatch) -> None:

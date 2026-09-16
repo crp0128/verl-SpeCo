@@ -29,6 +29,7 @@ ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-16}
 spec_verify_tokens=${SPECO_DSPARK_VERIFY_TOKENS:-7}
+rollout_max_model_len=${SPECO_ROLLOUT_MAX_MODEL_LEN:-9216}
 
 MODEL_PATH=/path/to/model
 CKPTS_DIR=/path/to/checkpoint
@@ -47,6 +48,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_v1_trainer \
     data.train_batch_size=64 \
     data.max_prompt_length=512 \
     data.max_response_length=8192 \
+    actor_rollout_ref.rollout.max_model_len=${rollout_max_model_len} \
     data.filter_overlong_prompts=False \
     data.filter_overlong_prompts_workers=256 \
     data.val_batch_size=null \

@@ -148,12 +148,12 @@ checkpoint's training `block_size`.
 ### verl V1 runner (Phase 1)
 
 On `release/v0.9.0`, SPECO can now enter verl's native V1
-`TransferQueue` trainer with `trainer.use_v1=true`. Fixed-drafter serving
-preserves verl's trainer mode (`sync`, `colocate_async`, or `separate_async`).
-Phase-1 online drafter training supports `sync` only. The adapter preserves the
-configured agent-loop manager while wrapping vLLM actor workers with SPECO's
-runtime compatibility and draft-weight publication hooks. It does not add
-Uni-Agent fields.
+`TransferQueue` trainer with `trainer.use_v1=true`. Fixed-drafter serving and
+online DSpark drafter training support `sync`, `colocate_async`, and
+`separate_async` with vLLM rollout. The adapter preserves the configured
+agent-loop manager while wrapping vLLM actor workers with SPECO's runtime
+compatibility and draft-weight publication hooks. It does not add Uni-Agent
+fields.
 
 Use the Phase 1 overlay from a checkout that exposes the `verl` config package:
 
@@ -166,16 +166,15 @@ python -m verl_speco.main --config-name=speco_v1_trainer \
   trainer.v1.trainer_mode=sync
 ```
 
-For `trainer.v1.trainer_mode=sync`, online drafter training uses the same
+For every supported V1 mode, online drafter training uses the same
 old-logprob collector, scheduler, feature store, and weight-publication
 protocol as the legacy trainer, with V1's `KVBatchMeta`/TransferQueue boundary
 preserved. Start with ordinary single-turn PPO/GRPO batches and the existing
 fixed feature window. Agent trajectories, per-turn masking, context-plus-
 assistant layouts, and sliding-window-aware training are Phase 2 work; do not
-enable those options with this overlay yet. Online drafter training also
-requires actor old-logprob inference, so it rejects
-`algorithm.rollout_correction.bypass_mode=true`. The asynchronous V1 modes are
-currently limited to fixed-drafter serving.
+enable those options with this overlay yet. Online drafter training requires
+actor old-logprob inference, so it rejects
+`algorithm.rollout_correction.bypass_mode=true`.
 
 ### VeOmni Actor Compatibility
 

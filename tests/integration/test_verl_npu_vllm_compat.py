@@ -50,7 +50,7 @@ def test_v080_npu_patch_temporarily_adds_factory_weight_loader(monkeypatch) -> N
     assert compat._IMPORT_COMPAT_APPLIED is True
 
 
-def test_v090_npu_patch_import_does_not_mutate_fused_moe_factory(monkeypatch) -> None:
+def test_v090_npu_patch_temporarily_adds_factory_weight_loader(monkeypatch) -> None:
     def fused_moe_factory(*args, **kwargs):
         return args, kwargs
 
@@ -70,6 +70,10 @@ def test_v090_npu_patch_import_does_not_mutate_fused_moe_factory(monkeypatch) ->
             return fused_moe_layer
         if module_name == compat._VERL_NPU_VLLM_PATCH_MODULE:
             assert fused_moe_package.FusedMoE is fused_moe_factory
+            assert fused_moe_factory.weight_loader is compat._unused_factory_weight_loader
+            # Mirror verl 0.9's import-time wrapper assignment. The temporary
+            # compatibility attribute must still be removed afterwards.
+            fused_moe_factory.weight_loader = lambda *args: args
             return types.ModuleType(module_name)
         raise AssertionError(f"unexpected import: {module_name}")
 
@@ -82,6 +86,30 @@ def test_v090_npu_patch_import_does_not_mutate_fused_moe_factory(monkeypatch) ->
         compat._VERL_NPU_VLLM_PATCH_MODULE,
     ]
     assert compat._IMPORT_COMPAT_APPLIED is True
+
+
+def test_v090_npu_patch_handles_package_exported_factory(monkeypatch) -> None:
+    def fused_moe_factory(*args, **kwargs):
+        return args, kwargs
+
+    fused_moe_package = types.ModuleType(compat._VLLM_FUSED_MOE_PACKAGE)
+    fused_moe_package.FusedMoE = fused_moe_factory
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
+    monkeypatch.setattr(compat, "_uses_verl_v090_runner", lambda: True)
+
+    def module_importer(module_name: str):
+        if module_name == compat._VLLM_FUSED_MOE_PACKAGE:
+            return fused_moe_package
+        if module_name == compat._VERL_NPU_VLLM_PATCH_MODULE:
+            assert fused_moe_package.FusedMoE is fused_moe_factory
+            assert fused_moe_factory.weight_loader is compat._unused_factory_weight_loader
+            return types.ModuleType(module_name)
+        raise AssertionError(f"unexpected import: {module_name}")
+
+    assert compat.install_verl_npu_vllm_import_compat(module_importer) is True
+    assert fused_moe_package.FusedMoE is fused_moe_factory
+    assert not hasattr(fused_moe_factory, "weight_loader")
 
 
 def test_v090_npu_patch_skips_removed_fused_moe_factory(monkeypatch) -> None:

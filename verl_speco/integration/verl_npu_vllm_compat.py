@@ -122,35 +122,43 @@ def _install_verl_v080_npu_vllm_import_compat(
 def _temporary_verl_v090_fused_moe_import(
     module_importer: Callable[[str], Any],
 ) -> Iterator[None]:
-    """Provide only the temporary package export expected by verl's NPU patch.
+    """Provide temporary symbols expected by verl's legacy NPU patch.
 
     Some modular vLLM revisions keep ``FusedMoE`` in ``fused_moe.layer``
-    without re-exporting it; newer revisions remove that factory entirely.
-    verl v0.9 imports the package-level symbol before it can skip the obsolete
-    class-level hook. Export the exact factory or a non-class sentinel only for
-    that import, then restore the package namespace even when import fails.
+    without re-exporting it; newer revisions remove that factory entirely or
+    export it as a factory function.  verl v0.9's NPU patch unconditionally
+    accesses ``FusedMoE.weight_loader`` at import time.  Supply the missing
+    export and/or a temporary loader attribute only for that import, then
+    restore the vLLM namespace even when import fails.
     """
 
     fused_moe_package = module_importer(_VLLM_FUSED_MOE_PACKAGE)
-    if hasattr(fused_moe_package, "FusedMoE"):
-        yield
-        return
+    added_package_export = not hasattr(fused_moe_package, "FusedMoE")
+    if added_package_export:
+        try:
+            fused_moe_layer = module_importer(_VLLM_FUSED_MOE_LAYER_MODULE)
+        except ModuleNotFoundError as exc:
+            if exc.name != _VLLM_FUSED_MOE_LAYER_MODULE:
+                raise
+            fused_moe_layer = None
+        fused_moe = getattr(fused_moe_layer, "FusedMoE", None)
+        if fused_moe is None:
+            fused_moe = _unavailable_fused_moe
+        fused_moe_package.FusedMoE = fused_moe
+    else:
+        fused_moe = fused_moe_package.FusedMoE
 
-    try:
-        fused_moe_layer = module_importer(_VLLM_FUSED_MOE_LAYER_MODULE)
-    except ModuleNotFoundError as exc:
-        if exc.name != _VLLM_FUSED_MOE_LAYER_MODULE:
-            raise
-        fused_moe_layer = None
-    fused_moe = getattr(fused_moe_layer, "FusedMoE", None)
-    if fused_moe is None:
-        fused_moe = _unavailable_fused_moe
-
-    fused_moe_package.FusedMoE = fused_moe
+    added_weight_loader = not hasattr(fused_moe, "weight_loader")
+    if added_weight_loader:
+        fused_moe.weight_loader = _unused_factory_weight_loader
     try:
         yield
     finally:
-        if getattr(fused_moe_package, "FusedMoE", None) is fused_moe:
+        if added_weight_loader and hasattr(fused_moe, "weight_loader"):
+            del fused_moe.weight_loader
+        if added_package_export and getattr(
+            fused_moe_package, "FusedMoE", None
+        ) is fused_moe:
             del fused_moe_package.FusedMoE
 
 
