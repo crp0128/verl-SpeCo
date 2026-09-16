@@ -80,6 +80,18 @@ def test_unrecognized_runner_layout_falls_back_to_safe_factory_import(monkeypatc
     assert compat._IMPORT_COMPAT_APPLIED is True
 
 
+def test_worker_process_setup_hook_installs_import_compat(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        compat,
+        "install_verl_npu_vllm_import_compat",
+        lambda: calls.append("compat"),
+    )
+
+    assert compat.install_verl_npu_vllm_worker_process_compat() is None
+    assert calls == ["compat"]
+
+
 def test_v090_npu_patch_temporarily_adds_factory_weight_loader(monkeypatch) -> None:
     def fused_moe_factory(*args, **kwargs):
         return args, kwargs

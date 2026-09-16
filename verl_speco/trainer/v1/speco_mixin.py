@@ -60,6 +60,9 @@ class SpecoV1Mixin:
 
     speco_worker_cls = None
     global_steps: int
+    _speco_prepared_for_fit = False
+    _speco_prefit_reissue_consumed = False
+    _speco_prefit_on_train_begin_consumed = False
 
     @staticmethod
     def _speco_v1_standalone_publish_worker_cls(drafter_config=None):
@@ -936,8 +939,7 @@ class SpecoV1Mixin:
             # sidecar directories were introduced.
             directory = os.path.join(os.fspath(run_dir), ".spec_decode_stats")
         current = read_vllm_spec_decode_sidecar_totals(directory)
-        previous = getattr(
-            self,
+        previous = self.__dict__.get(
             "_speco_vllm_spec_decode_sidecar_previous",
             {"drafts": 0.0, "accepted_tokens": 0.0, "draft_tokens": 0.0},
         )
@@ -1006,9 +1008,8 @@ class SpecoV1Mixin:
             total_drafts += max(0.0, drafts)
             total_accepted += max(0.0, accepted)
 
-        sidecar_metrics = self._speco_v1_spec_decode_sidecar_metrics()
         if total_drafts <= 0.0:
-            return sidecar_metrics
+            return self._speco_v1_spec_decode_sidecar_metrics()
         return {
             "drafter/spec_decode/mean_acceptance_length": 1.0
             + total_accepted / total_drafts,
