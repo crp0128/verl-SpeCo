@@ -325,6 +325,11 @@ class SpecoTaskRunner(_TaskRunnerBase):
                 reward_loop_worker_handles=trainer.get_reward_handles(),
             )
             logger.info("SPECO V1 trainer=%s manager=%s", type(trainer).__name__, type(manager).__name__)
+            # Keep drafter activation and the first real async decode outside
+            # trainer.fit(), so step 1 measures training work rather than lazy
+            # runtime initialization. The warmup batch remains normal step-1
+            # data in TransferQueue and is not regenerated or discarded.
+            trainer.prepare_for_fit(manager)
             trainer.fit(manager)
             logger.info("Completed SPECO V1 trainer fit")
             succeeded = True

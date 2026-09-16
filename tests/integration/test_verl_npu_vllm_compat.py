@@ -160,6 +160,10 @@ def test_v090_npu_patch_preserves_existing_fused_moe_export(monkeypatch) -> None
 def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
     events = []
     monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_vllm_runtime_for_worker",
+        lambda worker: events.append(("vllm_runtime", worker.__class__.__name__)),
+    )
+    monkeypatch.setattr(
         compat, "install_verl_npu_vllm_import_compat", lambda: events.append("compat")
     )
     monkeypatch.setattr(
@@ -191,8 +195,27 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
         "training_output_release",
         "reclaim",
         "fsdp2_export",
+        ("vllm_runtime", "WrappedWorker"),
         "base",
     ]
+
+
+def test_worker_mixin_hides_drafter_from_upstream_init_model() -> None:
+    drafter = {"enable": False}
+
+    class BaseWorker:
+        def init_model(self):
+            assert "drafter" not in self.config["rollout"]
+            return "initialized"
+
+    class WrappedWorker(compat.VerlNPUVLLMImportCompatMixin, BaseWorker):
+        pass
+
+    worker = WrappedWorker.__new__(WrappedWorker)
+    worker.config = {"rollout": {"name": "vllm", "drafter": drafter}}
+
+    assert worker.init_model() == "initialized"
+    assert worker.config["rollout"]["drafter"] is drafter
 
 
 def test_worker_mixin_installs_shm_reuse_before_weight_update(monkeypatch) -> None:

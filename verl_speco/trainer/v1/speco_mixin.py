@@ -5,6 +5,9 @@ from __future__ import annotations
 import logging
 import json
 import inspect
+import os
+import tempfile
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,84 @@ class SpecoV1Mixin:
     """
 
     speco_worker_cls = None
+
+    @staticmethod
+    def _speco_v1_standalone_publish_worker_cls(drafter_config=None):
+        """Return a rollout-side worker that can consume a draft IPC payload.
+
+        ``separate_async`` gives its continuously-serving replicas their own
+        ``CheckpointEngineWorker`` group.  Unlike a hybrid actor/rollout worker,
+        that upstream worker has no draft-publish RPC, even though its embedded
+        vLLM rollout already has the required IPC receiver.  Add the narrow
+        publish facade before the standalone replicas are created.
+        """
+        serialized_drafter_config = json.dumps(
+            _plain_config(drafter_config or {}), sort_keys=True
+        )
+        cached = getattr(SpecoV1Mixin, "_speco_v1_standalone_publish_worker_remote", None)
+        if (
+            cached is not None
+            and getattr(
+                SpecoV1Mixin, "_speco_v1_standalone_publish_worker_config", None
+            )
+            == serialized_drafter_config
+        ):
+            return cached
+
+        import ray
+        from verl.checkpoint_engine.base import CheckpointEngineWorker
+        from verl_speco.integration.rollout_publish import DraftWeightPublishMixin
+
+        class SpecoV1StandalonePublishWorker(
+            DraftWeightPublishMixin, CheckpointEngineWorker
+        ):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.rollout = self.server_adapter
+                # Upstream RolloutConfig deliberately has no SPECO ``drafter``
+                # extension.  Preserve it in the facade config so a standalone
+                # publish RPC reaches the embedded rollout instead of no-oping.
+                self.config = {
+                    "rollout": {
+                        "name": self.rollout_config.name,
+                        "drafter": json.loads(type(self)._speco_drafter_config_env),
+                    }
+                }
+
+        SpecoV1StandalonePublishWorker.__module__ = __name__
+        SpecoV1StandalonePublishWorker._speco_drafter_config_env = (
+            serialized_drafter_config
+        )
+        globals()[SpecoV1StandalonePublishWorker.__name__] = SpecoV1StandalonePublishWorker
+        cached = ray.remote(SpecoV1StandalonePublishWorker)
+        SpecoV1Mixin._speco_v1_standalone_publish_worker_remote = cached
+        SpecoV1Mixin._speco_v1_standalone_publish_worker_config = (
+            serialized_drafter_config
+        )
+        return cached
+
+    def _speco_install_v1_standalone_publish_worker(self) -> None:
+        mode = str(self.config.trainer.v1.get("trainer_mode", "sync")).lower()
+        drafter = self.config.actor_rollout_ref.rollout.get("drafter", {}) or {}
+        if mode != "separate_async" or not bool(drafter.get("enable", False)):
+            return
+
+        from verl.workers.rollout.replica import RolloutMode, RolloutReplica
+
+        if getattr(RolloutReplica, "_speco_v1_publish_worker_patched", False):
+            return
+        original = RolloutReplica.get_ray_class_with_init_args
+
+        def get_ray_class_with_speco_publish(replica):
+            init_args = original(replica)
+            if getattr(replica, "rollout_mode", None) == RolloutMode.STANDALONE:
+                init_args.cls = SpecoV1Mixin._speco_v1_standalone_publish_worker_cls(
+                    drafter
+                )
+            return init_args
+
+        RolloutReplica.get_ray_class_with_init_args = get_ray_class_with_speco_publish
+        RolloutReplica._speco_v1_publish_worker_patched = True
 
     def _speco_init_state(self):
         from verl_speco.trainer.scheduler import DrafterRuntimeState, DrafterScheduler
@@ -113,6 +194,167 @@ class SpecoV1Mixin:
             return flattened
         return []
 
+    def _speco_feature_store_checkpoint_configured(self) -> bool:
+        training = (
+            self.config.actor_rollout_ref.rollout.get("drafter", {}) or {}
+        ).get("training", {}) or {}
+        feature_store = training.get("feature_store", None)
+        return bool(feature_store and feature_store.get("path", None))
+
+    def _speco_v1_checkpoint_directory(self, global_step: int | None = None) -> str:
+        step = self.global_steps if global_step is None else global_step
+        return os.path.join(
+            str(self.config.trainer.default_local_dir), f"global_step_{int(step)}"
+        )
+
+    def _speco_v1_joint_checkpoint_manifest_path(
+        self, global_step: int | None = None
+    ) -> str:
+        return os.path.join(
+            self._speco_v1_checkpoint_directory(global_step), "speco_v1_manifest.json"
+        )
+
+    def _speco_finalize_v1_drafter_publish(self) -> dict[str, Any]:
+        if not getattr(self, "_speco_v1_pending_training", False):
+            return {}
+        training_plan = getattr(self, "_speco_v1_training_plan", None)
+        try:
+            # Keep the established V1 order: the parent completes its actor
+            # weight sync before drafter SHM reload starts.  The publish RPC is
+            # still awaited here, so the next V1 step cannot consume a partial
+            # drafter revision.
+            metrics = self._speco_publish_drafter_weights(
+                True, training_plan, after_weight_update=True
+            )
+            waited = self._speco_wait_pending_drafter_publish()
+            metrics["drafter/publish_waited_after_weight_sync"] = int(waited)
+            metrics["drafter/publish_safe_point_after_weight_sync"] = 1
+            return metrics
+        finally:
+            # A failed publish raises after the legacy facade has restored the
+            # previous payload.  Do not retry it from a later checkpoint hook.
+            self._speco_v1_pending_training = False
+            self._speco_v1_training_plan = None
+
+    def _speco_snapshot_v1_feature_store_checkpoint(self) -> list[dict[str, Any]]:
+        if not self._speco_feature_store_checkpoint_configured():
+            return []
+        results = self._ray_get_if_needed(
+            self.speco_get_feature_store_checkpoint_state(self.global_steps)
+        )
+        flattened = self._speco_flatten_checkpoint_results(results)
+        failures = [
+            result
+            for result in flattened
+            if not bool(result.get("saved", False))
+            and result.get("reason")
+            not in {"not_in_training_group", "not_feature_store_leader"}
+        ]
+        if failures:
+            raise RuntimeError(f"Feature-store checkpoint cursor save failed: {failures}")
+        saved = [result for result in flattened if bool(result.get("saved", False))]
+        if not saved:
+            raise RuntimeError("Feature-store checkpoint cursor produced no saved state")
+        return saved
+
+    def _speco_write_v1_joint_checkpoint_manifest(
+        self,
+        *,
+        drafter_results: Any,
+        feature_store: list[dict[str, Any]],
+    ) -> str:
+        checkpoint_dir = self._speco_v1_checkpoint_directory()
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        manifest_path = self._speco_v1_joint_checkpoint_manifest_path()
+        manifest = {
+            "format": "speco_v1_joint_checkpoint",
+            "version": 1,
+            "global_step": int(self.global_steps),
+            "trainer_mode": str(self.trainer_mode),
+            # This is the revision actually committed to rollout, which can
+            # legitimately lag global_step when a training plan does not publish.
+            "drafter_version": getattr(self, "_speco_last_published_drafter_step", 0),
+            "drafter_checkpoints": self._speco_flatten_checkpoint_results(
+                drafter_results
+            ),
+            "feature_store": feature_store,
+        }
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=".speco_v1_manifest.", suffix=".tmp", dir=checkpoint_dir
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(manifest, stream, ensure_ascii=True, indent=2, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, manifest_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        return manifest_path
+
+    def _speco_restore_v1_feature_store_checkpoint(self) -> None:
+        if not self._speco_feature_store_checkpoint_configured():
+            return
+        resume_step = self._speco_resume_global_step_hint()
+        if resume_step is None:
+            return
+        manifest_path = self._speco_v1_joint_checkpoint_manifest_path(resume_step)
+        if not os.path.isfile(manifest_path):
+            raise RuntimeError(
+                "V1 resume with Feature Store enabled requires a joint SPECO "
+                f"checkpoint manifest: {manifest_path}"
+            )
+        try:
+            with open(manifest_path, encoding="utf-8") as stream:
+                manifest = json.load(stream)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Invalid V1 SPECO checkpoint manifest: {manifest_path}"
+            ) from exc
+        if (
+            manifest.get("format") != "speco_v1_joint_checkpoint"
+            or int(manifest.get("version", 0)) != 1
+            or int(manifest.get("global_step", -1)) != int(resume_step)
+        ):
+            raise RuntimeError(
+                f"V1 SPECO checkpoint manifest does not match resumed step {resume_step}"
+            )
+        states = manifest.get("feature_store")
+        if not isinstance(states, list) or not states:
+            raise RuntimeError(
+                "V1 SPECO checkpoint manifest must contain a Feature Store cursor"
+            )
+        unique_states = {
+            json.dumps(state.get("cursor"), sort_keys=True): state
+            for state in states
+            if isinstance(state, dict) and isinstance(state.get("cursor"), dict)
+        }
+        if len(unique_states) != 1:
+            raise RuntimeError(
+                "V1 SPECO checkpoint manifest must contain one unique Feature Store cursor"
+            )
+        state = next(iter(unique_states.values()))
+        results = self._ray_get_if_needed(
+            self.speco_restore_feature_store_checkpoint_state(state)
+        )
+        flattened = self._speco_flatten_checkpoint_results(results)
+        failures = [
+            result
+            for result in flattened
+            if not bool(result.get("restored", False))
+            and result.get("reason")
+            not in {"not_in_training_group", "not_feature_store_leader"}
+        ]
+        if failures or not any(result.get("restored", False) for result in flattened):
+            raise RuntimeError(
+                "Feature-store checkpoint cursor restore failed: "
+                f"{failures or flattened}"
+            )
+        logger.info(
+            "SPECO V1 restored Feature Store cursor from step=%s", resume_step
+        )
+
     def attach_speco_worker_group(self, worker_group):
         """Bind V1 drafter workers to the shared SPECO adapter facade."""
         from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
@@ -149,11 +391,6 @@ class SpecoV1Mixin:
                 "algorithm.rollout_correction.bypass_mode=true because hidden "
                 "states must be collected from actor old-logprob inference"
             )
-        if str(config.trainer.v1.get("trainer_mode", "sync")).lower() != "sync":
-            raise ValueError(
-                "Phase-1 V1 online SPECO training supports trainer.v1.trainer_mode=sync only. "
-                "The asynchronous V1 modes remain available for fixed-drafter serving."
-            )
         if str(config.actor_rollout_ref.rollout.get("name", "")).lower() != "vllm":
             raise ValueError(
                 "Phase-1 V1 online SPECO training supports rollout.name=vllm only"
@@ -164,6 +401,10 @@ class SpecoV1Mixin:
             configure_vllm_runtime_from_config,
         )
 
+        # Must precede PPOTrainerSeparateAsync's standalone LLMServerManager
+        # construction, otherwise its CheckpointEngineWorker actors are already
+        # fixed without the draft-publication facade.
+        self._speco_install_v1_standalone_publish_worker()
         self._speco_validate_v1_training_config(self.config)
         self._speco_init_state()
         if self._speco_online_enabled_from_config(self.config):
@@ -186,6 +427,7 @@ class SpecoV1Mixin:
             # the drafter can safely share their bundles before the first
             # checkpoint-manager weight update in on_init_end().
             self._init_v1_speco_drafter_workers()
+            self._speco_restore_v1_feature_store_checkpoint()
         self._speco_v1_state = {"drafter_version": None, "features_collected": 0}
         return result
 
@@ -193,6 +435,58 @@ class SpecoV1Mixin:
         result = super()._init_resource_pool_mgr()
         self._wrap_v1_actor_worker()
         return result
+
+    def _speco_update_rollout_drafter_weights(
+        self, payload: Any, global_step: object, asynchronous: bool
+    ) -> None:
+        """Publish V1 separate-async drafts only to standalone replicas.
+
+        The hybrid actor worker is in trainer mode during this boundary.  Its
+        vLLM server must not consume the draft IPC stream; doing so races the
+        detached actor's own weight lifecycle.  The standalone rollout workers
+        are the replicas that serve the next batch, so publish directly to them.
+        """
+        mode = str(self.config.trainer.v1.get("trainer_mode", "sync")).lower()
+        if mode != "separate_async":
+            from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
+
+            return SpecoRayPPOTrainer._speco_update_rollout_drafter_weights(
+                self, payload, global_step, asynchronous
+            )
+
+        manager = getattr(self, "standalone_server_manager", None)
+        replicas = manager.get_replicas() if manager is not None else []
+        workers = [worker for replica in replicas for worker in replica.workers]
+        if not workers:
+            raise RuntimeError(
+                "V1 separate_async drafter publish requires initialized standalone rollout workers"
+            )
+
+        from verl.single_controller.ray.base import RayClassWithInitArgs, RayWorkerGroup
+
+        worker_group = RayWorkerGroup(
+            worker_handles=workers,
+            ray_cls_with_init=RayClassWithInitArgs(
+                cls=self._speco_v1_standalone_publish_worker_cls()
+            ),
+        )
+        method_name = (
+            "update_draft_weights_async" if asynchronous else "update_draft_weights"
+        )
+        update_result = getattr(worker_group, method_name)(
+            payload, global_steps=global_step
+        )
+        if asynchronous:
+            self._pending_drafter_publish_refs = update_result
+            self._pending_drafter_publish_payload = payload
+            self._pending_drafter_publish_step = global_step
+            return
+        try:
+            self._ray_get_if_needed(update_result)
+        except Exception:
+            self._speco_restore_last_published_drafter_weights()
+            raise
+        self._speco_record_published_drafter_weights(payload, global_step)
 
     def _wrap_v1_actor_worker(self):
         rollout = self.config.actor_rollout_ref.rollout
@@ -249,25 +543,126 @@ class SpecoV1Mixin:
 
     def on_step_end(self):
         result = super().on_step_end()
-        if getattr(self, "_speco_v1_pending_training", False):
-            publish_metrics = self._speco_publish_drafter_weights(
-                True, getattr(self, "_speco_v1_training_plan", None), after_weight_update=True
-            )
+        # The original V1 publish point follows the parent's actor weight sync.
+        # Preserve it for NPU SHM reloads, then synchronously finalize the
+        # drafter publication before returning to the next trainer step.
+        publish_metrics = self._speco_finalize_v1_drafter_publish()
+        if publish_metrics:
             self._pending_sync_metrics = {
                 **(getattr(self, "_pending_sync_metrics", None) or {}),
                 **publish_metrics,
             }
-            self._speco_v1_pending_training = False
         return result
 
     def _save_checkpoint(self):
+        drafter_results = None
         if self._speco_online_enabled_from_config(self.config):
             self._speco_wait_pending_drafter_publish()
-            self._speco_save_drafter_checkpoint(wait=True)
-        return super()._save_checkpoint()
+            drafter_results = self._speco_save_drafter_checkpoint(wait=True)
+        result = super()._save_checkpoint()
+        if self._speco_online_enabled_from_config(self.config):
+            feature_store = self._speco_snapshot_v1_feature_store_checkpoint()
+            self._speco_write_v1_joint_checkpoint_manifest(
+                drafter_results=drafter_results,
+                feature_store=feature_store,
+            )
+        return result
 
     def on_sample_end(self):
         return super().on_sample_end()
+
+    def prepare_step(self):
+        """Avoid creating an unconsumed rollout at the async loop boundary.
+
+        V1 calls ``prepare_step`` before sampling the current batch.  In
+        ``colocate_async`` that method submits a batch which becomes
+        unconsumed at the final loop boundary, because upstream ``fit``
+        returns immediately after the step.  Its agent-loop request then
+        races Ray's rollout-server teardown and surfaces as an
+        ``ActorDiedError`` or vLLM ``EngineDeadError``.
+
+        Sync mode must retain the parent behavior because it creates the batch
+        consumed by the current step rather than maintaining an async prefetch
+        buffer.  ``separate_async`` must also retain its parent behavior: its
+        final ``prepare_step`` submits the batch that is consumed by the final
+        update, then waits for it and switches hybrid workers back to trainer
+        mode.  The V1 agent-loop drain in ``fit`` makes any post-final queued
+        work safe before teardown.
+        """
+        mode = str(self.config.trainer.v1.get("trainer_mode", "sync")).lower()
+        is_last_step = int(self.global_steps) >= int(self.total_training_steps)
+        if mode == "colocate_async" and is_last_step:
+            logger.info(
+                "SPECO V1 skipping final async rollout prefetch at step=%s; "
+                "the batch cannot be consumed before trainer teardown",
+                self.global_steps,
+            )
+            return {}
+        return super().prepare_step()
+
+    @staticmethod
+    def _speco_v1_drain_agent_loop(agent_loop_manager: Any) -> int:
+        """Wait for all requests submitted before V1 destroys rollout actors."""
+        workers = list(getattr(agent_loop_manager, "agent_loop_workers", None) or [])
+        drain_refs = []
+        for worker in workers:
+            drain = getattr(worker, "speco_drain", None)
+            remote = getattr(drain, "remote", None)
+            if callable(remote):
+                drain_refs.append(remote())
+        if not drain_refs:
+            return 0
+
+        import ray
+
+        ray.get(drain_refs)
+        logger.info(
+            "SPECO V1 drained %s agent-loop workers before rollout teardown",
+            len(drain_refs),
+        )
+        return len(drain_refs)
+
+    def _speco_v1_shutdown_dataloaders(self) -> int:
+        """Stop StatefulDataLoader workers before the owning Ray task exits.
+
+        verl V1 keeps the training iterator alive in ``train_dataloader_it``.
+        If it is left for Ray process teardown, Ray kills the iterator's child
+        processes and PyTorch's SIGCHLD handler reports a misleading
+        ``DataLoader worker ... is killed by signal: Killed`` after the final
+        training step.  StatefulDataLoader currently exposes worker shutdown on
+        its iterator, so clean up every live iterator while the task is still
+        in normal Python control flow.
+        """
+        holders = [(self, "train_dataloader_it")]
+        for loader_name in ("train_dataloader", "val_dataloader"):
+            loader = getattr(self, loader_name, None)
+            if loader is not None:
+                holders.append((loader, "_iterator"))
+
+        shutdown_count = 0
+        seen: set[int] = set()
+        for owner, attribute in holders:
+            iterator = getattr(owner, attribute, None)
+            if iterator is None or id(iterator) in seen:
+                continue
+            seen.add(id(iterator))
+            shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+            if callable(shutdown_workers):
+                shutdown_workers()
+                shutdown_count += 1
+
+        # Drop all references after shutdown so a later destructor cannot race
+        # Ray teardown or attempt to close the same multiprocessing iterator.
+        for owner, attribute in holders:
+            if hasattr(owner, attribute):
+                setattr(owner, attribute, None)
+
+        if shutdown_count:
+            logger.info(
+                "SPECO V1 shut down %s DataLoader iterator(s) before Ray teardown",
+                shutdown_count,
+            )
+        return shutdown_count
 
     def _init_v1_speco_drafter_workers(self):
         from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
@@ -297,8 +692,8 @@ class SpecoV1Mixin:
 
     def _speco_v1_batch_data(self, batch):
         import transfer_queue as tq
-        import torch
         from verl.protocol import DataProto
+        from verl_speco.trainer.v1.batch_adapter import to_legacy_padded_batch
 
         fields = ["prompts", "responses", "input_ids", "response_mask", "position_ids"]
         if bool(self.config.actor_rollout_ref.rollout.get("calculate_log_probs", False)):
@@ -312,21 +707,8 @@ class SpecoV1Mixin:
         data = tq.kv_batch_get(
             keys=batch.keys, partition_id=batch.partition_id, select_fields=fields
         )
-        input_ids = data["input_ids"]
-        if "position_ids" not in data.keys():
-            # Standard V1 agent loops persist position ids.  This fallback is
-            # only for a custom text loop that omits them.
-            input_padded = input_ids.to_padded_tensor(padding=0)
-            sequence_width = input_padded.shape[1]
-            data["position_ids"] = torch.arange(
-                sequence_width, device=input_ids.device
-            ).expand(input_padded.shape[0], -1)
-        if "attention_mask" not in data.keys():
-            lengths = input_ids.offsets().diff()
-            width = int(lengths.max().item()) if lengths.numel() else 0
-            positions = torch.arange(width, device=input_ids.device).unsqueeze(0)
-            data["attention_mask"] = (positions < lengths.unsqueeze(1)).to(torch.int64)
-        return data, DataProto(batch=data.to_padded_tensor())
+        pad_token_id = getattr(getattr(self, "tokenizer", None), "pad_token_id", 0)
+        return data, DataProto(batch=to_legacy_padded_batch(data, pad_token_id or 0))
 
     def _compute_old_log_prob(self, batch, metrics):
         if not self._speco_oldlogprob_collection_enabled():
@@ -486,9 +868,131 @@ class SpecoV1Mixin:
         metrics["actor/entropy"] = entropy_agg.detach().item()
         return updated_batch
 
+    def _speco_v1_spec_decode_sidecar_metrics(self) -> dict[str, float]:
+        """Read cumulative EngineCore counters when RequestOutput has no stats."""
+
+        from verl_speco.integration.vllm_runtime import (
+            read_vllm_spec_decode_sidecar_totals,
+        )
+
+        run_dir = getattr(
+            getattr(getattr(self, "config", None), "trainer", None),
+            "default_local_dir",
+            None,
+        )
+        directory = (
+            os.path.join(os.fspath(run_dir), ".spec_decode_stats")
+            if run_dir
+            else None
+        )
+        current = read_vllm_spec_decode_sidecar_totals(directory)
+        previous = getattr(
+            self,
+            "_speco_vllm_spec_decode_sidecar_previous",
+            {"drafts": 0.0, "accepted_tokens": 0.0, "draft_tokens": 0.0},
+        )
+        self._speco_vllm_spec_decode_sidecar_previous = current
+        drafts = max(0.0, current["drafts"] - float(previous.get("drafts", 0.0)))
+        accepted = max(
+            0.0,
+            current["accepted_tokens"]
+            - float(previous.get("accepted_tokens", 0.0)),
+        )
+        if drafts <= 0.0:
+            return {}
+        return {
+            "drafter/spec_decode/mean_acceptance_length": 1.0
+            + accepted / drafts,
+        }
+
+    def _speco_v1_spec_decode_metrics(self, batch: Any) -> dict[str, float]:
+        """Aggregate SpeCo's vLLM acceptance counters for one V1 global step.
+
+        V1's upstream metric collector only fetches ``extra_fields`` when the
+        upstream MTP feature is enabled.  SpeCo speculative decoding is
+        configured independently, so its counters would otherwise remain in
+        TransferQueue and never reach the trainer logger.
+        """
+        try:
+            import transfer_queue as tq
+        except ImportError:
+            return self._speco_v1_spec_decode_sidecar_metrics()
+
+        try:
+            stats_data = tq.kv_batch_get(
+                keys=batch.keys,
+                partition_id=batch.partition_id,
+                select_fields=["extra_fields"],
+            )
+            extra_fields = stats_data.pop("extra_fields", None)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("SPECO V1 could not read speculative metrics: %s", exc)
+            return self._speco_v1_spec_decode_sidecar_metrics()
+
+        if hasattr(extra_fields, "tolist"):
+            extra_fields = extra_fields.tolist()
+        if not isinstance(extra_fields, list):
+            return self._speco_v1_spec_decode_sidecar_metrics()
+
+        total_drafts = 0.0
+        total_accepted = 0.0
+        tags = list(getattr(batch, "tags", None) or [])
+        for index, fields in enumerate(extra_fields):
+            if index < len(tags) and bool(tags[index].get("is_padding", False)):
+                continue
+            # TransferQueue returns object-backed values for ``extra_fields``
+            # in the live V1 replay-buffer path.  They expose the user dict
+            # through ``.data`` rather than being dict instances themselves.
+            # The initial bridge only covered plain dicts, silently dropping
+            # every real rollout counter.
+            fields = getattr(fields, "data", fields)
+            if not isinstance(fields, dict):
+                continue
+            try:
+                # These are the native verl rollout fields.  In particular,
+                # ToolAgentLoop knows to accumulate them across tool turns.
+                drafts = float(fields.get("spec_num_verify_steps", 0.0) or 0.0)
+                accepted = float(
+                    fields.get("spec_num_accepted_tokens", 0.0) or 0.0
+                )
+            except (TypeError, ValueError):
+                continue
+            total_drafts += max(0.0, drafts)
+            total_accepted += max(0.0, accepted)
+
+        sidecar_metrics = self._speco_v1_spec_decode_sidecar_metrics()
+        if total_drafts <= 0.0:
+            return sidecar_metrics
+        return {
+            "drafter/spec_decode/mean_acceptance_length": 1.0
+            + total_accepted / total_drafts,
+        }
+
+    def _compute_metrics(self, batch, metrics, timing_raw, global_steps, epoch):
+        """Preserve upstream V1 metrics and add SpeCo speculative decoding."""
+        result = super()._compute_metrics(
+            batch, metrics, timing_raw, global_steps, epoch
+        )
+        metrics.update(self._speco_v1_spec_decode_metrics(batch))
+        return result
+
     def _update_actor(self, batch, metrics):
         if not self._speco_online_enabled_from_config(self.config):
             return super()._update_actor(batch, metrics)
+
+        # A V1 global step can contain several local actor updates when
+        # ``parameter_sync_step > 1``.  Those updates all share one global
+        # weight version and one drafter publication boundary, so training the
+        # drafter at every local update would perform multiple optimizer steps
+        # for a single global step.  Let the preceding local updates collect
+        # their features into the data buffer, then schedule exactly once after
+        # the final actor update.
+        parameter_sync_step = max(int(getattr(self, "parameter_sync_step", 1)), 1)
+        local_trigger_step = int(getattr(self, "local_trigger_step", 0))
+        if local_trigger_step < parameter_sync_step - 1:
+            metrics["drafter/training_deferred_to_global_step_end"] = 1
+            return super()._update_actor(batch, metrics)
+
         event = self._speco_on_before_actor_update()
         plan = event.training_plan
         metrics.update(event.metrics or {})
@@ -515,15 +1019,115 @@ class SpecoV1Mixin:
             self._speco_v1_training_plan = plan
         return result
 
+    def _speco_async_prefit_rollout_warmup_enabled(self) -> bool:
+        v1_config = self.config.trainer.v1
+        mode = str(v1_config.get("trainer_mode", "sync")).lower()
+        return mode in {"colocate_async", "separate_async"} and bool(
+            v1_config.get("pre_fit_rollout_warmup", True)
+        )
+
+    def _speco_run_async_prefit_rollout_warmup(self, agent_loop_manager) -> None:
+        """Finish V1's initial rollout batch before the timed training loop.
+
+        Upstream async trainers submit ``num_warmup_batches`` from
+        ``on_train_begin`` but enter step 1 immediately.  The first step then
+        absorbs vLLM/MRV2's first real decode and waits for the replay buffer.
+        Run the same hooks at the upcoming global step and wait for one full
+        training batch here; the batch remains in TQ and is consumed normally
+        by step 1, so this changes timing boundaries rather than training data.
+        """
+
+        if not self._speco_async_prefit_rollout_warmup_enabled():
+            return
+
+        from verl.utils.skip import SkipManager
+
+        self.agent_loop_manager = agent_loop_manager
+        next_global_step = int(getattr(self, "global_steps", 0)) + 1
+        SkipManager.init(self.config)
+        SkipManager.set_step(next_global_step)
+
+        original_global_steps = self.global_steps
+        started = time.perf_counter()
+        try:
+            self.global_steps = next_global_step
+            reissued = int(super()._reissue_inflight_prompts() or 0)
+            super().on_train_begin()
+        finally:
+            self.global_steps = original_global_steps
+
+        mode = str(self.config.trainer.v1.get("trainer_mode", "sync")).lower()
+        mode_config = self.config.trainer.v1.get(mode, {}) or {}
+        skip_rollout = bool(self.config.skip.rollout_tq.get("enable", False))
+        warmup_batches = 0 if skip_rollout else int(
+            mode_config.get("num_warmup_batches", 0) or 0
+        )
+        submitted = warmup_batches * int(self.config.data.train_batch_size)
+        target_count = min(
+            max(reissued + submitted, 0), int(self.config.data.train_batch_size)
+        )
+        if target_count > 0:
+            self.replay_buffer.wait_for_sampleable(
+                next_global_step, "train", target_count
+            )
+
+        # Upstream fit() invokes these hooks after incrementing global_steps.
+        # They have already run for that exact step, so consume those calls once.
+        self._speco_prefit_reissue_consumed = True
+        self._speco_prefit_on_train_begin_consumed = True
+        logger.info(
+            "SPECO V1 async rollout pre-fit warmup completed: step=%s, "
+            "reissued=%s, submitted=%s, sampleable_target=%s, elapsed=%.3fs",
+            next_global_step,
+            reissued,
+            submitted,
+            target_count,
+            time.perf_counter() - started,
+        )
+
+    def prepare_for_fit(self, agent_loop_manager) -> None:
+        """Run expensive V1 activation/warmup before entering trainer.fit()."""
+
+        if bool(getattr(self, "_speco_prepared_for_fit", False)):
+            return
+        if self._speco_online_enabled_from_config(self.config):
+            self._speco_activate_drafter_training_model_before_fit()
+            self._speco_run_async_prefit_rollout_warmup(agent_loop_manager)
+        self._speco_prepared_for_fit = True
+
+    def _reissue_inflight_prompts(self, *args, **kwargs):
+        if bool(getattr(self, "_speco_prefit_reissue_consumed", False)):
+            self._speco_prefit_reissue_consumed = False
+            return 0
+        return super()._reissue_inflight_prompts(*args, **kwargs)
+
+    def on_train_begin(self):
+        if bool(getattr(self, "_speco_prefit_on_train_begin_consumed", False)):
+            self._speco_prefit_on_train_begin_consumed = False
+            logger.info(
+                "SPECO V1 skipped duplicate in-fit warmup submission; "
+                "pre-fit rollout batch is already sampleable"
+            )
+            return None
+        return super().on_train_begin()
+
     def fit(self, agent_loop_manager):
         try:
+            if not bool(getattr(self, "_speco_prepared_for_fit", False)):
+                # Compatibility fallback for callers other than SpecoTaskRunner.
+                self.prepare_for_fit(agent_loop_manager)
+            result = super().fit(agent_loop_manager)
             if self._speco_online_enabled_from_config(self.config):
-                self._speco_activate_drafter_training_model_before_fit()
-            return super().fit(agent_loop_manager)
+                # ``fit`` returns immediately after the final V1 step.  Do not
+                # let its owning Ray worker exit while agent-loop actors still
+                # own vLLM requests or output handlers.
+                self._speco_v1_drain_agent_loop(agent_loop_manager)
+            return result
         finally:
             if self._speco_online_enabled_from_config(self.config):
                 self._speco_wait_pending_drafter_publish()
                 self._speco_wait_pending_drafter_checkpoint()
+            self._speco_v1_shutdown_dataloaders()
 
     def speco_v1_status(self) -> dict[str, Any]:
         """Return diagnostics used by smoke tests and startup logging."""

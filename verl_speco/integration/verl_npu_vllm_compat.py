@@ -471,13 +471,32 @@ class VerlNPUVLLMImportCompatMixin:
 
     def __init__(self, *args, **kwargs):
         from verl_speco.integration.compat import check_compatible_verl
+        from verl_speco.integration.vllm_runtime import install_vllm_runtime_for_worker
 
         check_compatible_verl()
         install_verl_npu_vllm_import_compat()
         install_verl_fsdp_training_output_release_compat()
         install_verl_npu_checkpoint_reclaim()
         install_verl_npu_fsdp2_weight_export_compat()
+        # V1 constructs rollout replicas from inside this WorkerDict process.
+        # Install SPECO's server/EngineCore runtime hooks before upstream
+        # worker initialization resolves the rollout registry.
+        install_vllm_runtime_for_worker(self)
         super().__init__(*args, **kwargs)
+
+    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
+    def init_model(self, *args, **kwargs):
+        # ``rollout.drafter`` is a SPECO extension and is not accepted by
+        # upstream verl's RolloutConfig dataclass. Online-drafter workers also
+        # receive DraftWeightPublishMixin, which already hides it at this
+        # boundary; no-drafter workers do not, so the compatibility mixin must
+        # enforce the same boundary for every V1 vLLM worker.
+        from verl_speco.integration.rollout_publish import (
+            _without_speco_drafter_rollout_config,
+        )
+
+        with _without_speco_drafter_rollout_config(self):
+            return super().init_model(*args, **kwargs)
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
     async def update_weights(self, global_steps: int | None = None, mode: str = "auto"):

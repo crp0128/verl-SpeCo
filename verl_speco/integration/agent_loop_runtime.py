@@ -218,6 +218,16 @@ async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs)
     return _speco_default_agent_loop_extra_fields(result)
 
 
+async def _speco_worker_drain(self) -> None:
+    """A FIFO barrier for requests already submitted to an agent-loop worker.
+
+    Ray executes actor calls in submission order.  A no-op submitted after the
+    trainer's last rollout request therefore completes only after the worker has
+    awaited all preceding agent-loop generation/post-processing work.
+    """
+    return None
+
+
 def _speco_worker_postprocess(
     self, inputs, input_non_tensor_batch=None, validate=False
 ):
@@ -293,6 +303,7 @@ def _build_speco_agent_loop_worker_class(worker_cls):
         "__module__": __name__,
         "__doc__": "Ray-serializable AgentLoopWorker subclass carrying SPECO runtime patches.",
         "__init__": _speco_worker_init,
+        "speco_drain": _speco_worker_drain,
         "_speco_explicit_worker_runtime": True,
     }
     if callable(generate_sequences):
@@ -517,6 +528,10 @@ def install_agent_loop_runtime_patch() -> bool:
 
         worker_cls._postprocess = speco_postprocess
         worker_cls._speco_patched_postprocess = True
+
+    if not getattr(worker_cls, "_speco_patched_drain", False):
+        worker_cls.speco_drain = _speco_worker_drain
+        worker_cls._speco_patched_drain = True
 
     if not getattr(manager_cls, "_speco_patched_init", False):
 

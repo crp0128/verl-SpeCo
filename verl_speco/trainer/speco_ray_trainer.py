@@ -599,6 +599,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def speco_wait_checkpoint(self):
         return self._require_speco_worker_group().wait_checkpoint()
 
+    def speco_get_feature_store_checkpoint_state(self, global_step: int):
+        return self._require_speco_worker_group().get_feature_store_checkpoint_state(
+            global_step
+        )
+
+    def speco_restore_feature_store_checkpoint_state(self, state: dict[str, Any]):
+        return self._require_speco_worker_group().restore_feature_store_checkpoint_state(
+            state
+        )
+
     def init_workers(self):
         drafter_rollout_enabled = self.is_drafter_rollout_enabled(self.config)
         online_drafter_enabled = self.is_drafter_training_enabled(self.config)
@@ -837,6 +847,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_prepare_drafter_checkpoint_for_worker_init(self):
         drafter_cfg = self._speco_drafter_config()
         if drafter_cfg is None:
+            return
+
+        # collect_only persists Feature Store state, not a trainable drafter state.
+        # Requiring draft_step_<N> here would make a valid feature-store-only
+        # checkpoint impossible to resume.
+        if self._speco_drafter_training_mode() == "collect_only":
+            logger.info(
+                "[drafter resume] collect_only mode: skipping drafter checkpoint restore"
+            )
             return
 
         checkpoint_save_enabled = self._speco_drafter_checkpoint_save_config_enabled()
