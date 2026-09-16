@@ -564,9 +564,10 @@ class TorchShardFeatureStore:
 
         if not isinstance(state, dict):
             raise TypeError("Feature-store checkpoint state must be a mapping")
-        if state.get("format") != "torch_shard_feature_store_cursor" or int(
-            state.get("version", 0)
-        ) != 1:
+        if (
+            state.get("format") != "torch_shard_feature_store_cursor"
+            or int(state.get("version", 0)) != 1
+        ):
             raise ValueError("Unsupported feature-store checkpoint cursor format")
         expected_path = str(Path(str(state.get("path", ""))).resolve())
         if expected_path != str(self.path.resolve()):
@@ -591,7 +592,10 @@ class TorchShardFeatureStore:
             )
         prefix = entries[:expected_shards]
         prefix_samples = sum(int(entry.get("num_samples", 0)) for entry in prefix)
-        if prefix_samples != expected_samples or self._manifest_prefix_sha256(prefix) != expected_digest:
+        if (
+            prefix_samples != expected_samples
+            or self._manifest_prefix_sha256(prefix) != expected_digest
+        ):
             raise RuntimeError(
                 "Feature-store checkpoint cursor does not match manifest prefix; "
                 "refusing to resume with rewritten samples"

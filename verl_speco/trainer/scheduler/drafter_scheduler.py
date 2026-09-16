@@ -241,7 +241,7 @@ class DrafterScheduler:
         self, source: DrafterCollectionSource, global_step: object
     ) -> str:
         try:
-            source_global_step = int(global_step)
+            source_global_step = int(str(global_step))
         except (TypeError, ValueError):
             source_global_step = -1
         self._collection_sequence += 1

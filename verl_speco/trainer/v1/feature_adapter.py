@@ -36,7 +36,9 @@ class V1DrafterBatch:
     global_step: int | None = None
 
 
-def from_transfer_queue_batch(batch: Any, *, global_step: int | None = None) -> V1DrafterBatch:
+def from_transfer_queue_batch(
+    batch: Any, *, global_step: int | None = None
+) -> V1DrafterBatch:
     """Build a feature view without assuming a legacy upstream batch container.
 
     ``batch`` may be a TensorDict-like object or a mapping. Missing optional

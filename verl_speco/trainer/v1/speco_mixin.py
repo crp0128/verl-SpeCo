@@ -22,7 +22,7 @@ import logging
 import os
 import tempfile
 import time
-from typing import Any
+from typing import Any, cast
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,7 @@ class SpecoV1Mixin:
     """
 
     speco_worker_cls = None
+    global_steps: int
 
     @staticmethod
     def _speco_v1_standalone_publish_worker_cls(drafter_config=None):
@@ -73,7 +74,9 @@ class SpecoV1Mixin:
         serialized_drafter_config = json.dumps(
             _plain_config(drafter_config or {}), sort_keys=True
         )
-        cached = getattr(SpecoV1Mixin, "_speco_v1_standalone_publish_worker_remote", None)
+        cached = getattr(
+            SpecoV1Mixin, "_speco_v1_standalone_publish_worker_remote", None
+        )
         if (
             cached is not None
             and getattr(
@@ -107,7 +110,9 @@ class SpecoV1Mixin:
         SpecoV1StandalonePublishWorker._speco_drafter_config_env = (
             serialized_drafter_config
         )
-        globals()[SpecoV1StandalonePublishWorker.__name__] = SpecoV1StandalonePublishWorker
+        globals()[SpecoV1StandalonePublishWorker.__name__] = (
+            SpecoV1StandalonePublishWorker
+        )
         cached = ray.remote(SpecoV1StandalonePublishWorker)
         SpecoV1Mixin._speco_v1_standalone_publish_worker_remote = cached
         SpecoV1Mixin._speco_v1_standalone_publish_worker_config = (
@@ -209,9 +214,9 @@ class SpecoV1Mixin:
         return []
 
     def _speco_feature_store_checkpoint_configured(self) -> bool:
-        training = (
-            self.config.actor_rollout_ref.rollout.get("drafter", {}) or {}
-        ).get("training", {}) or {}
+        training = (self.config.actor_rollout_ref.rollout.get("drafter", {}) or {}).get(
+            "training", {}
+        ) or {}
         feature_store = training.get("feature_store", None)
         return bool(feature_store and feature_store.get("path", None))
 
@@ -265,10 +270,14 @@ class SpecoV1Mixin:
             not in {"not_in_training_group", "not_feature_store_leader"}
         ]
         if failures:
-            raise RuntimeError(f"Feature-store checkpoint cursor save failed: {failures}")
+            raise RuntimeError(
+                f"Feature-store checkpoint cursor save failed: {failures}"
+            )
         saved = [result for result in flattened if bool(result.get("saved", False))]
         if not saved:
-            raise RuntimeError("Feature-store checkpoint cursor produced no saved state")
+            raise RuntimeError(
+                "Feature-store checkpoint cursor produced no saved state"
+            )
         return saved
 
     def _speco_write_v1_joint_checkpoint_manifest(
@@ -365,9 +374,7 @@ class SpecoV1Mixin:
                 "Feature-store checkpoint cursor restore failed: "
                 f"{failures or flattened}"
             )
-        logger.info(
-            "SPECO V1 restored Feature Store cursor from step=%s", resume_step
-        )
+        logger.info("SPECO V1 restored Feature Store cursor from step=%s", resume_step)
 
     def attach_speco_worker_group(self, worker_group):
         """Bind V1 drafter workers to the shared SPECO adapter facade."""
@@ -378,7 +385,10 @@ class SpecoV1Mixin:
     @staticmethod
     def _speco_online_enabled_from_config(config) -> bool:
         drafter = config.actor_rollout_ref.rollout.get("drafter", {}) or {}
-        return bool(drafter.get("enable", False) and drafter.get("enable_drafter_training", False))
+        return bool(
+            drafter.get("enable", False)
+            and drafter.get("enable_drafter_training", False)
+        )
 
     def _speco_v1_async_rollout_enabled(self) -> bool:
         mode = str(self.config.trainer.v1.get("trainer_mode", "sync")).lower()
@@ -434,8 +444,8 @@ class SpecoV1Mixin:
             self._speco_prepare_drafter_checkpoint_for_worker_init()
 
         configure_vllm_runtime_from_config(self.config)
-        self._speco_drafter_config_for_worker_wrap = self.config.actor_rollout_ref.rollout.get(
-            "drafter", None
+        self._speco_drafter_config_for_worker_wrap = (
+            self.config.actor_rollout_ref.rollout.get("drafter", None)
         )
         # SPECO translates this extension field into vLLM-native
         # ``engine_kwargs.vllm.speculative_config`` above.  Keep the source
@@ -472,7 +482,7 @@ class SpecoV1Mixin:
             from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
 
             return SpecoRayPPOTrainer._speco_update_rollout_drafter_weights(
-                self, payload, global_step, asynchronous
+                cast(Any, self), payload, global_step, asynchronous
             )
 
         manager = getattr(self, "standalone_server_manager", None)
@@ -528,10 +538,9 @@ class SpecoV1Mixin:
             bases = []
             if not issubclass(raw, VerlNPUVLLMImportCompatMixin):
                 bases.append(VerlNPUVLLMImportCompatMixin)
-            if (
-                bool((drafter_config or rollout.get("drafter", {})).get("enable", False))
-                and not issubclass(raw, DraftWeightPublishMixin)
-            ):
+            if bool(
+                (drafter_config or rollout.get("drafter", {})).get("enable", False)
+            ) and not issubclass(raw, DraftWeightPublishMixin):
                 bases.append(DraftWeightPublishMixin)
             if not bases:
                 continue
@@ -542,7 +551,8 @@ class SpecoV1Mixin:
                     "__module__": __name__,
                     "__doc__": raw.__doc__,
                     "_speco_drafter_config_env": json.dumps(
-                        _plain_config(drafter_config or rollout.get("drafter", {})), sort_keys=True
+                        _plain_config(drafter_config or rollout.get("drafter", {})),
+                        sort_keys=True,
                     ),
                 },
             )
@@ -552,8 +562,9 @@ class SpecoV1Mixin:
     def on_init_end(self):
         result = super().on_init_end()
         online_drafter = bool(
-            self.config.actor_rollout_ref.rollout.get("drafter", {})
-            .get("enable_drafter_training", False)
+            self.config.actor_rollout_ref.rollout.get("drafter", {}).get(
+                "enable_drafter_training", False
+            )
         )
         logger.info(
             "SPECO V1 trainer initialized: mode=%s, online_drafter=%s",
@@ -690,11 +701,17 @@ class SpecoV1Mixin:
         from verl.trainer.ppo.utils import Role
         from verl_speco.workers import SpecoWorker
 
-        actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+        actor_role = (
+            Role.ActorRolloutRef
+            if Role.ActorRolloutRef in self.role_worker_mapping
+            else Role.ActorRollout
+        )
         resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
         worker_cls = self.speco_worker_cls or SpecoWorker
         remote_worker_cls = (
-            worker_cls if hasattr(worker_cls, "__ray_actor_class__") else __import__("ray").remote(worker_cls)
+            worker_cls
+            if hasattr(worker_cls, "__ray_actor_class__")
+            else __import__("ray").remote(worker_cls)
         )
         drafter_cls = RayClassWithInitArgs(
             cls=remote_worker_cls,
@@ -717,7 +734,9 @@ class SpecoV1Mixin:
         from verl_speco.trainer.v1.batch_adapter import to_legacy_padded_batch
 
         fields = ["prompts", "responses", "input_ids", "response_mask", "position_ids"]
-        if bool(self.config.actor_rollout_ref.rollout.get("calculate_log_probs", False)):
+        if bool(
+            self.config.actor_rollout_ref.rollout.get("calculate_log_probs", False)
+        ):
             fields.append("rollout_log_probs")
         if bool(
             self.config.actor_rollout_ref.rollout.get(
@@ -763,7 +782,9 @@ class SpecoV1Mixin:
         control = left_right_2_no_padding(control)
         control[OLD_LOGPROB_COLLECT_MASK_KEY] = collect_plan["collect_mask"]
         control[OLD_LOGPROB_HIDDEN_POSITIONS_KEY] = collect_plan["hidden_positions"]
-        control[OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY] = collect_plan["hidden_position_mask"]
+        control[OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY] = collect_plan[
+            "hidden_position_mask"
+        ]
         control[OLD_LOGPROB_OWNER_RANK_KEY] = collect_plan["owner_rank"]
         tu.assign_non_tensor_data(
             control,
@@ -869,7 +890,9 @@ class SpecoV1Mixin:
             partition_id=batch.partition_id,
             fields=nested_data.select("old_log_probs", "entropy"),
         )
-        if bool(self.config.actor_rollout_ref.rollout.get("calculate_log_probs", False)):
+        if bool(
+            self.config.actor_rollout_ref.rollout.get("calculate_log_probs", False)
+        ):
             from verl.utils.debug.metrics import calculate_debug_metrics
 
             # The V1 batch is normally kept in TransferQueue, so construct the
@@ -922,14 +945,12 @@ class SpecoV1Mixin:
         drafts = max(0.0, current["drafts"] - float(previous.get("drafts", 0.0)))
         accepted = max(
             0.0,
-            current["accepted_tokens"]
-            - float(previous.get("accepted_tokens", 0.0)),
+            current["accepted_tokens"] - float(previous.get("accepted_tokens", 0.0)),
         )
         if drafts <= 0.0:
             return {}
         return {
-            "drafter/spec_decode/mean_acceptance_length": 1.0
-            + accepted / drafts,
+            "drafter/spec_decode/mean_acceptance_length": 1.0 + accepted / drafts,
         }
 
     def _speco_v1_spec_decode_metrics(self, batch: Any) -> dict[str, float]:
@@ -979,9 +1000,7 @@ class SpecoV1Mixin:
                 # These are the native verl rollout fields.  In particular,
                 # ToolAgentLoop knows to accumulate them across tool turns.
                 drafts = float(fields.get("spec_num_verify_steps", 0.0) or 0.0)
-                accepted = float(
-                    fields.get("spec_num_accepted_tokens", 0.0) or 0.0
-                )
+                accepted = float(fields.get("spec_num_accepted_tokens", 0.0) or 0.0)
             except (TypeError, ValueError):
                 continue
             total_drafts += max(0.0, drafts)
@@ -1078,16 +1097,17 @@ class SpecoV1Mixin:
         started = time.perf_counter()
         try:
             self.global_steps = next_global_step
-            reissued = int(super()._reissue_inflight_prompts() or 0)
-            super().on_train_begin()
+            upstream = cast(Any, super())
+            reissued = int(upstream._reissue_inflight_prompts() or 0)
+            upstream.on_train_begin()
         finally:
             self.global_steps = original_global_steps
 
         mode = str(self.config.trainer.v1.get("trainer_mode", "sync")).lower()
         mode_config = self.config.trainer.v1.get(mode, {}) or {}
         skip_rollout = bool(self.config.skip.rollout_tq.get("enable", False))
-        warmup_batches = 0 if skip_rollout else int(
-            mode_config.get("num_warmup_batches", 0) or 0
+        warmup_batches = (
+            0 if skip_rollout else int(mode_config.get("num_warmup_batches", 0) or 0)
         )
         submitted = warmup_batches * int(self.config.data.train_batch_size)
         target_count = min(

@@ -24,6 +24,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Type
 
+
 @lru_cache(maxsize=1)
 def _trainer_types() -> dict[str, Type]:
     from .speco_mixin import SpecoV1Mixin
@@ -36,8 +37,7 @@ def _trainer_types() -> dict[str, Type]:
         )
     except ImportError as exc:  # pragma: no cover - exercised in dependency checks
         raise RuntimeError(
-            "SPECO V1 support requires verl release/v0.9.0 with "
-            "verl.trainer.ppo.v1"
+            "SPECO V1 support requires verl release/v0.9.0 with verl.trainer.ppo.v1"
         ) from exc
 
     class SpecoV1SyncTrainer(SpecoV1Mixin, PPOTrainerSync):
