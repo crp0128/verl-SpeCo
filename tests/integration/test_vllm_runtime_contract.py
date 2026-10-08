@@ -1526,6 +1526,8 @@ def test_vllm_failed_draft_update_does_not_resume_generation(monkeypatch) -> Non
 
 
 def test_vllm_draft_update_pauses_flushes_and_resumes_after_commit(monkeypatch) -> None:
+    from contextlib import nullcontext
+
     import verl_speco.integration.vllm_runtime as runtime
 
     calls = []
@@ -1571,6 +1573,7 @@ def test_vllm_draft_update_pauses_flushes_and_resumes_after_commit(monkeypatch) 
     )
     monkeypatch.setattr(runtime, "_resolve_vllm_draft_update_use_shm", lambda *args: False)
     monkeypatch.setattr(runtime, "patch_verl_bucketed_weight_transfer_shm_reuse", lambda: False)
+    monkeypatch.setattr(runtime, "_ipc_safe_allocator", lambda enabled: nullcontext())
     adapter = SimpleNamespace(
         rollout_rank=0,
         replica_rank=0,
@@ -1594,7 +1597,10 @@ def test_vllm_draft_update_pauses_flushes_and_resumes_after_commit(monkeypatch) 
     assert calls[-2][1] == (9,)
 
 
-def test_vllm_draft_ipc_streams_buckets_without_cloning(monkeypatch) -> None:
+@pytest.mark.parametrize("registers_confidence_head", [True, False])
+def test_vllm_draft_ipc_streams_buckets_without_cloning(
+    monkeypatch, caplog, registers_confidence_head
+) -> None:
     import verl_speco.integration.vllm_runtime as runtime
 
     cache_events = []
@@ -1613,9 +1619,21 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(monkeypatch) -> None:
         def __init__(self):
             self.loaded = []
             self.rebuilds = 0
+            self.param_names = ["fc.weight", "layers.0.norm.weight"]
+            if registers_confidence_head:
+                self.param_names.append("confidence_head.proj.weight")
+
+        def named_parameters(self):
+            return [(name, None) for name in self.param_names]
+
+        def named_buffers(self):
+            return []
 
         def load_weights(self, weights):
             materialized = list(weights)
+            for name, _ in materialized:
+                if name not in self.param_names:
+                    raise KeyError(name)
             self.loaded.append(
                 [(name, tensor.value) for name, tensor in materialized]
             )
@@ -1627,6 +1645,7 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(monkeypatch) -> None:
 
     first_tensor = FakeTensor("first")
     second_tensor = FakeTensor("second")
+    confidence_tensor = FakeTensor("confidence")
 
     class FakeReceiver:
         def __init__(self, *, zmq_handle, device, use_shm):
@@ -1638,7 +1657,11 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(monkeypatch) -> None:
             on_bucket_received([("model.fc.weight", first_tensor)], False)
             first_tensor.value = "overwritten"
             on_bucket_received(
-                [("_orig_mod.model.midlayer.norm.weight", second_tensor)], True
+                [
+                    ("_orig_mod.model.midlayer.norm.weight", second_tensor),
+                    ("model.confidence_head.proj.weight", confidence_tensor),
+                ],
+                True,
             )
 
     receiver_module = types.ModuleType(
@@ -1682,11 +1705,13 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(monkeypatch) -> None:
 
     result = extension.update_draft_weights_from_ipc(use_shm=True)
 
-    assert result == {"loaded_params": 2, "has_draft_model": True}
-    assert inner_model.loaded == [
-        [("fc.weight", "first")],
-        [("layers.0.norm.weight", "second")],
-    ]
+    second_bucket = [("layers.0.norm.weight", "second")]
+    if registers_confidence_head:
+        second_bucket.append(("confidence_head.proj.weight", "confidence"))
+    assert result == {"loaded_params": len(second_bucket) + 1, "has_draft_model": True}
+    assert inner_model.loaded == [[("fc.weight", "first")], second_bucket]
+    skip_logged = "does not register 1 inference-only drafter param" in caplog.text
+    assert skip_logged is not registers_confidence_head
     assert inner_model.rebuilds == 1
     assert extension._speco_draft_runtime_revision == 1
     assert cache_events == ["rebuild", "synchronize", "empty_cache"]

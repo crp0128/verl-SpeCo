@@ -37,6 +37,7 @@ from verl_speco.integration.agent_loop_runtime import (
 )
 from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
 from verl_speco.integration.oldlogprob_runtime import (
+    OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY,
     OLD_LOGPROB_AUX_LAYER_IDS_KEY,
     OLD_LOGPROB_COLLECT_MASK_KEY,
     OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
@@ -132,69 +133,6 @@ def _get_nested(config, path, default=None):
         else:
             current = getattr(current, key, default)
     return current
-
-
-def _speco_cap_online_dspark_validation_batch_size(config) -> int | None:
-    """Apply the SpeCo validation cap before VERL builds its dataloader.
-
-    VERL 0.9 uses the complete validation dataset as one batch when
-    ``data.val_batch_size`` is unset.  With native MRV2 DSpark that batch is
-    further expanded by ``val_kwargs.n`` and can drive the vLLM KV cache to its
-    limit while the auxiliary-hidden-state projection is materialized.
-    Preserve 0.8/MRV1 behavior and explicit data-level values; only the MRV2
-    launcher opts into this cap through ``VLLM_USE_V2_MODEL_RUNNER``.
-    """
-
-    rollout_cfg = _get_nested(config, ("actor_rollout_ref", "rollout"), None)
-    drafter_cfg = _get_nested(rollout_cfg, ("drafter",), None)
-    training_cfg = _get_nested(drafter_cfg, ("training",), None)
-    if (
-        str(_get_nested(rollout_cfg, ("name",), "")).lower() != "vllm"
-        or not bool(_get_nested(drafter_cfg, ("enable",), False))
-        or not bool(_get_nested(drafter_cfg, ("enable_drafter_training",), False))
-        or str(_get_nested(drafter_cfg, ("speculative_algorithm",), "")).upper()
-        != "DSPARK"
-        or str(_get_nested(training_cfg, ("mode",), "online")).lower() != "online"
-        or os.getenv("VLLM_USE_V2_MODEL_RUNNER", "").lower() not in {"1", "true", "yes"}
-    ):
-        return None
-
-    data_cfg = _get_nested(config, ("data",), None)
-    if data_cfg is None:
-        return None
-    explicit_batch_size = _get_nested(data_cfg, ("val_batch_size",), None)
-    if explicit_batch_size is not None:
-        return int(explicit_batch_size)
-
-    configured_batch_size = _get_nested(training_cfg, ("validation_batch_size",), None)
-    if configured_batch_size is None:
-        return None
-    if isinstance(configured_batch_size, bool):
-        raise ValueError(
-            "actor_rollout_ref.rollout.drafter.training.validation_batch_size "
-            "must be a positive integer or null"
-        )
-    try:
-        validation_batch_size = int(configured_batch_size)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "actor_rollout_ref.rollout.drafter.training.validation_batch_size "
-            "must be a positive integer or null"
-        ) from exc
-    if validation_batch_size <= 0:
-        raise ValueError(
-            "actor_rollout_ref.rollout.drafter.training.validation_batch_size "
-            "must be a positive integer or null"
-        )
-
-    with open_dict(data_cfg):
-        data_cfg["val_batch_size"] = validation_batch_size
-    logger.warning(
-        "SPECO bounded native MRV2 DSpark validation to %d prompts per batch before "
-        "val_kwargs.n expansion",
-        validation_batch_size,
-    )
-    return validation_batch_size
 
 
 def _speco_alpha_counter(value: int) -> str:
@@ -460,9 +398,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def __init__(self, *args, **kwargs):
         self.speco_worker_cls = kwargs.pop("speco_worker_cls", None)
-        config = kwargs.get("config", args[0] if args else None)
-        if config is not None:
-            _speco_cap_online_dspark_validation_batch_size(config)
         super().__init__(*args, **kwargs)
         self.drafter_wg = None
         self._drafter_scheduler = DrafterScheduler()
@@ -1248,6 +1183,23 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return resolve_drafter_hidden_states_layout(
             algorithm, self._speco_drafter_training_config()
         )
+
+    def _speco_oldlogprob_aux_layer_id_space(self) -> str:
+        algorithm = (
+            str(
+                _get_nested(
+                    self._speco_drafter_config(),
+                    ("speculative_algorithm",),
+                    "EAGLE3",
+                )
+                or "EAGLE3"
+            )
+            .strip()
+            .upper()
+        )
+        # EAGLE3 config IDs are the same output IDs passed to vLLM serve.
+        # DFlash-family and EAGLE1/2 IDs remain decoder-layer indices.
+        return "output" if algorithm == "EAGLE3" else "decoder"
 
     @staticmethod
     def _speco_oldlogprob_window_train_rows(training_cfg) -> int:
@@ -2579,6 +2531,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 batch_td,
                 OLD_LOGPROB_AUX_LAYER_IDS_KEY,
                 self._speco_oldlogprob_aux_layer_ids(),
+            )
+            tu.assign_non_tensor_data(
+                batch_td,
+                OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY,
+                self._speco_oldlogprob_aux_layer_id_space(),
             )
             tu.assign_non_tensor_data(
                 batch_td,
