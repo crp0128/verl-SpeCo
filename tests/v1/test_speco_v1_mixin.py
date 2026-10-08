@@ -208,9 +208,7 @@ def test_v1_metrics_report_speco_mean_acceptance_length(monkeypatch):
     assert metrics["upstream/metrics"] == 1
 
 
-def test_v1_metrics_fall_back_to_engine_core_acceptance_sidecars(
-    monkeypatch, tmp_path
-):
+def test_v1_metrics_fall_back_to_engine_core_acceptance_sidecars(monkeypatch, tmp_path):
     stats_dir = tmp_path / ".spec_decode_stats"
     stats_dir.mkdir()
     (stats_dir / "engine-10.counters").write_text("4 6 28\n", encoding="ascii")
@@ -272,7 +270,9 @@ def test_async_publish_waits_after_upstream_weight_sync():
         ("publish", True),
         "wait_publish",
     ]
-    assert trainer._pending_sync_metrics["drafter/publish_waited_after_weight_sync"] == 2
+    assert (
+        trainer._pending_sync_metrics["drafter/publish_waited_after_weight_sync"] == 2
+    )
     assert trainer._speco_v1_pending_training is False
 
 
@@ -541,7 +541,10 @@ def test_joint_checkpoint_manifest_records_drafter_and_feature_store(tmp_path):
     assert payload["feature_store"] == [{"saved": True, "cursor": {"version": 1}}]
 
 
-def test_feature_store_resume_deduplicates_identical_worker_cursors(tmp_path):
+@pytest.mark.parametrize("writer_index", [1, 3])
+def test_feature_store_resume_deduplicates_shared_worker_cursors(
+    tmp_path, writer_index
+):
     cursor = {
         "format": "torch_shard_feature_store_cursor",
         "version": 1,
@@ -583,7 +586,10 @@ def test_feature_store_resume_deduplicates_identical_worker_cursors(tmp_path):
                 "global_step": 1,
                 "feature_store": [
                     {"saved": True, "cursor": cursor},
-                    {"saved": True, "cursor": dict(cursor)},
+                    {
+                        "saved": True,
+                        "cursor": {**cursor, "next_shard_index": writer_index},
+                    },
                 ],
             }
         ),
@@ -592,7 +598,71 @@ def test_feature_store_resume_deduplicates_identical_worker_cursors(tmp_path):
 
     harness = Harness()
     harness._speco_restore_v1_feature_store_checkpoint()
-    assert harness.restored_cursor == cursor
+    assert harness.restored_cursor == {**cursor, "next_shard_index": writer_index}
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("submission_failure", [False, True])
+def test_separate_async_publish_failure_rolls_back_standalone_workers(
+    monkeypatch, asynchronous, submission_failure
+):
+    pytest.importorskip("ray")
+    from verl.single_controller.ray import base
+
+    calls = []
+    workers = [object(), object()]
+
+    class WorkerGroup:
+        def __init__(self, *, worker_handles, ray_cls_with_init):
+            assert worker_handles == workers
+
+        def update_draft_weights(self, payload, global_steps):
+            calls.append(("sync", payload, global_steps))
+            if submission_failure and payload == "new":
+                raise RuntimeError("replica failure")
+            return payload
+
+        def update_draft_weights_async(self, payload, global_steps):
+            calls.append(("async", payload, global_steps))
+            if submission_failure:
+                raise RuntimeError("replica failure")
+            return payload
+
+    monkeypatch.setattr(base, "RayWorkerGroup", WorkerGroup)
+    monkeypatch.setattr(base, "RayClassWithInitArgs", lambda **kwargs: kwargs)
+
+    class Harness(SpecoV1Mixin):
+        config = _config(mode="separate_async")
+        standalone_server_manager = types.SimpleNamespace(
+            get_replicas=lambda: [types.SimpleNamespace(workers=workers)]
+        )
+        _speco_last_published_drafter_payload = "old"
+        _speco_last_published_drafter_step = 7
+
+        @staticmethod
+        def _speco_v1_standalone_publish_worker_cls():
+            return object()
+
+        def _speco_actor_rollout_method(self, name):
+            pytest.fail("separate_async must not publish to the hybrid actor worker")
+
+        def _ray_get_if_needed(self, value):
+            if value == "new":
+                raise RuntimeError("replica failure")
+            return value
+
+    trainer = Harness()
+    with pytest.raises(RuntimeError, match="replica failure"):
+        trainer._speco_update_rollout_drafter_weights("new", 8, asynchronous)
+        if asynchronous:
+            trainer._speco_wait_pending_drafter_publish_rpc()
+
+    assert calls == [
+        ("async" if asynchronous else "sync", "new", 8),
+        ("sync", "old", 7),
+    ]
+    assert trainer._speco_last_published_drafter_payload == "old"
+    assert trainer._speco_last_published_drafter_step == 7
 
 
 def test_feature_store_resume_rejects_conflicting_worker_cursors(tmp_path):
@@ -651,7 +721,9 @@ def test_collect_only_resume_skips_drafter_checkpoint_resolution():
 def test_setup_resolves_drafter_before_upstream_and_creates_worker_after(monkeypatch):
     events = []
     runtime = types.ModuleType("verl_speco.integration.vllm_runtime")
-    runtime.configure_vllm_runtime_from_config = lambda config: events.append("configure")
+    runtime.configure_vllm_runtime_from_config = lambda config: events.append(
+        "configure"
+    )
     monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
 
     class Upstream:
@@ -692,7 +764,9 @@ def test_setup_resolves_drafter_before_upstream_and_creates_worker_after(monkeyp
 def test_init_creates_drafter_before_first_rollout_weight_update(monkeypatch):
     events = []
     runtime = types.ModuleType("verl_speco.integration.vllm_runtime")
-    runtime.configure_vllm_runtime_from_config = lambda config: events.append("configure")
+    runtime.configure_vllm_runtime_from_config = lambda config: events.append(
+        "configure"
+    )
     monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
 
     class Upstream:

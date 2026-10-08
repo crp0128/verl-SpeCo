@@ -2166,7 +2166,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             )
             return
         try:
-            result = self._speco_actor_rollout_method("update_draft_weights")(
+            result = self._speco_drafter_publish_method("update_draft_weights")(
                 payload,
                 global_steps=getattr(self, "_speco_last_published_drafter_step", 0),
             )
@@ -2174,25 +2174,29 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         except Exception:
             logger.exception("SPECO drafter rollback after publish failure failed")
 
+    def _speco_drafter_publish_method(self, method_name: str):
+        return self._speco_actor_rollout_method(method_name)
+
     def _speco_update_rollout_drafter_weights(
         self, payload: Any, global_step: object, asynchronous: bool
     ) -> None:
         method_name = (
             "update_draft_weights_async" if asynchronous else "update_draft_weights"
         )
-        update_result = self._speco_actor_rollout_method(method_name)(
-            payload, global_steps=global_step
-        )
+        try:
+            update_result = self._speco_drafter_publish_method(method_name)(
+                payload, global_steps=global_step
+            )
+            if not asynchronous:
+                self._ray_get_if_needed(update_result)
+        except Exception:
+            self._speco_restore_last_published_drafter_weights()
+            raise
         if asynchronous:
             self._pending_drafter_publish_refs = update_result
             self._pending_drafter_publish_payload = payload
             self._pending_drafter_publish_step = global_step
         else:
-            try:
-                self._ray_get_if_needed(update_result)
-            except Exception:
-                self._speco_restore_last_published_drafter_weights()
-                raise
             self._speco_record_published_drafter_weights(payload, global_step)
 
     def _speco_publish_drafter_weights(
