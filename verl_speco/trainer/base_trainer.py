@@ -59,6 +59,47 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 device_name = get_device_name()
 
+
+def _drafter_memory_snapshot() -> dict[str, int]:
+    """Return cheap process/host memory counters for diagnosing post-step stalls."""
+    snapshot: dict[str, int] = {}
+    try:
+        with open("/proc/self/status", encoding="utf-8") as status_file:
+            for line in status_file:
+                if line.startswith(("VmRSS:", "VmHWM:")):
+                    fields = line.split()
+                    snapshot[fields[0].rstrip(":").lower()] = int(fields[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as meminfo_file:
+            for line in meminfo_file:
+                if line.startswith(("MemTotal:", "MemAvailable:")):
+                    fields = line.split()
+                    snapshot[fields[0].rstrip(":").lower()] = int(fields[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    return snapshot
+
+
+def _log_drafter_phase(rank: Any, phase: str, started_at: float, **extra: Any) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    memory = _drafter_memory_snapshot()
+    details = " ".join(f"{key}={value}" for key, value in extra.items())
+    logger.debug(
+        "[DrafterTiming rank=%s] phase=%s elapsed_s=%.3f rss_bytes=%s "
+        "hwm_bytes=%s host_available_bytes=%s host_total_bytes=%s%s",
+        rank,
+        phase,
+        time.perf_counter() - started_at,
+        memory.get("vmrss"),
+        memory.get("vmhwm"),
+        memory.get("memavailable"),
+        memory.get("memtotal"),
+        f" {details}" if details else "",
+    )
+
 _ALIGNMENT_DEBUG_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG"
 _ALIGNMENT_DEBUG_EVERY_N_STEPS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_EVERY_N_STEPS"
 _ALIGNMENT_DEBUG_MAX_SAMPLES_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_MAX_SAMPLES_PER_STEP"
@@ -484,6 +525,7 @@ class DrafterBaseTrainer:
         self.current_rl_step = 0
         self.buffer_version = 0
 
+        training_cfg = config.rollout.drafter.training
         self.device_id = get_device_id()
         self.device_module = get_torch_device()
         self.runtime_device = (
@@ -491,9 +533,16 @@ class DrafterBaseTrainer:
             if device_name != "cpu"
             else torch.device("cpu")
         )
-        self.copy_stream = self._create_copy_stream()
-
-        training_cfg = config.rollout.drafter.training
+        # A colocated online drafter shares an Ascend device with the actor
+        # worker.  The optional D2H copy stream is an optimization only; on
+        # stream-constrained devices it can prevent later HCCL communicator
+        # initialization.  Keep the optimized default, with a per-run escape
+        # hatch for the constrained topology.
+        self.copy_stream = (
+            self._create_copy_stream()
+            if bool(training_cfg.get("use_copy_stream", True))
+            else None
+        )
         self.is_offload_param = bool(training_cfg.get("is_offload_param", False))
         self.is_offload_optimizer = bool(
             training_cfg.get("is_offload_optimizer", False)
@@ -648,9 +697,19 @@ class DrafterBaseTrainer:
                 else getattr(actor_config, "strategy", "")
             )
         )
+        training_config = getattr(
+            getattr(getattr(self.config, "rollout", None), "drafter", None),
+            "training",
+            {},
+        )
+        force_full_shard = bool(
+            training_config.get("use_full_shard_fsdp_mesh", False)
+            if hasattr(training_config, "get")
+            else getattr(training_config, "use_full_shard_fsdp_mesh", False)
+        )
         return (
             device_name == "npu"
-            and str(actor_strategy).lower() == "veomni"
+            and (str(actor_strategy).lower() == "veomni" or force_full_shard)
             and getattr(self.backend, "model_type", None) == "dspark"
             and self.training_device_mesh is not None
             and self.dp_group_world_size > 1
@@ -670,20 +729,13 @@ class DrafterBaseTrainer:
         return device_name == "npu" and str(actor_strategy).lower() == "veomni"
 
     def _should_park_drafter_hccl(self) -> bool:
-        actor_config = getattr(self.config, "actor", None)
-        actor_strategy = (
-            ""
-            if actor_config is None
-            else (
-                actor_config.get("strategy", "")
-                if hasattr(actor_config, "get")
-                else getattr(actor_config, "strategy", "")
-            )
-        )
+        # HCCL stream ownership is per physical NPU, not per actor strategy.
+        # Online DSpark can therefore need parking with FSDP2 just as it does
+        # with VeOmni; limiting this to VeOmni leaves colocated FSDP2 actor
+        # all-reduces competing with an idle drafter communicator.
         return (
             self.park_hccl_after_drafter_training
             and device_name == "npu"
-            and str(actor_strategy).lower() == "veomni"
             and getattr(self.backend, "model_type", None) == "dspark"
         )
 
@@ -692,12 +744,27 @@ class DrafterBaseTrainer:
 
         if not self._should_park_drafter_hccl() or not dist.is_initialized():
             return
+        park_started = time.perf_counter()
+
+        mesh_groups: list[Any] = []
+        if self.fsdp_device_mesh is not None:
+            mesh_ndim = int(getattr(self.fsdp_device_mesh, "ndim", 1))
+            if mesh_ndim == 1:
+                mesh_groups.append(self.fsdp_device_mesh.get_group())
+            else:
+                # FSDP2 can retain a named DP/SP mesh. DeviceMesh.get_group()
+                # requires an explicit dimension for that case.
+                mesh_dim_names = getattr(self.fsdp_device_mesh, "mesh_dim_names", None)
+                if mesh_dim_names is not None:
+                    mesh_groups.extend(
+                        self.fsdp_device_mesh.get_group(mesh_dim)
+                        for mesh_dim in mesh_dim_names
+                    )
 
         groups: list[Any] = []
         for group in (
-            self.fsdp_device_mesh.get_group()
-            if self.fsdp_device_mesh is not None
-            else None,
+            dist.group.WORLD,
+            *mesh_groups,
             self.training_process_group,
             self.data_parallel_process_group,
         ):
@@ -719,9 +786,27 @@ class DrafterBaseTrainer:
                 return
             group_backends.append((delete_store_key, abort_hccl))
 
-        sync_group = groups[0] if groups else None
-        if sync_group is not None and dist.get_world_size(group=sync_group) > 1:
-            dist.barrier(group=sync_group)
+        # Every rank has completed the FSDP state-dict collective before it can
+        # reach this point.  Use WORLD once as the unambiguous ordering boundary
+        # before aborting WORLD and its derived DP/SP communicators.  Sequential
+        # barriers over overlapping mesh dimensions can otherwise introduce a
+        # rank-dependent communicator order.
+        world_size = dist.get_world_size(group=dist.group.WORLD)
+        if world_size > 1:
+            barrier_started_at = time.perf_counter()
+            logger.debug(
+                "[DrafterTiming rank=%s] phase=park_barrier_start group=world group_size=%s",
+                self.rank,
+                world_size,
+            )
+            dist.barrier(group=dist.group.WORLD)
+            _log_drafter_phase(
+                self.rank,
+                "park_barrier_done",
+                barrier_started_at,
+                group="world",
+                group_size=world_size,
+            )
         if hasattr(self.device_module, "synchronize"):
             self.device_module.synchronize()
 
@@ -733,6 +818,12 @@ class DrafterBaseTrainer:
             self.device_module.synchronize()
         if hasattr(self.device_module, "empty_cache"):
             self.device_module.empty_cache()
+        logger.warning(
+            "[speco timing] drafter_hccl_park_s=%.3f rank=%s groups=%s",
+            time.perf_counter() - park_started,
+            self.rank,
+            len(groups),
+        )
 
     def _offload_optimizer_state_to_cpu(self) -> None:
         if self.optimizer is None or not self.optimizer.state:
@@ -786,7 +877,7 @@ class DrafterBaseTrainer:
             flattened_mesh = mesh._flatten(mesh_dim_name="fsdp")
         if dist.get_rank() == int(flattened_mesh.mesh.reshape(-1)[0].item()):
             logger.info(
-                "[drafter-fsdp] NPU VeOmni DSpark uses a 1D full-shard mesh "
+                "[drafter-fsdp] NPU DSpark uses a 1D full-shard mesh "
                 "across %s ranks instead of dp=%s x sp=%s HSDP "
                 "reuse_default_world_group=%s",
                 flattened_mesh.size(),
@@ -1381,9 +1472,26 @@ class DrafterBaseTrainer:
 
     def _get_trainable_state_dict(self) -> dict[str, torch.Tensor]:
         """Get floating state dict entries excluding weights shared with the target model."""
-        if isinstance(self.model, FSDP) or (
-            self.training_device_mesh is not None and dist.is_initialized()
-        ):
+        if self.training_device_mesh is not None and dist.is_initialized():
+            # FSDP2 state-dict extraction is collective across the complete
+            # device mesh.  Every rank must enter it, while cpu_offload keeps
+            # the materialized full state on rank 0 only.  Excluding frozen
+            # parameters before the gather avoids a second CPU copy of target
+            # embeddings/heads that hot publish will discard anyway.
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions,
+                get_model_state_dict,
+            )
+
+            full_state_dict = get_model_state_dict(
+                self.model,
+                options=StateDictOptions(
+                    full_state_dict=True,
+                    cpu_offload=True,
+                    ignore_frozen_params=True,
+                ),
+            )
+        elif isinstance(self.model, FSDP):
             full_state_dict = get_fsdp_full_state_dict(
                 self.model, offload_to_cpu=True, rank0_only=True
             )
@@ -2058,6 +2166,9 @@ class DrafterBaseTrainer:
         # 将模型和优化器状态从CPU加载到GPU，激活草稿模型进入训练状态
         start_ts = time.time()
         activation_stage = "enter"
+        build_draft_model_sec = 0.0
+        model_restore_sec = 0.0
+        optimizer_restore_sec = 0.0
         try:
             logger.debug(
                 f"[Trainer rank {getattr(self, 'rank', -1)}] activate_training_model enter "
@@ -2082,7 +2193,9 @@ class DrafterBaseTrainer:
                     "Draft Model not initialized, calling build_draft_model during activation..."
                 )
                 activation_stage = "build_draft_model"
+                build_started = time.perf_counter()
                 self._build_draft_model()
+                build_draft_model_sec = time.perf_counter() - build_started
 
             # 只有当配置了 offload 或者当前模型不在 CUDA 上时执行加载
             first_param = next(self.model.parameters(), None)
@@ -2093,7 +2206,9 @@ class DrafterBaseTrainer:
             if self.is_offload_param or not is_on_cuda:
                 # 调用工具将 FSDP 分片移动到 GPU
                 activation_stage = "load_draft_model"
+                model_restore_started = time.perf_counter()
                 load_fsdp_model_to_gpu(self.model)
+                model_restore_sec = time.perf_counter() - model_restore_started
                 logger.debug("Loaded drafter model to GPU for training")
 
             if self.optimizer is not None and (
@@ -2103,7 +2218,9 @@ class DrafterBaseTrainer:
                 # 获取 device_id,否则在多卡环境优化器状态可能全部挤在 cuda:0 导致 OOM
                 current_dev_id = get_device_id()
                 activation_stage = "load_draft_optimizer"
+                optimizer_restore_started = time.perf_counter()
                 load_fsdp_optimizer(optimizer=self.optimizer, device_id=current_dev_id)
+                optimizer_restore_sec = time.perf_counter() - optimizer_restore_started
                 logger.debug("Loaded drafter optimizer to GPU for training")
 
             activation_stage = "load_target_lm_head"
@@ -2117,6 +2234,15 @@ class DrafterBaseTrainer:
             logger.debug(
                 f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] activate_training_model success "
                 f"elapsed={time.time() - start_ts:.2f}s"
+            )
+            logger.warning(
+                "[speco timing] drafter_activation_s=%.3f build_s=%.3f "
+                "model_restore_s=%.3f optimizer_restore_s=%.3f rank=%s",
+                time.time() - start_ts,
+                build_draft_model_sec,
+                model_restore_sec,
+                optimizer_restore_sec,
+                self.rank,
             )
             return True
 
@@ -3289,6 +3415,10 @@ class DrafterBaseTrainer:
                 "hidden_last_hidden_filter": batch.get("hidden_last_hidden_filter"),
                 "hidden_last_hidden_select": batch.get("hidden_last_hidden_select"),
                 "global_step": _batch_item_int(batch.get("global_step"), i),
+                "collection_id": batch.get("collection_id"),
+                "collection_source_global_step": _batch_item_int(
+                    batch.get("collection_source_global_step"), i
+                ),
             }
 
             if alignment_debug_enabled():
@@ -4659,6 +4789,18 @@ class DrafterBaseTrainer:
             for item in trainable_data
             if item is not None
         ]
+        # ``step`` is deliberately mutable DataBuffer retention metadata.
+        # Collection source steps are immutable transaction versions and are
+        # therefore the only safe version to compare across workers.
+        collection_source_steps = [
+            int(
+                item.get(
+                    "collection_source_global_step", item.get("step", current_step)
+                )
+            )
+            for item in trainable_data
+            if item is not None
+        ]
         return {
             "current_step": current_step,
             "current_step_samples": len(current_step_data),
@@ -4672,7 +4814,10 @@ class DrafterBaseTrainer:
             "same_step_data_required": same_step_data_required,
             "target_version": getattr(self, "_target_lm_head_weight_step", None),
             "buffer_version": self.buffer_version,
-            "data_version": max(sample_steps) if sample_steps else None,
+            "data_version": (
+                max(collection_source_steps) if collection_source_steps else None
+            ),
+            "collection_source_steps": sorted(set(collection_source_steps)),
             "min_sample_step": effective_min_sample_step,
             "max_sample_step": effective_max_sample_step,
         }
@@ -5287,12 +5432,48 @@ class DrafterBaseTrainer:
 
     def prepare_model_state_dict_for_publish(self, global_step: Optional[int]) -> bool:
         """Snapshot trainable drafter weights before cleanup/offload for fast publish."""
+        snapshot_started_at = time.perf_counter()
+        logger.debug(
+            "[DrafterTiming rank=%s] phase=publish_snapshot_start step=%s",
+            self.rank,
+            global_step,
+        )
         self.clear_pending_publish_state_dict()
+        # All FSDP ranks must enter the state-dict collective.  With a full
+        # cpu-offloaded FSDP2 state dict only global rank 0 materializes the
+        # payload; the remaining ranks return an empty mapping after taking
+        # part in the gather.
         step = int(global_step) if global_step is not None else None
+        state_dict_started_at = time.perf_counter()
         state_dict = self.get_model_state_dict()
+        tensor_count = len(state_dict) if state_dict else 0
+        payload_bytes = (
+            sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in state_dict.values()
+                if isinstance(tensor, torch.Tensor)
+            )
+            if state_dict
+            else 0
+        )
+        _log_drafter_phase(
+            self.rank,
+            "publish_snapshot_get_state_dict_done",
+            state_dict_started_at,
+            tensors=tensor_count,
+            payload_bytes=payload_bytes,
+        )
         self._pending_publish_state_dict = state_dict
         self._pending_publish_step = step
         self._pending_publish_ready = True
+        _log_drafter_phase(
+            self.rank,
+            "publish_snapshot_done",
+            snapshot_started_at,
+            tensors=tensor_count,
+            payload_bytes=payload_bytes,
+            step=step,
+        )
         return bool(state_dict)
 
     def pop_model_state_dict_for_publish(
@@ -5320,9 +5501,20 @@ class DrafterBaseTrainer:
     async def cleanup_training(self, clear_data: bool = True):
         # First set training as inactive to prevent further steps
         self._training_active = False
+        cleanup_started_at = time.perf_counter()
+        logger.debug(
+            "[DrafterTiming rank=%s] phase=cleanup_start clear_data=%s",
+            self.rank,
+            clear_data,
+        )
 
         # Wait for any pending async checkpoint save to complete
         if self._pending_checkpoint_future is not None:
+            checkpoint_wait_started_at = time.perf_counter()
+            logger.debug(
+                "[DrafterTiming rank=%s] phase=cleanup_checkpoint_wait_start",
+                self.rank,
+            )
             logger.debug(
                 f"[Rank {self.rank}] Waiting for pending checkpoint save to complete..."
             )
@@ -5334,7 +5526,15 @@ class DrafterBaseTrainer:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Pending checkpoint save failed: {e}")
             self._pending_checkpoint_future = None
+            _log_drafter_phase(
+                self.rank, "cleanup_checkpoint_wait_done", checkpoint_wait_started_at
+            )
         if self._pending_full_checkpoint_future is not None:
+            full_checkpoint_wait_started_at = time.perf_counter()
+            logger.debug(
+                "[DrafterTiming rank=%s] phase=cleanup_full_checkpoint_wait_start",
+                self.rank,
+            )
             logger.debug(
                 f"[Rank {self.rank}] Waiting for pending full drafter checkpoint save to complete..."
             )
@@ -5346,6 +5546,11 @@ class DrafterBaseTrainer:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Pending full drafter checkpoint save failed: {e}")
             self._pending_full_checkpoint_future = None
+            _log_drafter_phase(
+                self.rank,
+                "cleanup_full_checkpoint_wait_done",
+                full_checkpoint_wait_started_at,
+            )
         if self.optimizer is not None:
             try:
                 self.optimizer.zero_grad(set_to_none=True)
@@ -5364,28 +5569,61 @@ class DrafterBaseTrainer:
                 "[Rank %s] Skipped heavy drafter cleanup; model/optimizer stay on runtime device",
                 self.rank,
             )
+            _log_drafter_phase(self.rank, "cleanup_done_lightweight", cleanup_started_at)
             return
 
         # Training and publish collectives have completed before cleanup. These
         # process groups stay alive across triggers, so barriers here only
         # serialize ranks and can add timeout windows without releasing memory.
 
-        if self.model is not None:
+        if self.model is not None and self.is_offload_param:
+            offload_model_started_at = time.perf_counter()
             try:
                 offload_fsdp_model_to_cpu(self.model)
-                logger.debug("Offloaded drafter model to CPU after training")
+                _log_drafter_phase(
+                    self.rank, "cleanup_model_offload_done", offload_model_started_at
+                )
             except Exception as e:  # noqa: BLE001
+                _log_drafter_phase(
+                    self.rank,
+                    "cleanup_model_offload_failed",
+                    offload_model_started_at,
+                    error=type(e).__name__,
+                )
                 logger.debug(f"Failed to offload drafter model during cleanup: {e}")
-        if self.optimizer is not None:
+        elif self.model is not None:
+            logger.debug(
+                "[Rank %s] Keeping drafter model on runtime device after training; "
+                "is_offload_param=False",
+                self.rank,
+            )
+        if self.optimizer is not None and self.is_offload_optimizer:
+            offload_optimizer_started_at = time.perf_counter()
             try:
                 self._offload_optimizer_state_to_cpu()
-                logger.debug("Offloaded drafter optimizer state to CPU after training")
+                _log_drafter_phase(
+                    self.rank,
+                    "cleanup_optimizer_offload_done",
+                    offload_optimizer_started_at,
+                )
             except Exception as e:  # noqa: BLE001
+                _log_drafter_phase(
+                    self.rank,
+                    "cleanup_optimizer_offload_failed",
+                    offload_optimizer_started_at,
+                    error=type(e).__name__,
+                )
                 if self._use_blocking_npu_optimizer_offload():
                     raise RuntimeError(
                         "NPU VeOmni drafter optimizer blocking offload failed during cleanup"
                     ) from e
                 logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
+        elif self.optimizer is not None:
+            logger.debug(
+                "[Rank %s] Keeping drafter optimizer on runtime device after training; "
+                "is_offload_optimizer=False",
+                self.rank,
+            )
         try:
             self._move_target_lm_head("cpu")
         except Exception as e:  # noqa: BLE001
@@ -5398,14 +5636,21 @@ class DrafterBaseTrainer:
             self._full_checkpoint_executor.shutdown(wait=False)
             self._full_checkpoint_executor = None
         if device_name != "cpu" and hasattr(self.device_module, "empty_cache"):
+            empty_cache_started_at = time.perf_counter()
             if hasattr(self.device_module, "synchronize"):
                 self.device_module.synchronize()
             self.device_module.empty_cache()
+            _log_drafter_phase(
+                self.rank, "cleanup_empty_cache_done", empty_cache_started_at
+            )
+        park_started_at = time.perf_counter()
         self._park_idle_drafter_hccl()
+        _log_drafter_phase(self.rank, "cleanup_drafter_hccl_park_done", park_started_at)
         self._training_initialized = False
         self._training_active = False
         self._last_ckpt_step = -1
         self.training_steps = 0
+        _log_drafter_phase(self.rank, "cleanup_done", cleanup_started_at)
 
     async def release_training_memory_after_activation(self):
         """Release runtime-device memory after a pre-fit activation warmup."""

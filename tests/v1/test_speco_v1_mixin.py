@@ -50,6 +50,34 @@ def _config(*, mode="sync", bypass=False, rollout_name="vllm"):
     )
 
 
+def test_v1_worker_drafter_payload_keeps_runtime_acceptance_sidecar(monkeypatch):
+    from verl_speco.integration.drafter_config_env import SPECO_DRAFTER_CONFIG_ENV
+    from verl_speco.trainer.v1.speco_mixin import (
+        _serialize_v1_worker_drafter_config,
+    )
+
+    monkeypatch.setenv(
+        SPECO_DRAFTER_CONFIG_ENV,
+        json.dumps(
+            {
+                "enable": True,
+                "_speco_acceptance_stats_dir": "/tmp/run/.spec_decode_stats/run-123",
+            }
+        ),
+    )
+
+    payload = json.loads(
+        _serialize_v1_worker_drafter_config(
+            {"enable": True, "model_path": "/models/drafter"}
+        )
+    )
+
+    assert payload["model_path"] == "/models/drafter"
+    assert payload["_speco_acceptance_stats_dir"] == (
+        "/tmp/run/.spec_decode_stats/run-123"
+    )
+
+
 def test_worker_group_facade_delegates_attach_and_require(monkeypatch):
     attached = []
     worker_group = object()
@@ -487,6 +515,10 @@ def test_async_prefit_warmup_is_sampleable_before_upstream_fit(monkeypatch):
             self.global_steps = 0
             self.replay_buffer = ReplayBuffer()
 
+        def _speco_park_actor_hccl_for_drafter(self):
+            events.append("park_actor")
+            return {"drafter/actor_hccl_parked": 1}
+
         def _speco_activate_drafter_training_model_before_fit(self):
             events.append("activate")
 
@@ -505,6 +537,7 @@ def test_async_prefit_warmup_is_sampleable_before_upstream_fit(monkeypatch):
 
     assert trainer.global_steps == 0
     assert events == [
+        "park_actor",
         "activate",
         "skip_init",
         ("skip_step", 1),

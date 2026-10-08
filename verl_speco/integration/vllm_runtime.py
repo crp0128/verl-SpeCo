@@ -201,6 +201,18 @@ def _set_child(container: Any, key: str, value: Any) -> None:
             setattr(container, key, value)
 
 
+def _pop_child(container: Any, key: str, default: Any = None) -> Any:
+    """Remove a config field while respecting OmegaConf struct mode."""
+    with _open_dict_if_needed(container):
+        if hasattr(container, "pop"):
+            return container.pop(key, default)
+        if hasattr(container, key):
+            value = getattr(container, key)
+            delattr(container, key)
+            return value
+    return default
+
+
 def _has_config_field(config: Any, key: str) -> bool:
     if config is None:
         return False
@@ -2703,8 +2715,28 @@ def _build_speco_vllm_stat_logger(server: Any):
 
 
 def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
+    # Ray rollout actors inherit their launch environment.  A controller may
+    # have cleared an older drafter payload for a non-speculative run, while a
+    # newly created server actor still sees that stale value.  The serialized
+    # rollout configuration is authoritative: never revive speculative decode
+    # when it explicitly disables the drafter.
+    drafter_enabled = _get_nested(rollout_cfg, ("drafter", "enable"), None)
+    if drafter_enabled is None:
+        drafter_enabled = _get_nested(
+            rollout_cfg, ("actor_rollout_ref", "rollout", "drafter", "enable"), None
+        )
+    if drafter_enabled is False:
+        clear_drafter_config_env()
+        engine_kwargs = _get_nested(rollout_cfg, ("engine_kwargs", "vllm"), None)
+        if isinstance(engine_kwargs, dict):
+            engine_kwargs.pop("speculative_config", None)
+        return
+
     drafter_cfg = _load_env_drafter_config()
     if not bool(drafter_cfg.get("enable")):
+        engine_kwargs = _get_nested(rollout_cfg, ("engine_kwargs", "vllm"), None)
+        if isinstance(engine_kwargs, dict):
+            engine_kwargs.pop("speculative_config", None)
         return
 
     speculative_config = build_vllm_speculative_config_from_drafter(
@@ -2712,10 +2744,33 @@ def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
     )
     engine_kwargs_root = _ensure_child_mapping(rollout_cfg, "engine_kwargs")
     engine_kwargs = _ensure_child_mapping(engine_kwargs_root, "vllm")
+    # The server actor may inherit a launcher environment serialized before
+    # the controller-side sanitization in ``configure_vllm_runtime_from_config``.
+    # Strip the legacy SpeCo-only locator here as well, immediately before
+    # upstream converts engine kwargs to ``AsyncEngineArgs``/``VllmConfig``.
+    # The locator remains available through ``VERL_SPECO_DRAFTER_CONFIG`` for
+    # the sidecar writer and V1 trainer fallback.
+    additional_config = _ensure_child_mapping(engine_kwargs, "additional_config")
+    additional_config.pop(SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY, None)
     existing_spec = _get_nested(engine_kwargs, ("speculative_config",), None)
     merged_speculative_config = _merge_speculative_config(
         existing_spec, speculative_config
     )
+    # V1 resolves a resumed drafter checkpoint on the controller before it
+    # serializes this replica's native engine kwargs.  A freshly spawned vLLM
+    # process can still inherit the launcher environment from before that
+    # resolution.  The controller already validates user engine overrides in
+    # ``configure_vllm_runtime_from_config``; here, use its serialized native
+    # model path so the stale environment cannot reject a valid resume.
+    existing_spec_mapping = _plain_container(existing_spec)
+    if (
+        isinstance(existing_spec_mapping, dict)
+        and existing_spec_mapping.get("model")
+        and merged_speculative_config.get("model")
+        != speculative_config.get("model")
+    ):
+        speculative_config = dict(speculative_config)
+        speculative_config["model"] = existing_spec_mapping["model"]
     # Authoritative check: engine_kwargs.vllm.speculative_config (existing_spec) takes
     # priority in the merge, so a lossy acceptance mode injected there must be caught here.
     assert_lossless_vllm_speculative_config(
@@ -3000,6 +3055,13 @@ class _SpecoVLLMHttpServerActorClass:
         runtime_env = dict(options.get("runtime_env", {}) or {})
         env_vars = dict(runtime_env.get("env_vars", {}) or {})
         env_vars[self._SETUP_HOOK_ENV_VAR] = self._SETUP_HOOK_PATH
+        # The HTTP server is a new Ray actor, not a child process of the
+        # rollout WorkerDict. Ray does not inherit WorkerDict's process env.
+        # Its EngineCore/model workers do inherit the HTTP actor env, so carry
+        # the run-scoped acceptance sidecar locator across this actor boundary.
+        drafter_env = get_drafter_config_env()
+        if drafter_env and _vllm_spec_decode_sidecar_dir():
+            env_vars[SPECO_DRAFTER_CONFIG_ENV] = drafter_env
         runtime_env["env_vars"] = env_vars
         # Ray serializes per-actor runtime_env values as JSON before starting
         # the worker.  A callable works for ray.init(), but remains a raw
@@ -3215,6 +3277,16 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     enabled = bool(drafter_cfg.get("enable"))
     if not enabled:
         clear_drafter_config_env()
+        engine_kwargs = _ensure_nested_mapping(
+            config, ("actor_rollout_ref", "rollout", "engine_kwargs", "vllm")
+        )
+        _pop_child(engine_kwargs, "speculative_config")
+        # The extension also owns the V2 level-2 wake hook. Keep it on
+        # ordinary rollout-only jobs so BlockTables rebuilds cached device
+        # pointers after the Ascend allocator remaps KV-cache memory.
+        _set_child(
+            engine_kwargs, "worker_extension_cls", SPECO_VLLM_WORKER_EXTENSION_CLS
+        )
         # V1 creates standalone rollout replicas even without speculative
         # decoding.  They still receive the SPECO extension field in the raw
         # config, so install the replica bridge that removes it before VERL
@@ -3228,7 +3300,14 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     )
     additional_config = _get_nested(engine_kwargs, ("additional_config",), {}) or {}
     additional_config = dict(additional_config)
-    sidecar_dir = additional_config.get(SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY)
+    # This is SpeCo-private runtime state, not a vLLM engine option.  Older
+    # integrations placed it in ``VllmConfig.additional_config`` so both the
+    # scheduler and trainer could discover the sidecar.  Newer vLLM versions
+    # validate that mapping and reject unknown keys, so consume a legacy value
+    # here and keep it out of the config passed to vLLM.
+    sidecar_dir = additional_config.pop(
+        SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY, None
+    ) or _vllm_spec_decode_sidecar_dir()
     if run_dir and not sidecar_dir:
         # Checkpoint directories are commonly reused for retries and resumes.
         # Keep cumulative worker counters per run so stale PID files cannot
@@ -3236,12 +3315,10 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
         sidecar_dir = os.path.join(
             os.fspath(run_dir), ".spec_decode_stats", f"run-{uuid.uuid4().hex}"
         )
-        additional_config[SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY] = os.path.abspath(
-            sidecar_dir
-        )
+        sidecar_dir = os.path.abspath(sidecar_dir)
 
     drafter_env_payload = _vllm_drafter_env_payload(drafter_cfg)
-    if run_dir:
+    if sidecar_dir:
         drafter_env_payload[SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY] = sidecar_dir
     set_drafter_config_env(json.dumps(drafter_env_payload, sort_keys=True))
     rollout_cfg = _rollout_config_from_config(config)
@@ -3250,8 +3327,9 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     )
     install_upstream_vllm_runtime_bridge()
 
-    if run_dir:
-        _set_child(engine_kwargs, "additional_config", additional_config)
+    # Always write the sanitized mapping back: callers may still provide the
+    # legacy private key even when no trainer run directory is configured.
+    _set_child(engine_kwargs, "additional_config", additional_config)
     existing_spec = _get_nested(engine_kwargs, ("speculative_config",), None)
     merged_speculative_config = _merge_speculative_config(
         existing_spec, speculative_config
@@ -3741,6 +3819,14 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         def _speco_wake_up_hook(*args, **kwargs):
             result = _orig_wake_up(instance, *args, **kwargs)
             tags = kwargs.get("tags", args[0] if args else None)
+            # Ascend level-2 sleep releases KV-cache allocations and maps them
+            # again during wake_up.  BlockTables caches the raw device pointer
+            # tensors, so those pointers must be rebuilt after the remap before
+            # the next scheduler step.  Otherwise idx/count metadata remains
+            # valid while _gather_block_tables_kernel dereferences stale GM.
+            wakes_kv_cache = tags is None or "kv_cache" in tags
+            if wakes_kv_cache:
+                instance._speco_refresh_vllm_block_table_pointers(tags)
             wakes_weights = tags is None or "weights" in tags
             if not wakes_weights:
                 return result
@@ -3763,6 +3849,20 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
 
         instance.wake_up = _speco_wake_up_hook
         return instance
+
+    def _speco_refresh_vllm_block_table_pointers(self, tags: list[str] | None) -> bool:
+        """Rebind raw block-table pointers after Ascend KV-cache remapping."""
+        runner = getattr(self, "model_runner", None)
+        block_tables = getattr(runner, "block_tables", None)
+        refresh = getattr(block_tables, "init_block_table_layout_tensors", None)
+        if not callable(refresh):
+            return False
+        refresh()
+        logger.info(
+            "[speco vllm] refreshed block-table device pointers after wake_up tags=%s",
+            tags,
+        )
+        return True
 
     def _get_speco_draft_zmq_handle(self) -> str:
         get_base = getattr(self, "_get_zmq_handle", None)
@@ -3824,6 +3924,13 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     def _speco_is_dspark_algorithm(self) -> bool:
         """Identify DSpark independently of Ascend's MRV1 ``dflash`` alias."""
 
+        # A disabled drafter is not running DSpark even when the launch
+        # environment still carries ``speculative_algorithm=DSPARK`` (no-drafter
+        # runs reuse the DSPARK payload with ``enable=false``). Without this
+        # guard, ``_speco_sync_dspark_lm_head_from_target`` proceeds past its
+        # early return and raises because the draft model was never built.
+        if not bool(_load_env_drafter_config().get("enable", True)):
+            return False
         if self._speco_draft_method() == "dspark":
             return True
         if _drafter_algorithm(_load_env_drafter_config()) == "DSPARK":

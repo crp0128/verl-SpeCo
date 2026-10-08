@@ -39,6 +39,21 @@ def _plain_config(value):
         return value
 
 
+def _serialize_v1_worker_drafter_config(drafter_config):
+    """Serialize the drafter payload with its runtime sidecar locator.
+
+    V1's actor worker wrapper replaces ``VERL_SPECO_DRAFTER_CONFIG`` inside
+    the worker process. Preserve the run-scoped acceptance directory there so
+    the spawned vLLM EngineCore inherits the same locator as the trainer.
+    """
+    from verl_speco.integration.drafter_config_env import serialize_worker_drafter_config
+
+    payload = _plain_config(drafter_config or {})
+    if not isinstance(payload, dict):
+        payload = {}
+    return serialize_worker_drafter_config(payload)
+
+
 def _unwrap_remote(cls):
     return getattr(cls, "__ray_actor_class__", cls)
 
@@ -74,8 +89,8 @@ class SpecoV1Mixin:
         vLLM rollout already has the required IPC receiver.  Add the narrow
         publish facade before the standalone replicas are created.
         """
-        serialized_drafter_config = json.dumps(
-            _plain_config(drafter_config or {}), sort_keys=True
+        serialized_drafter_config = _serialize_v1_worker_drafter_config(
+            drafter_config
         )
         cached = getattr(
             SpecoV1Mixin, "_speco_v1_standalone_publish_worker_remote", None
@@ -553,9 +568,8 @@ class SpecoV1Mixin:
                 {
                     "__module__": __name__,
                     "__doc__": raw.__doc__,
-                    "_speco_drafter_config_env": json.dumps(
-                        _plain_config(drafter_config or rollout.get("drafter", {})),
-                        sort_keys=True,
+                    "_speco_drafter_config_env": _serialize_v1_worker_drafter_config(
+                        drafter_config or rollout.get("drafter", {})
                     ),
                 },
             )
@@ -920,6 +934,7 @@ class SpecoV1Mixin:
 
         from verl_speco.integration.vllm_runtime import (
             SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY,
+            _vllm_spec_decode_sidecar_dir,
             read_vllm_spec_decode_sidecar_totals,
         )
 
@@ -933,7 +948,12 @@ class SpecoV1Mixin:
         engine_kwargs = rollout.get("engine_kwargs", {}) or {}
         vllm_kwargs = engine_kwargs.get("vllm", {}) or {}
         additional_config = vllm_kwargs.get("additional_config", {}) or {}
-        directory = additional_config.get(SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY)
+        # Accept legacy configs, but prefer the SpeCo runtime channel.  The
+        # private sidecar locator must not be forwarded to newer validated
+        # ``VllmConfig.additional_config`` mappings.
+        directory = additional_config.get(
+            SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY
+        ) or _vllm_spec_decode_sidecar_dir()
         if not directory and run_dir:
             # Compatibility fallback for launchers configured before per-run
             # sidecar directories were introduced.
@@ -1050,6 +1070,7 @@ class SpecoV1Mixin:
             self._pending_target_lm_head_sync = None
         if plan is not None:
             if plan.launch:
+                metrics.update(self._speco_park_actor_hccl_for_drafter())
                 trained, train_metrics = self._speco_train_drafter(plan)
             else:
                 trained = False
@@ -1139,9 +1160,43 @@ class SpecoV1Mixin:
         if bool(getattr(self, "_speco_prepared_for_fit", False)):
             return
         if self._speco_online_enabled_from_config(self.config):
+            # The initial online-drafter activation builds the drafter model
+            # and its process groups before ``fit`` enters the normal actor
+            # update path.  Async V1 therefore needs the same HCCL exclusion
+            # used by ``_update_actor``; otherwise actor (and, when enabled,
+            # colocated rollout) groups remain live during the first
+            # HcclBroadcast and can exhaust the device stream budget.
+            if self._speco_v1_async_rollout_enabled():
+                prefit_park = self._speco_park_actor_hccl_for_drafter()
+                if prefit_park.get("drafter/actor_hccl_parked", 0):
+                    logger.info(
+                        "SPECO V1 pre-fit actor HCCL parked before drafter activation: %s",
+                        prefit_park,
+                    )
             self._speco_activate_drafter_training_model_before_fit()
         if self._speco_v1_async_rollout_enabled():
             self._speco_run_async_prefit_rollout_warmup(agent_loop_manager)
+            # The async replay-backed loader can report length zero until its
+            # first sample is materialized.  The pre-fit warmup above has
+            # already waited for one complete training batch, so retain the
+            # configured training horizon as the epoch length for V1's epoch
+            # bookkeeping.  Without this, upstream ``fit`` divides by zero
+            # before consuming the ready batch.
+            if int(getattr(self, "steps_per_epoch", 0) or 0) <= 0:
+                trainer_config = getattr(self.config, "trainer", {})
+                if hasattr(trainer_config, "get"):
+                    configured_steps = int(
+                        trainer_config.get("total_training_steps", 0) or 0
+                    )
+                else:
+                    configured_steps = int(
+                        getattr(trainer_config, "total_training_steps", 0) or 0
+                    )
+                self.steps_per_epoch = max(configured_steps, 1)
+                logger.info(
+                    "SPECO V1 repaired async steps_per_epoch=%s after pre-fit warmup",
+                    self.steps_per_epoch,
+                )
         self._speco_prepared_for_fit = True
 
     def _reissue_inflight_prompts(self, *args, **kwargs):

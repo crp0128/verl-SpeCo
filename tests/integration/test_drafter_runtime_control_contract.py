@@ -29,6 +29,24 @@ _speco_ray_trainer = pytest.importorskip(
 SpecoRayPPOTrainer = _speco_ray_trainer.SpecoRayPPOTrainer
 
 
+def test_oldlogprob_chunk_payload_rows_remap_actor_dp_indices() -> None:
+    refs, metadata = SpecoRayPPOTrainer._speco_merge_chunk_payload_rows(
+        [["rank-0-chunk"], [], ["rank-1-chunk"], []],
+        [
+            [{"sample_indices": [0, 1]}],
+            [],
+            [{"sample_indices": [0, 1]}],
+            [],
+        ],
+    )
+
+    assert refs == ["rank-0-chunk", "rank-1-chunk"]
+    assert metadata == [
+        {"sample_indices": [0, 1]},
+        {"sample_indices": [2, 3]},
+    ]
+
+
 class _FakeOldLogProbBatch:
     non_tensor_batch = {}
 
@@ -311,6 +329,7 @@ def test_sync_scheduler_preserves_released_training_call_order() -> None:
         {
             "training_interval_steps": 1,
             "publish_interval_steps": 0,
+            "park_hccl_after_drafter_training": True,
         },
         step=5,
     )
@@ -329,6 +348,9 @@ def test_sync_scheduler_preserves_released_training_call_order() -> None:
     trainer._update_actor = lambda *args, **kwargs: events.append(
         "update_actor"
     ) or SimpleNamespace(meta_info={"metrics": {}})
+    trainer._speco_park_actor_hccl_for_drafter = lambda: events.append(
+        "park_actor_hccl"
+    ) or {"drafter/actor_hccl_parked": 1}
     trainer._speco_train_drafter = lambda plan: events.append(
         ("train_drafter", plan.max_batches, plan.publish_after_success)
     ) or (
@@ -346,6 +368,7 @@ def test_sync_scheduler_preserves_released_training_call_order() -> None:
         "set_global_step",
         "sync_target_lm_head",
         "update_actor",
+        "park_actor_hccl",
         ("train_drafter", 100, True),
         ("publish", True),
     ]

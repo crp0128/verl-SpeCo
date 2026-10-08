@@ -44,6 +44,7 @@ def test_native_ascend_split_sampling_to_trainer(monkeypatch, tmp_path, request)
     output.model_runner_output = ModelRunnerOutput(req_ids=["a", "b"], req_id_to_index={"a": 0, "b": 1})
     output.sampled_token_ids = np.array([[1, 2, 3, -1], [4, -1, -1, -1]])
     output.num_sampled_tokens_np = np.array([3, 1])
+    output.sampling_mask_tensors = None
     output.num_nans = None
     output.logprobs_tensors = None
     output.prompt_logprobs_dict = {}
@@ -72,6 +73,15 @@ def test_native_ascend_split_sampling_to_trainer(monkeypatch, tmp_path, request)
     worker.model_runner = SimpleNamespace(
         execute_model=lambda *args: None,
         sample_tokens=lambda *args: output,
+        # Newer vLLM-Ascend records optional profiling-chunk timing in
+        # ``NPUWorker.sample_tokens`` before SpeCo observes the output.
+        # Disable that independent feature in this CPU-only acceptance test.
+        ascend_config=SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                profiling_chunk_config=SimpleNamespace(need_timing=False)
+            )
+        ),
+        _cpp_execution_time_ms=None,
     )
     monkeypatch.setattr(worker_module, "get_ascend_config", lambda: SimpleNamespace(msmonitor_use_daemon=False))
     monkeypatch.setattr(worker_module, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))

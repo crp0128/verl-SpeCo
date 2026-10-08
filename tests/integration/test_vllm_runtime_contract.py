@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import sys
 import types
@@ -232,6 +233,19 @@ def test_vllm_level1_wake_keeps_online_draft_revision(monkeypatch) -> None:
     assert extension._speco_restore_draft_for_wake(["weights"]) == (None, 0)
     assert extension._speco_draft_runtime_revision == 3
     assert reload_calls == []
+
+
+def test_vllm_wake_refreshes_block_table_device_pointers() -> None:
+    extension = SpecoVLLMColocateWorkerExtension()
+    calls = []
+    extension.model_runner = SimpleNamespace(
+        block_tables=SimpleNamespace(
+            init_block_table_layout_tensors=lambda: calls.append("refresh")
+        )
+    )
+
+    assert extension._speco_refresh_vllm_block_table_pointers(["kv_cache"])
+    assert calls == ["refresh"]
 
 
 def test_vllm_level2_wake_restores_matching_online_revision() -> None:
@@ -953,21 +967,19 @@ def test_vllm_runtime_injects_native_config_and_worker_extension(monkeypatch, tm
     assert engine_kwargs["speculative_config"]["method"] == "eagle3"
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
     assert engine_kwargs["additional_config"]["existing_option"] == 1
-    sidecar_dir = engine_kwargs["additional_config"][
+    assert (
         vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY
-    ]
+        not in engine_kwargs["additional_config"]
+    )
+    sidecar_dir = vllm_runtime._vllm_spec_decode_sidecar_dir()
+    assert sidecar_dir is not None
     assert sidecar_dir.startswith(str(tmp_path / ".spec_decode_stats"))
     assert "/run-" in sidecar_dir.replace("\\", "/")
 
     # Reconfiguration in the same driver process must reuse its run-scoped
     # directory rather than splitting counters between two locations.
     configure_vllm_runtime_from_config(config)
-    assert (
-        engine_kwargs["additional_config"][
-            vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY
-        ]
-        == sidecar_dir
-    )
+    assert vllm_runtime._vllm_spec_decode_sidecar_dir() == sidecar_dir
 
 
 def test_vllm_runtime_installs_replica_bridge_without_drafter(monkeypatch) -> None:
@@ -984,9 +996,103 @@ def test_vllm_runtime_installs_replica_bridge_without_drafter(monkeypatch) -> No
 
     assert configure_vllm_runtime_from_config(config) == {}
     assert bridge_calls == [True]
+    engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
+    assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
 
 
-def test_vllm_http_actor_installs_import_guard_before_deserialization() -> None:
+def test_vllm_runtime_strips_speculative_config_from_struct_mode_without_drafter(
+    monkeypatch,
+) -> None:
+    omegaconf = pytest.importorskip("omegaconf")
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
+        lambda: True,
+    )
+    config = omegaconf.OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {
+                    "name": "vllm",
+                    "drafter": {"enable": False},
+                    "engine_kwargs": {
+                        "vllm": {"speculative_config": {"method": "eagle3"}}
+                    },
+                }
+            }
+        }
+    )
+    omegaconf.OmegaConf.set_struct(config, True)
+
+    configure_vllm_runtime_from_config(config)
+
+    engine_kwargs = config.actor_rollout_ref.rollout.engine_kwargs.vllm
+    assert "speculative_config" not in engine_kwargs
+    assert engine_kwargs.worker_extension_cls == SPECO_VLLM_WORKER_EXTENSION_CLS
+
+
+def test_vllm_server_bridge_strips_legacy_acceptance_sidecar_key(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "VERL_SPECO_DRAFTER_CONFIG",
+        json.dumps(_drafter(), sort_keys=True),
+    )
+    rollout_cfg = {
+        "engine_kwargs": {
+            "vllm": {
+                "additional_config": {
+                    vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY: "/tmp/stats"
+                }
+            }
+        }
+    }
+
+    vllm_runtime._ensure_vllm_drafter_speculative_config_from_env(rollout_cfg)
+
+    assert (
+        vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY
+        not in rollout_cfg["engine_kwargs"]["vllm"]["additional_config"]
+    )
+
+
+def test_vllm_server_does_not_revive_stale_drafter_env_when_disabled(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "VERL_SPECO_DRAFTER_CONFIG",
+        json.dumps(_drafter(), sort_keys=True),
+    )
+    rollout_cfg = {
+        "drafter": {"enable": False},
+        "engine_kwargs": {"vllm": {"speculative_config": {"model": "/stale"}}},
+    }
+
+    vllm_runtime._ensure_vllm_drafter_speculative_config_from_env(rollout_cfg)
+
+    assert "speculative_config" not in rollout_cfg["engine_kwargs"]["vllm"]
+    assert "VERL_SPECO_DRAFTER_CONFIG" not in os.environ
+
+
+def test_vllm_server_does_not_revive_stale_drafter_env_when_nested_disabled(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "VERL_SPECO_DRAFTER_CONFIG",
+        json.dumps(_drafter(), sort_keys=True),
+    )
+    rollout_cfg = {
+        "actor_rollout_ref": {"rollout": {"drafter": {"enable": False}}}
+    }
+
+    vllm_runtime._ensure_vllm_drafter_speculative_config_from_env(rollout_cfg)
+
+    assert "engine_kwargs" not in rollout_cfg
+    assert "VERL_SPECO_DRAFTER_CONFIG" not in os.environ
+
+
+def test_vllm_http_actor_installs_import_guard_before_deserialization(
+    monkeypatch,
+) -> None:
+    sidecar_dir = "/tmp/speco-acceptance/run-test"
+    drafter_env = json.dumps({
+        "enable": True,
+        "_speco_acceptance_stats_dir": sidecar_dir,
+    })
+    monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, drafter_env)
     captured = {}
 
     class FakeRemoteActorClass:
@@ -1021,9 +1127,26 @@ def test_vllm_http_actor_installs_import_guard_before_deserialization() -> None:
     assert runtime_env["env_vars"] == {
         "EXISTING": "1",
         "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR": setup_hook_path,
+        vllm_runtime.SPECO_DRAFTER_CONFIG_ENV: drafter_env,
     }
     assert runtime_env["worker_process_setup_hook"] == setup_hook_path
     assert json.loads(json.dumps(runtime_env)) == runtime_env
+
+
+def test_vllm_http_actor_does_not_forward_drafter_without_sidecar(monkeypatch) -> None:
+    monkeypatch.setenv(
+        vllm_runtime.SPECO_DRAFTER_CONFIG_ENV,
+        json.dumps({"enable": True}),
+    )
+    captured = {}
+
+    class FakeRemoteActorClass:
+        def options(self, **options):
+            captured.update(options)
+            return self
+
+    vllm_runtime._SpecoVLLMHttpServerActorClass(FakeRemoteActorClass()).options()
+    assert vllm_runtime.SPECO_DRAFTER_CONFIG_ENV not in captured["runtime_env"]["env_vars"]
 
 
 def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(
@@ -1139,6 +1262,51 @@ def test_vllm_mrv2_rejects_final_engine_speculative_override(
 
     with pytest.raises(ValueError, match="final speculative config"):
         configure_vllm_runtime_from_config(config)
+
+
+def test_vllm_mrv2_resume_uses_serialized_checkpoint_over_stale_env(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    source_model = tmp_path / "source-drafter"
+    resumed_model = tmp_path / "draft_step_1"
+    for model_path in (source_model, resumed_model):
+        model_path.mkdir()
+        (model_path / "config.json").write_text(
+            '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}'
+        )
+
+    stale_drafter = _drafter(
+        speculative_algorithm="DSPARK",
+        model_path=str(source_model),
+        rollout={"spec_verify_tokens": 5},
+    )
+    monkeypatch.setenv(
+        "VERL_SPECO_DRAFTER_CONFIG", json.dumps(stale_drafter, sort_keys=True)
+    )
+    rollout_cfg = {
+        "engine_kwargs": {
+            "vllm": {
+                "speculative_config": {
+                    "draft_sample_method": "greedy",
+                    "draft_load_config": {"load_format": "auto"},
+                    "method": "dspark",
+                    "model": str(resumed_model),
+                    "num_speculative_tokens": 5,
+                }
+            }
+        },
+    }
+
+    vllm_runtime._ensure_vllm_drafter_speculative_config_from_env(rollout_cfg)
+
+    assert (
+        rollout_cfg["engine_kwargs"]["vllm"]["speculative_config"]["model"]
+        == str(resumed_model)
+    )
 
 
 def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None:

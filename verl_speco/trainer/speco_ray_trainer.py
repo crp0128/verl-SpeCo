@@ -1536,6 +1536,40 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return flattened
 
     @staticmethod
+    def _speco_merge_chunk_payload_rows(ref_rows: Any, meta_rows: Any):
+        """Flatten actor-DP chunks and globalize worker-local sample indices."""
+
+        if not isinstance(meta_rows, (list, tuple)) or not meta_rows or not all(
+            isinstance(item, (list, tuple)) for item in meta_rows
+        ):
+            return (
+                SpecoRayPPOTrainer._speco_flatten_non_tensor_rows(ref_rows),
+                SpecoRayPPOTrainer._speco_flatten_non_tensor_rows(meta_rows),
+            )
+
+        merged_refs: list[Any] = []
+        if isinstance(ref_rows, (list, tuple)):
+            for row in ref_rows:
+                if isinstance(row, (list, tuple)):
+                    merged_refs.extend(row)
+
+        merged_meta: list[Any] = []
+        for global_row_offset, row in enumerate(meta_rows):
+            if not isinstance(row, (list, tuple)):
+                continue
+            for meta in row:
+                if not isinstance(meta, dict):
+                    merged_meta.append(meta)
+                    continue
+                remapped = dict(meta)
+                remapped["sample_indices"] = [
+                    int(global_row_offset) + int(sample_idx)
+                    for sample_idx in meta.get("sample_indices") or []
+                ]
+                merged_meta.append(remapped)
+        return merged_refs, merged_meta
+
+    @staticmethod
     def _speco_sum_timing_rows(tensor: torch.Tensor | None) -> torch.Tensor | None:
         if tensor is None:
             return None
@@ -1570,11 +1604,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         hidden_ref_meta = self._speco_flatten_non_tensor_rows(
             tu.get(output, OLD_LOGPROB_HIDDEN_REF_META_KEY)
         )
-        chunk_refs = self._speco_flatten_non_tensor_rows(
-            tu.get(output, OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY)
-        )
-        chunk_meta = self._speco_flatten_non_tensor_rows(
-            tu.get(output, OLD_LOGPROB_HIDDEN_CHUNK_META_KEY)
+        chunk_refs, chunk_meta = self._speco_merge_chunk_payload_rows(
+            tu.get(output, OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY),
+            tu.get(output, OLD_LOGPROB_HIDDEN_CHUNK_META_KEY),
         )
         # PP>1 single-put path: the last stage ray.put()s the concatenated
         # hidden tensor once and returns the ObjectRef.  Materialize it here
@@ -1948,6 +1980,47 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             )
         return method
 
+    def _speco_park_actor_hccl_for_drafter(self) -> dict[str, Any]:
+        training_cfg = self._speco_drafter_training_config()
+        enabled = bool(
+            training_cfg.get(
+                "park_actor_hccl_during_drafter_training",
+                training_cfg.get("park_hccl_after_drafter_training", False),
+            )
+        )
+        if not enabled:
+            return {
+                "drafter/actor_hccl_park_attempted": 0,
+                "drafter/actor_hccl_parked": 0,
+            }
+
+        started_at = time.perf_counter()
+        results = self._ray_get_if_needed(
+            self._speco_actor_rollout_method("park_actor_hccl_for_drafter")()
+        )
+        if not isinstance(results, (list, tuple)):
+            results = [results]
+        active_results = [result for result in results if isinstance(result, dict)]
+        failures = [
+            result for result in active_results if not bool(result.get("parked", False))
+        ]
+        if not active_results or failures:
+            raise RuntimeError(
+                "SPECO failed to park actor HCCL before drafter training: "
+                f"{failures[:3] if failures else results}"
+            )
+        return {
+            "drafter/actor_hccl_park_attempted": 1,
+            "drafter/actor_hccl_parked": 1,
+            "drafter/actor_hccl_park_worker_count": len(active_results),
+            "drafter/actor_hccl_park_groups_min": min(
+                int(result.get("groups", 0) or 0) for result in active_results
+            ),
+            "timing_s/drafter_actor_hccl_park": (
+                time.perf_counter() - started_at
+            ),
+        }
+
     def _speco_build_drafter_target_lm_head_sync_args(
         self,
         payload: dict[str, torch.Tensor],
@@ -2140,6 +2213,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self, training_plan: TrainingPlan
     ) -> tuple[bool, dict[str, Any]]:
         runtime_state = self._speco_get_drafter_runtime_state()
+        train_started_at = time.perf_counter()
+        logger.debug(
+            "[DrafterTiming] phase=training_rpc_start step=%s plan_id=%s",
+            training_plan.source_global_step,
+            training_plan.plan_id,
+        )
         try:
             event = self._speco_get_drafter_scheduler().on_after_actor_update(
                 AfterActorUpdateContext(
@@ -2152,7 +2231,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 raise RuntimeError(
                     "Drafter after-actor-update event returned no training outcome"
                 )
+            logger.debug(
+                "[DrafterTiming] phase=training_rpc_done elapsed_s=%.3f trained=%s",
+                time.perf_counter() - train_started_at,
+                outcome.trained,
+            )
         except Exception:
+            logger.debug(
+                "[DrafterTiming] phase=training_rpc_failed elapsed_s=%.3f",
+                time.perf_counter() - train_started_at,
+            )
             logger.exception(
                 "[DrafterRuntime] synchronous training failed at step=%s",
                 training_plan.source_global_step,
@@ -2689,6 +2777,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     )
                 )
             if training_plan.launch:
+                metrics.update(self._speco_park_actor_hccl_for_drafter())
                 drafter_trained, train_metrics = self._speco_train_drafter(
                     training_plan
                 )

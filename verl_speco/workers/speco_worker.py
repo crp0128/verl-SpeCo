@@ -386,6 +386,7 @@ class SpecoWorker(Worker):
         if self._training_group_initialized:
             return
 
+        group_init_started = time.perf_counter()
         self._ensure_process_group_initialized()
         if not dist.is_initialized():
             return
@@ -448,6 +449,13 @@ class SpecoWorker(Worker):
             is_collect=True,
         )
         self._training_group_initialized = True
+        logger.warning(
+            "[speco timing] drafter_hccl_group_init_s=%.3f rank=%s sp=%s dp=%s",
+            time.perf_counter() - group_init_started,
+            self.rank,
+            self.training_group_world_size,
+            self.dp_group_world_size,
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -1040,6 +1048,12 @@ class SpecoWorker(Worker):
                 "input_ids": sample["input_ids"],
                 "prompts": sample["prompts"],
                 "responses": sample["responses"],
+                # Preserve the immutable collection transaction in the
+                # trainer buffer.  DataBuffer's mutable ``step`` is used for
+                # retention, while this source version is used to validate a
+                # distributed training plan.
+                "collection_id": collection_id,
+                "collection_source_global_step": int(self.last_global_step),
             }
             for key in (
                 "hidden_position_start",
@@ -1488,6 +1502,13 @@ class SpecoWorker(Worker):
             self.trainer.clear_pending_publish_state_dict()
             try:
                 train_loop_ts = time.time()
+                logger.debug(
+                    "[DrafterTiming replica=%s rank=%s] phase=training_loop_start step=%s max_batches=%s",
+                    self.replica_rank,
+                    self.rank,
+                    self.last_global_step,
+                    max_batches,
+                )
                 self.trainer.reset_training_metrics()
                 for _ in range(max_batches):
                     result["attempted_steps"] += 1
@@ -1500,9 +1521,23 @@ class SpecoWorker(Worker):
                         result["successful_steps"] += 1
                 result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
                 result.update(self.trainer.get_training_metrics())
+                logger.debug(
+                    "[DrafterTiming replica=%s rank=%s] phase=training_loop_done elapsed_s=%.3f successful_steps=%s optimizer_step=%s",
+                    self.replica_rank,
+                    self.rank,
+                    result["training_loop_elapsed_sec"],
+                    result["successful_steps"],
+                    self.trainer.optimizer_steps_total,
+                )
                 if result["successful_steps"] > 0:
                     if prepare_publish:
                         snapshot_ts = time.time()
+                        logger.debug(
+                            "[DrafterTiming replica=%s rank=%s] phase=publish_snapshot_call_start step=%s",
+                            self.replica_rank,
+                            self.rank,
+                            self.last_global_step,
+                        )
                         cached = self.trainer.prepare_model_state_dict_for_publish(
                             self.last_global_step
                         )
@@ -1515,6 +1550,13 @@ class SpecoWorker(Worker):
                                 "timing_s/drafter_publish_snapshot",
                                 result["publish_snapshot_elapsed_sec"],
                             )
+                        logger.debug(
+                            "[DrafterTiming replica=%s rank=%s] phase=publish_snapshot_call_done elapsed_s=%.3f cached=%s",
+                            self.replica_rank,
+                            self.rank,
+                            result["publish_snapshot_elapsed_sec"],
+                            result["publish_snapshot_cached"],
+                        )
                     else:
                         self.trainer.clear_pending_publish_state_dict()
                 else:
@@ -1522,10 +1564,29 @@ class SpecoWorker(Worker):
                 result.update(self.trainer.get_training_metrics())
             finally:
                 cleanup_ts = time.time()
-                await self.trainer.cleanup_training(
-                    clear_data=result["successful_steps"] > 0
+                logger.debug(
+                    "[DrafterTiming replica=%s rank=%s] phase=cleanup_call_start",
+                    self.replica_rank,
+                    self.rank,
                 )
+                try:
+                    await self.trainer.cleanup_training(
+                        clear_data=result["successful_steps"] > 0
+                    )
+                except Exception:
+                    logger.exception(
+                        "[DrafterTiming replica=%s rank=%s] phase=cleanup_call_failed",
+                        self.replica_rank,
+                        self.rank,
+                    )
+                    raise
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
+                logger.debug(
+                    "[DrafterTiming replica=%s rank=%s] phase=cleanup_call_done elapsed_s=%.3f",
+                    self.replica_rank,
+                    self.rank,
+                    result["cleanup_elapsed_sec"],
+                )
 
             result["trained"] = result["successful_steps"] > 0
             result["reason"] = "trained" if result["trained"] else "no_trainable_batch"
