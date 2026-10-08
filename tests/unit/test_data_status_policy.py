@@ -58,6 +58,8 @@ def test_status_policy_aggregates_distributed_capacity_conservatively() -> None:
     assert result.oldest_sample_step == 2
     assert result.newest_sample_step == 5
     assert not result.data_version_consistent
+    assert result.collection_source_steps == (4, 5)
+    assert result.metrics()["drafter/data_collection_source_versions"] == 2
     assert result.worker_snapshots == {
         "0": {
             "buffer_version": 7,
@@ -117,6 +119,4 @@ def test_status_policy_ignores_empty_workers_for_data_version_consistency() -> N
 
 
 def test_status_policy_returns_none_without_available_workers() -> None:
-    assert (
-        ConservativeTrainingDataStatusPolicy().aggregate([], global_step=4) is None
-    )
+    assert ConservativeTrainingDataStatusPolicy().aggregate([], global_step=4) is None

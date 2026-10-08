@@ -1064,9 +1064,7 @@ class DraftWeightPublishMixin:
             _get_nested(
                 training_cfg,
                 ("park_actor_hccl_during_drafter_training",),
-                _get_nested(
-                    training_cfg, ("park_hccl_after_drafter_training",), False
-                ),
+                _get_nested(training_cfg, ("park_hccl_after_drafter_training",), False),
             )
         )
         if not enabled:

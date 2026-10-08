@@ -63,11 +63,27 @@ def serialize_worker_drafter_config(payload: dict, run_dir=None) -> str:
     if not isinstance(runtime_payload, dict):
         runtime_payload = {}
     sidecar_dir = runtime_payload.get("_speco_acceptance_stats_dir")
+    if sidecar_dir and run_dir:
+        # A driver can launch another run without exiting. Reuse a locator
+        # only within its run directory, never counters from another launch.
+        sidecar_root = os.path.abspath(
+            os.path.join(os.fspath(run_dir), ".spec_decode_stats")
+        )
+        try:
+            if (
+                os.path.commonpath([sidecar_root, os.path.abspath(sidecar_dir)])
+                != sidecar_root
+            ):
+                sidecar_dir = None
+        except (TypeError, ValueError):
+            sidecar_dir = None
     if not sidecar_dir and payload.get("enable") and run_dir:
         sidecar_dir = os.path.abspath(
-            os.path.join(os.fspath(run_dir), ".spec_decode_stats", f"run-{uuid.uuid4().hex}")
+            os.path.join(
+                os.fspath(run_dir), ".spec_decode_stats", f"run-{uuid.uuid4().hex}"
+            )
         )
-        runtime_payload = {**payload, **runtime_payload}
+        runtime_payload = {**runtime_payload, **payload}
         runtime_payload["_speco_acceptance_stats_dir"] = sidecar_dir
         set_drafter_config_env(json.dumps(runtime_payload, sort_keys=True))
     if sidecar_dir:

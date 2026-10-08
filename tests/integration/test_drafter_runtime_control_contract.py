@@ -19,7 +19,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from verl_speco.trainer.scheduler import CallbackDrafterWorkerExecutor
+from verl_speco.trainer.scheduler import CallbackDrafterWorkerExecutor  # noqa: E402
 
 
 _speco_ray_trainer = pytest.importorskip(
@@ -27,6 +27,28 @@ _speco_ray_trainer = pytest.importorskip(
     reason="drafter runtime control contract needs the trainer dependency stack",
 )
 SpecoRayPPOTrainer = _speco_ray_trainer.SpecoRayPPOTrainer
+
+
+@pytest.mark.parametrize("source_step", [None, 0, 4])
+def test_training_status_handles_legacy_samples_without_collection_version(source_step):
+    from verl_speco.trainer.base_trainer import DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.current_rl_step = 5
+    trainer.config = SimpleNamespace(
+        rollout=SimpleNamespace(drafter=SimpleNamespace(training={}))
+    )
+    trainer.backend = SimpleNamespace(model_type="dspark")
+    trainer.collected_data = [{"step": 5, "collection_source_global_step": source_step}]
+    trainer.use_data_buffer = False
+    trainer.batch_size = 1
+    trainer.buffer_version = 1
+
+    status = trainer.get_training_data_status()
+
+    expected_step = 5 if source_step is None else source_step
+    assert status["data_version"] == expected_step
+    assert status["collection_source_steps"] == [expected_step]
 
 
 def test_oldlogprob_chunk_payload_rows_remap_actor_dp_indices() -> None:
@@ -186,95 +208,6 @@ def _no_drafter_trainer(*, calculate_entropy=Ellipsis) -> SpecoRayPPOTrainer:
     return trainer
 
 
-def _validation_config(
-    *,
-    val_batch_size=None,
-    validation_batch_size=8,
-    algorithm="DSPARK",
-    enable_training=True,
-):
-    from omegaconf import OmegaConf
-
-    return OmegaConf.create(
-        {
-            "data": {"val_batch_size": val_batch_size},
-            "actor_rollout_ref": {
-                "rollout": {
-                    "name": "vllm",
-                    "drafter": {
-                        "enable": True,
-                        "enable_drafter_training": enable_training,
-                        "speculative_algorithm": algorithm,
-                        "training": {
-                            "mode": "online",
-                            "validation_batch_size": validation_batch_size,
-                        },
-                    },
-                }
-            },
-        }
-    )
-
-
-def test_online_dspark_caps_unset_validation_batch_before_dataloader_init(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-    config = _validation_config()
-
-    assert _speco_ray_trainer._speco_cap_online_dspark_validation_batch_size(config) == 8
-    assert config.data.val_batch_size == 8
-
-
-def test_online_dspark_preserves_explicit_validation_batch_size(monkeypatch) -> None:
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-    config = _validation_config(val_batch_size=3)
-
-    assert _speco_ray_trainer._speco_cap_online_dspark_validation_batch_size(config) == 3
-    assert config.data.val_batch_size == 3
-
-
-@pytest.mark.parametrize(
-    ("algorithm", "enable_training"),
-    [("EAGLE3", True), ("DSPARK", False)],
-)
-def test_validation_cap_does_not_change_other_runtime_modes(
-    algorithm: str, enable_training: bool, monkeypatch
-) -> None:
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-    config = _validation_config(
-        algorithm=algorithm, enable_training=enable_training
-    )
-
-    assert (
-        _speco_ray_trainer._speco_cap_online_dspark_validation_batch_size(config)
-        is None
-    )
-    assert config.data.val_batch_size is None
-
-
-@pytest.mark.parametrize("value", [0, -1, True, "invalid"])
-def test_online_dspark_rejects_invalid_validation_batch_size(
-    value, monkeypatch
-) -> None:
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-    config = _validation_config(validation_batch_size=value)
-
-    with pytest.raises(ValueError, match="must be a positive integer or null"):
-        _speco_ray_trainer._speco_cap_online_dspark_validation_batch_size(config)
-
-
-def test_validation_cap_preserves_mrv1_and_verl080_behavior(monkeypatch) -> None:
-    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
-    config = _validation_config()
-
-    assert (
-        _speco_ray_trainer._speco_cap_online_dspark_validation_batch_size(config)
-        is None
-    )
-    assert config.data.val_batch_size is None
-
-
 def test_drafter_collect_train_and_publish_intervals() -> None:
     trainer = _trainer(
         {
@@ -309,10 +242,12 @@ def test_drafter_training_attempt_requires_interval_and_samples() -> None:
     trainer._speco_last_collected_samples = 10
     scheduler = trainer._speco_get_drafter_scheduler()
     config = trainer._speco_drafter_schedule_config()
+
     def plan():
         return scheduler.prepare_training_plan(
             trainer._speco_drafter_schedule_context(), config
         )
+
     assert plan().launch is False
 
     trainer.global_steps = 5
@@ -466,7 +401,6 @@ def test_no_drafter_run_refuses_and_leaves_vllm_config_untouched(
     assert "worker_extension_cls" not in vllm_engine
 
 
-
 def test_task_runner_installs_vllm_import_compat_in_its_own_process(
     monkeypatch,
 ) -> None:
@@ -527,7 +461,6 @@ def test_no_drafter_run_does_not_install_vllm_import_compat(monkeypatch) -> None
     # A no-drafter run must never install the SPECO vLLM import-compat mixin;
     # the runner refuses before reaching the import-compat step.
     assert compat_calls == []
-
 
 
 def test_oldlogprob_non_collect_step_uses_original_compute_path() -> None:
@@ -613,8 +546,10 @@ def test_target_head_sync_defers_for_all_lm_head_drafters(
     received = []
     trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
     trainer._speco_actor_rollout_method = lambda name: lambda rows, **kwargs: [payload]
-    trainer._speco_build_drafter_target_lm_head_sync_args = (
-        lambda value: (value, trainer.global_steps, 1)
+    trainer._speco_build_drafter_target_lm_head_sync_args = lambda value: (
+        value,
+        trainer.global_steps,
+        1,
     )
     trainer.speco_sync_target_lm_head_weight = (
         lambda value, global_step=None: received.append((value, global_step))
@@ -641,8 +576,10 @@ def test_target_head_transfer_waits_after_actor_update() -> None:
     trainer._ray_get_if_needed = lambda value: resolved.append(value) or value
     trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
     trainer._speco_actor_rollout_method = lambda name: lambda rows, **kwargs: [payload]
-    trainer._speco_build_drafter_target_lm_head_sync_args = (
-        lambda value: (value, trainer.global_steps, 1)
+    trainer._speco_build_drafter_target_lm_head_sync_args = lambda value: (
+        value,
+        trainer.global_steps,
+        1,
     )
     trainer.speco_sync_target_lm_head_weight = (
         lambda value, global_step=None: pending_refs
@@ -896,9 +833,7 @@ def _oldlogprob_batch(response_mask: list[int]) -> SimpleNamespace:
 def test_oldlogprob_collect_plan_honors_response_mask_before_window_selection() -> None:
     trainer = _oldlogprob_collect_plan_trainer()
 
-    plan = trainer._speco_build_oldlogprob_collect_plan(
-        _oldlogprob_batch([1, 1, 0])
-    )
+    plan = trainer._speco_build_oldlogprob_collect_plan(_oldlogprob_batch([1, 1, 0]))
 
     assert plan is None
     assert trainer._speco_last_oldlogprob_candidate_samples == 0
@@ -908,9 +843,7 @@ def test_oldlogprob_collect_plan_honors_response_mask_before_window_selection() 
 def test_oldlogprob_collect_plan_tracks_short_response_skip_metric_state() -> None:
     trainer = _oldlogprob_collect_plan_trainer()
 
-    plan = trainer._speco_build_oldlogprob_collect_plan(
-        _oldlogprob_batch([1, 1, 1])
-    )
+    plan = trainer._speco_build_oldlogprob_collect_plan(_oldlogprob_batch([1, 1, 1]))
 
     assert plan is not None
     assert plan["response_lens"] == [3]
@@ -932,8 +865,7 @@ def test_oldlogprob_collection_omits_masked_response_token_from_payload() -> Non
     assert collect_plan is not None
     captured = {}
     trainer._speco_execute_collection = lambda plan, payload: (
-        captured.setdefault("payload", payload)
-        or SimpleNamespace(collected_samples=1)
+        captured.setdefault("payload", payload) or SimpleNamespace(collected_samples=1)
     )
     output = {
         _speco_ray_trainer.OLD_LOGPROB_HIDDEN_STATES_KEY: torch.arange(

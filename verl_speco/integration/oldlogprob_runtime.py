@@ -55,6 +55,7 @@ OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY = "speco_oldlogprob_hidden_whole_ref_meta"
 OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY = "speco_oldlogprob_hidden_chunk_refs"
 OLD_LOGPROB_HIDDEN_CHUNK_META_KEY = "speco_oldlogprob_hidden_chunk_meta"
 OLD_LOGPROB_AUX_LAYER_IDS_KEY = "speco_oldlogprob_aux_layer_ids"
+OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY = "speco_oldlogprob_aux_layer_id_space"
 OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY = "speco_oldlogprob_hidden_capture_impl"
 OLD_LOGPROB_HIDDEN_LAYOUT_KEY = "speco_oldlogprob_hidden_layout"
 OLD_LOGPROB_TIMING_KEY = "speco_oldlogprob_timing"
@@ -74,9 +75,7 @@ _BATCH_POSTPROCESS_PATCHED_MODULES: set[str] = set()
 _POSTPROCESS_PATCHED = False
 
 
-def _worker_payload_rows(
-    value: Any, *, batch_size: int, per_sample: bool
-) -> list[Any]:
+def _worker_payload_rows(value: Any, *, batch_size: int, per_sample: bool) -> list[Any]:
     """Represent worker-local metadata on the TensorDict batch dimension.
 
     Verl concatenates the outputs from every actor DP rank with
@@ -123,9 +122,7 @@ def _assign_worker_payload(
     # ``assign_non_tensor_stack``.
     from tensordict.tensorclass import NonTensorData, NonTensorStack
 
-    tensor_dict[key] = NonTensorStack.from_list(
-        [NonTensorData(item) for item in rows]
-    )
+    tensor_dict[key] = NonTensorStack.from_list([NonTensorData(item) for item in rows])
 
 
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
@@ -192,12 +189,16 @@ def _tensor_key_present(container: Any, key: str) -> bool:
             return False
 
 
-def _resolve_hidden_state(hidden_states: Any, layer_id: int):
+def _resolve_hidden_state(
+    hidden_states: Any, layer_id: int, *, layer_id_space: str = "decoder"
+):
     if hidden_states is None:
         return None
     num_states = len(hidden_states)
     index = int(layer_id)
-    if index >= 0:
+    if layer_id_space not in {"decoder", "output"}:
+        raise ValueError(f"Unsupported old-logprob layer ID space: {layer_id_space!r}")
+    if index >= 0 and layer_id_space == "decoder":
         # Config layer ids refer to transformer layer outputs. HF hidden_states
         # includes embeddings at index 0, so layer 0 is hidden_states[1].
         index += 1
@@ -246,6 +247,22 @@ def _oldlogprob_hidden_layout(micro_batch: Any) -> str:
     if layout not in {"eagle3_aux_plus_last", "dflash_aux", "dflash_aux_plus_last"}:
         raise ValueError(f"Unsupported SPECO old-logprob hidden layout: {layout!r}")
     return layout
+
+
+def _oldlogprob_aux_layer_id_space(micro_batch: Any) -> str:
+    value = "decoder"
+    try:
+        value = micro_batch.get(OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY, value)
+    except Exception:  # noqa: BLE001
+        if _tensor_key_present(micro_batch, OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY):
+            value = micro_batch[OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY]
+    value = getattr(value, "data", value)
+    layer_id_space = str(value or "decoder").strip().lower()
+    if layer_id_space not in {"decoder", "output"}:
+        raise ValueError(
+            f"Unsupported SPECO old-logprob layer ID space: {layer_id_space!r}"
+        )
+    return layer_id_space
 
 
 def _oldlogprob_hidden_object_ref_enabled(micro_batch: Any) -> bool:
@@ -953,9 +970,7 @@ def _non_tensor_output_sample_count(model_output: dict[str, Any]) -> int:
 
     largest_index = -1
     chunk_meta = model_output.get(OLD_LOGPROB_HIDDEN_CHUNK_META_KEY)
-    meta_values = (
-        chunk_meta if isinstance(chunk_meta, (list, tuple)) else [chunk_meta]
-    )
+    meta_values = chunk_meta if isinstance(chunk_meta, (list, tuple)) else [chunk_meta]
     for meta in meta_values:
         if not isinstance(meta, dict):
             continue
@@ -1831,11 +1846,16 @@ def _find_layers_and_final_norm(engine: Any):
 
 
 def _hidden_state_capture_target(
-    layer_id: int, num_layers: int
+    layer_id: int, num_layers: int, *, layer_id_space: str = "decoder"
 ) -> tuple[str, int | None]:
     num_states = num_layers + 1
     index = int(layer_id)
-    hidden_state_index = index + 1 if index >= 0 else num_states + index
+    if index >= 0:
+        hidden_state_index = index + 1 if layer_id_space == "decoder" else index
+    else:
+        hidden_state_index = num_states + index
+    if layer_id_space not in {"decoder", "output"}:
+        raise ValueError(f"Unsupported old-logprob layer ID space: {layer_id_space!r}")
     if hidden_state_index <= 0 or hidden_state_index > num_layers:
         raise IndexError(
             f"SPECO old-logprob hidden layer id {layer_id} resolved to hidden-state index "
@@ -1907,11 +1927,14 @@ def _install_oldlogprob_hidden_hooks(
 
     selection_context = _build_selection_context(engine, output_args, micro_batch)
     aux_layer_ids = _oldlogprob_aux_layer_ids_from_batch(micro_batch)
+    layer_id_space = _oldlogprob_aux_layer_id_space(micro_batch)
     hidden_layout = _oldlogprob_hidden_layout(micro_batch)
     aux_keys = []
     required_modules = {}
     for layer_id in aux_layer_ids:
-        kind, layer_index = _hidden_state_capture_target(layer_id, len(layers))
+        kind, layer_index = _hidden_state_capture_target(
+            layer_id, len(layers), layer_id_space=layer_id_space
+        )
         key = "final" if kind == "final" else f"layer:{layer_index}"
         aux_keys.append(key)
         if kind == "final":
@@ -2042,10 +2065,12 @@ def _select_oldlogprob_hidden_states(
 
     context = _build_selection_context(engine, output_args, micro_batch)
     aux_layer_ids = _oldlogprob_aux_layer_ids_from_batch(micro_batch)
+    layer_id_space = _oldlogprob_aux_layer_id_space(micro_batch)
     hidden_layout = _oldlogprob_hidden_layout(micro_batch)
 
     aux_hidden_list = [
-        _resolve_hidden_state(hidden_states, layer_id) for layer_id in aux_layer_ids
+        _resolve_hidden_state(hidden_states, layer_id, layer_id_space=layer_id_space)
+        for layer_id in aux_layer_ids
     ]
     selected_hidden_list = list(aux_hidden_list)
     if hidden_layout in {"eagle3_aux_plus_last", "dflash_aux_plus_last"}:
@@ -2505,6 +2530,8 @@ def _megatron_map_aux_layers_to_stage(
     pp_rank: int,
     pp_size: int,
     num_global_layers: int,
+    *,
+    layer_id_space: str = "decoder",
 ) -> list[tuple[str, int | None]]:
     """Map global aux layer IDs to (kind, local_index) on the current PP stage.
 
@@ -2522,6 +2549,17 @@ def _megatron_map_aux_layers_to_stage(
     results: list[tuple[str, int | None]] = []
     for layer_id in aux_layer_ids:
         index = int(layer_id)
+        if layer_id_space == "output":
+            index -= 1
+        elif layer_id_space != "decoder":
+            raise ValueError(
+                f"Unsupported old-logprob layer ID space: {layer_id_space!r}"
+            )
+        if index < 0:
+            raise IndexError(
+                f"SPECO old-logprob hidden layer id {layer_id} cannot be "
+                f"captured from Megatron layers in {layer_id_space} space"
+            )
         if index == num_global_layers - 1:
             # Final layer maps to final_layernorm on the last stage.
             if pp_rank == pp_size - 1:
@@ -2559,6 +2597,7 @@ def _install_megatron_hidden_hooks(engine: Any, model: Any, micro_batch: Any) ->
     is_last_stage = selection_context["is_last_stage"]
 
     aux_layer_ids = _oldlogprob_aux_layer_ids_from_batch(micro_batch)
+    layer_id_space = _oldlogprob_aux_layer_id_space(micro_batch)
     hidden_layout = _oldlogprob_hidden_layout(micro_batch)
 
     # Determine the global number of layers.  With PP>1 each stage only has
@@ -2573,7 +2612,12 @@ def _install_megatron_hidden_hooks(engine: Any, model: Any, micro_batch: Any) ->
 
     # Map global aux layer IDs to this stage.
     stage_mapping = _megatron_map_aux_layers_to_stage(
-        aux_layer_ids, len(layers), pp_rank, pp_size, num_global_layers
+        aux_layer_ids,
+        len(layers),
+        pp_rank,
+        pp_size,
+        num_global_layers,
+        layer_id_space=layer_id_space,
     )
 
     aux_keys: list[str] = []

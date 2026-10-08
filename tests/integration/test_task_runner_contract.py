@@ -46,7 +46,9 @@ def test_worker_drafter_payload_keeps_generated_acceptance_sidecar(monkeypatch):
     assert payload["_speco_acceptance_stats_dir"] == "/tmp/run/.spec_decode_stats/run-x"
 
 
-def test_v1_worker_payload_allocates_and_persists_acceptance_sidecar(monkeypatch, tmp_path):
+def test_v1_worker_payload_allocates_and_persists_acceptance_sidecar(
+    monkeypatch, tmp_path
+):
     """V1 serializes workers before its trainer configures the vLLM runtime."""
     pytest.importorskip("ray")
     pytest.importorskip("verl")

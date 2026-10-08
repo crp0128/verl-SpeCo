@@ -54,10 +54,18 @@ def test_clear_drafter_config_env_removes_both_names(monkeypatch) -> None:
     assert get_drafter_config_env() == ""
 
 
-def test_worker_payload_retains_locator_without_overriding_user_config(monkeypatch) -> None:
+def test_worker_payload_retains_locator_without_overriding_user_config(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv(
         SPECO_DRAFTER_CONFIG_ENV,
-        json.dumps({"enable": True, "model_path": "stale", "_speco_acceptance_stats_dir": "/tmp/stats"}),
+        json.dumps(
+            {
+                "enable": True,
+                "model_path": "stale",
+                "_speco_acceptance_stats_dir": "/tmp/stats",
+            }
+        ),
     )
     original = {"enable": False, "model_path": "current"}
 
@@ -76,13 +84,47 @@ def test_worker_payload_allocates_and_reuses_run_locator(monkeypatch, tmp_path) 
     second = json.loads(serialize_worker_drafter_config(config, run_dir=tmp_path))
 
     assert first == second == json.loads(get_drafter_config_env())
-    assert os.path.dirname(first["_speco_acceptance_stats_dir"]) == str(tmp_path / ".spec_decode_stats")
+    assert os.path.dirname(first["_speco_acceptance_stats_dir"]) == str(
+        tmp_path / ".spec_decode_stats"
+    )
 
 
-def test_disabled_worker_ignores_invalid_runtime_payload_without_allocating(monkeypatch, tmp_path) -> None:
+def test_worker_payload_isolates_new_run_and_replaces_stale_config(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv(
+        SPECO_DRAFTER_CONFIG_ENV,
+        json.dumps(
+            {
+                "enable": False,
+                "model_path": "stale",
+                "_speco_acceptance_stats_dir": str(
+                    tmp_path / "old" / ".spec_decode_stats" / "run-old"
+                ),
+            }
+        ),
+    )
+    config = {"enable": True, "model_path": "current"}
+
+    payload = json.loads(
+        serialize_worker_drafter_config(config, run_dir=tmp_path / "new")
+    )
+
+    assert os.path.dirname(payload["_speco_acceptance_stats_dir"]) == str(
+        tmp_path / "new" / ".spec_decode_stats"
+    )
+    assert json.loads(get_drafter_config_env()) == payload
+
+
+def test_disabled_worker_ignores_invalid_runtime_payload_without_allocating(
+    monkeypatch, tmp_path
+) -> None:
     for runtime_payload in ("invalid json", "[]", "null"):
         monkeypatch.setenv(SPECO_DRAFTER_CONFIG_ENV, runtime_payload)
         config = {"enable": False}
 
-        assert json.loads(serialize_worker_drafter_config(config, run_dir=tmp_path)) == config
+        assert (
+            json.loads(serialize_worker_drafter_config(config, run_dir=tmp_path))
+            == config
+        )
         assert get_drafter_config_env() == runtime_payload

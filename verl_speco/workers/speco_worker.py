@@ -1053,7 +1053,7 @@ class SpecoWorker(Worker):
                 # retention, while this source version is used to validate a
                 # distributed training plan.
                 "collection_id": collection_id,
-                "collection_source_global_step": int(self.last_global_step),
+                "collection_source_global_step": int(self.last_global_step or 0),
             }
             for key in (
                 "hidden_position_start",

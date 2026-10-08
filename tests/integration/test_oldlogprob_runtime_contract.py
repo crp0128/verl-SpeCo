@@ -25,8 +25,10 @@ from verl_speco.integration.oldlogprob_runtime import (
     _assign_worker_payload,
     _extract_oldlogprob_non_tensor_model_output,
     _find_layers_and_final_norm,
+    _hidden_state_capture_target,
     _install_oldlogprob_fsdp_batch_postprocess_patch,
     _megatron_pp_exchange_tag,
+    _resolve_hidden_state,
     _select_and_merge_concatenated_hidden,
     _to_cpu_transfer_tensor,
     _worker_payload_rows,
@@ -49,7 +51,9 @@ def test_fsdp2_runtime_install_does_not_import_veomni(monkeypatch) -> None:
         raise AssertionError(f"unexpected backend import: {name}")
 
     monkeypatch.setattr(oldlogprob_runtime, "_PATCHED", True)
-    monkeypatch.setattr(oldlogprob_runtime.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(
+        oldlogprob_runtime.importlib, "import_module", fake_import_module
+    )
     monkeypatch.setattr(
         oldlogprob_runtime,
         "_install_oldlogprob_fsdp_batch_postprocess_patch",
@@ -143,17 +147,13 @@ def test_chunk_only_oldlogprob_output_advances_fallback_batch_offset() -> None:
         {
             "model_output": {
                 OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY: ["chunk-0"],
-                OLD_LOGPROB_HIDDEN_CHUNK_META_KEY: [
-                    {"sample_indices": [0, 1]}
-                ],
+                OLD_LOGPROB_HIDDEN_CHUNK_META_KEY: [{"sample_indices": [0, 1]}],
             }
         },
         {
             "model_output": {
                 OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY: ["chunk-1"],
-                OLD_LOGPROB_HIDDEN_CHUNK_META_KEY: [
-                    {"sample_indices": [0, 1]}
-                ],
+                OLD_LOGPROB_HIDDEN_CHUNK_META_KEY: [{"sample_indices": [0, 1]}],
             }
         },
     ]
@@ -171,9 +171,10 @@ def test_worker_payload_rows_preserve_per_sample_and_worker_payloads() -> None:
     assert _worker_payload_rows(
         ["sample-0", "sample-1"], batch_size=2, per_sample=True
     ) == ["sample-0", "sample-1"]
-    assert _worker_payload_rows(
-        ["chunk-0"], batch_size=2, per_sample=False
-    ) == [["chunk-0"], []]
+    assert _worker_payload_rows(["chunk-0"], batch_size=2, per_sample=False) == [
+        ["chunk-0"],
+        [],
+    ]
 
 
 def test_worker_chunk_payload_survives_actor_dp_tensordict_concat() -> None:
@@ -228,6 +229,40 @@ def test_eagle3_oldlogprob_falls_back_to_default_three_layers() -> None:
     assert (
         eagle3_num_aux_hidden_states_from_config({"speculative_algorithm": "EAGLE3"})
         is None
+    )
+
+
+def test_eagle3_output_ids_select_same_physical_hidden_states_as_vllm() -> None:
+    torch = pytest.importorskip("torch")
+    hidden_states = tuple(torch.tensor([index]) for index in range(37))
+
+    selected = [
+        _resolve_hidden_state(hidden_states, layer_id, layer_id_space="output")
+        for layer_id in [2, 18, 33]
+    ]
+
+    assert [int(value.item()) for value in selected] == [2, 18, 33]
+    assert _hidden_state_capture_target(2, 36, layer_id_space="output") == (
+        "layer",
+        1,
+    )
+
+
+def test_decoder_ids_keep_hf_embedding_offset_for_dflash_and_eagle12() -> None:
+    torch = pytest.importorskip("torch")
+    hidden_states = tuple(torch.tensor([index]) for index in range(37))
+
+    assert (
+        int(_resolve_hidden_state(hidden_states, 2, layer_id_space="decoder").item())
+        == 3
+    )
+    assert _hidden_state_capture_target(2, 36, layer_id_space="decoder") == (
+        "layer",
+        2,
+    )
+    assert _hidden_state_capture_target(35, 36, layer_id_space="decoder") == (
+        "final",
+        None,
     )
 
 
@@ -429,6 +464,4 @@ def test_veomni_batch_postprocess_keeps_router_replay_output() -> None:
     )
 
     assert result["model_output"]["routed_experts"] == "routes"
-    assert result["model_output"][OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY] == [
-        "hidden-ref"
-    ]
+    assert result["model_output"][OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY] == ["hidden-ref"]

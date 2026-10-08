@@ -43,6 +43,7 @@ from verl_speco.integration.drafter_config_env import (
     SPECO_DRAFTER_CONFIG_ENV,
     clear_drafter_config_env,
     get_drafter_config_env,
+    serialize_worker_drafter_config,
     set_drafter_config_env,
 )
 from verl_speco.trainer.checkpoint import trim_process_host_memory
@@ -1862,6 +1863,23 @@ patch_transformers_attention_layer_type_constants()
 install_verl_npu_vllm_import_compat()
 
 
+# Drafter params that some DSpark runtimes do not wire into inference.  vLLM's
+# GPU-native Qwen3DSparkForCausalLM.load_weights() carries
+# ``skip_substrs = ["mask_embedding", "confidence_head"]`` and its served
+# Qwen3DSparkModel never registers the confidence head, so publishing a trained
+# drafter's confidence-head weights into it raises on the unknown module.
+#
+# This is a *candidate* list, not an unconditional skip: other DSpark backends
+# (vllm-ascend is adding confidence-head support) do register these, and dropping
+# a published tensor there would silently stall that head at its initial values.
+# Callers must additionally confirm the resolved model lacks the parameter.
+_DSPARK_INFERENCE_ONLY_SKIPPED = ("confidence_head",)
+
+
+def _is_inference_only_skipped_dspark_param(name: str) -> bool:
+    return any(marker in name for marker in _DSPARK_INFERENCE_ONLY_SKIPPED)
+
+
 def _is_dspark_hf_config(hf_config: Any) -> bool:
     architectures = _get_nested(hf_config, ("architectures",), None) or []
     if isinstance(architectures, str):
@@ -2728,15 +2746,15 @@ def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
     if drafter_enabled is False:
         clear_drafter_config_env()
         engine_kwargs = _get_nested(rollout_cfg, ("engine_kwargs", "vllm"), None)
-        if isinstance(engine_kwargs, dict):
-            engine_kwargs.pop("speculative_config", None)
+        if engine_kwargs is not None:
+            _pop_child(engine_kwargs, "speculative_config")
         return
 
     drafter_cfg = _load_env_drafter_config()
     if not bool(drafter_cfg.get("enable")):
         engine_kwargs = _get_nested(rollout_cfg, ("engine_kwargs", "vllm"), None)
-        if isinstance(engine_kwargs, dict):
-            engine_kwargs.pop("speculative_config", None)
+        if engine_kwargs is not None:
+            _pop_child(engine_kwargs, "speculative_config")
         return
 
     speculative_config = build_vllm_speculative_config_from_drafter(
@@ -2751,7 +2769,7 @@ def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
     # The locator remains available through ``VERL_SPECO_DRAFTER_CONFIG`` for
     # the sidecar writer and V1 trainer fallback.
     additional_config = _ensure_child_mapping(engine_kwargs, "additional_config")
-    additional_config.pop(SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY, None)
+    _pop_child(additional_config, SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY)
     existing_spec = _get_nested(engine_kwargs, ("speculative_config",), None)
     merged_speculative_config = _merge_speculative_config(
         existing_spec, speculative_config
@@ -2766,8 +2784,7 @@ def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
     if (
         isinstance(existing_spec_mapping, dict)
         and existing_spec_mapping.get("model")
-        and merged_speculative_config.get("model")
-        != speculative_config.get("model")
+        and merged_speculative_config.get("model") != speculative_config.get("model")
     ):
         speculative_config = dict(speculative_config)
         speculative_config["model"] = existing_spec_mapping["model"]
@@ -3307,7 +3324,9 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     # here and keep it out of the config passed to vLLM.
     sidecar_dir = additional_config.pop(
         SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY, None
-    ) or _vllm_spec_decode_sidecar_dir()
+    ) or json.loads(serialize_worker_drafter_config(drafter_cfg, run_dir=run_dir)).get(
+        SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY
+    )
     if run_dir and not sidecar_dir:
         # Checkpoint directories are commonly reused for retries and resumes.
         # Keep cumulative worker counters per run so stale PID files cannot
@@ -4537,14 +4556,24 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 )
             storage_signatures = self._speco_parameter_storage_signatures(draft_model)
 
+        # Which parameters the resolved draft model actually exposes.  The skip
+        # below is gated on this rather than on ``is_dspark`` so that a backend
+        # which does register the confidence head (vllm-ascend is adding it)
+        # keeps receiving its updates without another change here.
+        target_param_names: set[str] = set()
+        if inner_model is not None:
+            target_param_names = {name for name, _ in inner_model.named_parameters()}
+            target_param_names.update(name for name, _ in inner_model.named_buffers())
+
         requested_names: list[str] = []
         loaded_names: set[str] = set()
         first_keys: list[str] = []
         bucket_count = 0
         loaded_params = 0
+        warned_skipped = False
 
         def on_bucket_received(bucket_weights, _is_last: bool = False):
-            nonlocal bucket_count, loaded_params
+            nonlocal bucket_count, loaded_params, warned_skipped
             # VERL synchronizes the device after this callback and before it
             # acknowledges/reuses the SHM bucket. Loading here therefore keeps
             # the source tensor alive long enough without cloning a complete
@@ -4552,6 +4581,29 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             translated_bucket = [
                 (translate_name(str(name)), tensor) for name, tensor in bucket_weights
             ]
+            if is_dspark and target_param_names:
+                skipped = {
+                    name
+                    for name, _ in translated_bucket
+                    if _is_inference_only_skipped_dspark_param(name)
+                    and name not in target_param_names
+                }
+                if skipped:
+                    translated_bucket = [
+                        (name, tensor)
+                        for name, tensor in translated_bucket
+                        if name not in skipped
+                    ]
+                    if not warned_skipped:
+                        warned_skipped = True
+                        logger.warning(
+                            "[speco draft ipc] %s does not register %d "
+                            "inference-only drafter param(s); skipping them so "
+                            "the publish can proceed: %s",
+                            type(inner_model).__name__,
+                            len(skipped),
+                            sorted(skipped)[:5],
+                        )
             if not translated_bucket:
                 return
             bucket_count += 1

@@ -46,7 +46,9 @@ def _serialize_v1_worker_drafter_config(drafter_config):
     the worker process. Preserve the run-scoped acceptance directory there so
     the spawned vLLM EngineCore inherits the same locator as the trainer.
     """
-    from verl_speco.integration.drafter_config_env import serialize_worker_drafter_config
+    from verl_speco.integration.drafter_config_env import (
+        serialize_worker_drafter_config,
+    )
 
     payload = _plain_config(drafter_config or {})
     if not isinstance(payload, dict):
@@ -89,9 +91,7 @@ class SpecoV1Mixin:
         vLLM rollout already has the required IPC receiver.  Add the narrow
         publish facade before the standalone replicas are created.
         """
-        serialized_drafter_config = _serialize_v1_worker_drafter_config(
-            drafter_config
-        )
+        serialized_drafter_config = _serialize_v1_worker_drafter_config(drafter_config)
         cached = getattr(
             SpecoV1Mixin, "_speco_v1_standalone_publish_worker_remote", None
         )
@@ -366,8 +366,18 @@ class SpecoV1Mixin:
             raise RuntimeError(
                 "V1 SPECO checkpoint manifest must contain a Feature Store cursor"
             )
+        # Writers have rank/PID-specific shard prefixes and can flush unequal
+        # numbers of shards. Their local next indices are not part of the
+        # shared manifest prefix that restore validates.
         unique_states = {
-            json.dumps(state.get("cursor"), sort_keys=True): state
+            json.dumps(
+                {
+                    key: value
+                    for key, value in state["cursor"].items()
+                    if key != "next_shard_index"
+                },
+                sort_keys=True,
+            ): state
             for state in states
             if isinstance(state, dict) and isinstance(state.get("cursor"), dict)
         }
@@ -485,10 +495,8 @@ class SpecoV1Mixin:
         self._wrap_v1_actor_worker()
         return result
 
-    def _speco_update_rollout_drafter_weights(
-        self, payload: Any, global_step: object, asynchronous: bool
-    ) -> None:
-        """Publish V1 separate-async drafts only to standalone replicas.
+    def _speco_drafter_publish_method(self, method_name: str):
+        """Route both publish and rollback to the replicas serving rollouts.
 
         The hybrid actor worker is in trainer mode during this boundary.  Its
         vLLM server must not consume the draft IPC stream; doing so races the
@@ -499,8 +507,8 @@ class SpecoV1Mixin:
         if mode != "separate_async":
             from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
 
-            return SpecoRayPPOTrainer._speco_update_rollout_drafter_weights(
-                cast(Any, self), payload, global_step, asynchronous
+            return SpecoRayPPOTrainer._speco_drafter_publish_method(
+                cast(Any, self), method_name
             )
 
         manager = getattr(self, "standalone_server_manager", None)
@@ -519,23 +527,7 @@ class SpecoV1Mixin:
                 cls=self._speco_v1_standalone_publish_worker_cls()
             ),
         )
-        method_name = (
-            "update_draft_weights_async" if asynchronous else "update_draft_weights"
-        )
-        update_result = getattr(worker_group, method_name)(
-            payload, global_steps=global_step
-        )
-        if asynchronous:
-            self._pending_drafter_publish_refs = update_result
-            self._pending_drafter_publish_payload = payload
-            self._pending_drafter_publish_step = global_step
-            return
-        try:
-            self._ray_get_if_needed(update_result)
-        except Exception:
-            self._speco_restore_last_published_drafter_weights()
-            raise
-        self._speco_record_published_drafter_weights(payload, global_step)
+        return getattr(worker_group, method_name)
 
     def _wrap_v1_actor_worker(self):
         rollout = self.config.actor_rollout_ref.rollout
@@ -951,9 +943,10 @@ class SpecoV1Mixin:
         # Accept legacy configs, but prefer the SpeCo runtime channel.  The
         # private sidecar locator must not be forwarded to newer validated
         # ``VllmConfig.additional_config`` mappings.
-        directory = additional_config.get(
-            SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY
-        ) or _vllm_spec_decode_sidecar_dir()
+        directory = (
+            additional_config.get(SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY)
+            or _vllm_spec_decode_sidecar_dir()
+        )
         if not directory and run_dir:
             # Compatibility fallback for launchers configured before per-run
             # sidecar directories were introduced.

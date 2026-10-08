@@ -44,9 +44,7 @@ def test_actor_hccl_groups_include_world_and_engine_meshes() -> None:
 
     engine = SimpleNamespace(
         device_mesh=_Mesh([fsdp_group], ["fsdp"]),
-        ulysses_device_mesh=_Mesh(
-            {"dp": dp_group, "sp": sp_group}, ["dp", "sp"]
-        ),
+        ulysses_device_mesh=_Mesh({"dp": dp_group, "sp": sp_group}, ["dp", "sp"]),
     )
     worker = SimpleNamespace(actor=SimpleNamespace(engine=engine))
     dist = SimpleNamespace(group=SimpleNamespace(WORLD=world_group))
@@ -57,12 +55,16 @@ def test_actor_hccl_groups_include_world_and_engine_meshes() -> None:
         dp_group,
         sp_group,
     ]
+
+
 @pytest.mark.parametrize("use_omegaconf", [False, True])
 def test_upstream_rollout_init_temporarily_hides_speco_drafter_config(
     use_omegaconf: bool,
 ) -> None:
     config = {"rollout": {"name": "vllm", "drafter": {"enable": True}}}
-    worker = SimpleNamespace(config=OmegaConf.create(config) if use_omegaconf else config)
+    worker = SimpleNamespace(
+        config=OmegaConf.create(config) if use_omegaconf else config
+    )
 
     with rollout_publish._without_speco_drafter_rollout_config(worker):
         rollout = worker.config.rollout if use_omegaconf else worker.config["rollout"]
@@ -98,7 +100,11 @@ def test_v1_agent_loop_config_excludes_speco_drafter() -> None:
     from verl_speco.integration.task_runner import SpecoTaskRunner
 
     config = OmegaConf.create(
-        {"actor_rollout_ref": {"rollout": {"name": "vllm", "drafter": {"enable": True}}}}
+        {
+            "actor_rollout_ref": {
+                "rollout": {"name": "vllm", "drafter": {"enable": True}}
+            }
+        }
     )
     agent_config = SpecoTaskRunner._v1_agent_loop_config(config)
 
@@ -707,7 +713,7 @@ def test_drafter_full_shard_mesh_can_be_enabled_for_fsdp2() -> None:
     )
     source = getsource(base_trainer.DrafterBaseTrainer._use_flattened_drafter_fsdp_mesh)
 
-    assert 'use_full_shard_fsdp_mesh' in source
+    assert "use_full_shard_fsdp_mesh" in source
     assert "force_full_shard" in source
 
 

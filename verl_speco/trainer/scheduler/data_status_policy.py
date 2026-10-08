@@ -94,6 +94,15 @@ class ConservativeTrainingDataStatusPolicy:
             target_version_consistent=target_version_consistent,
             data_version=common_data_version,
             data_version_consistent=data_version_consistent,
+            collection_source_steps=tuple(
+                sorted(
+                    {
+                        step
+                        for status in statuses
+                        for step in status.collection_source_steps
+                    }
+                )
+            ),
             buffer_version=min(s.buffer_version for s in statuses),
             worker_snapshots=worker_snapshots,
             min_sample_step=min(
