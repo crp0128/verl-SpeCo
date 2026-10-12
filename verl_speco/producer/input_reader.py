@@ -616,6 +616,53 @@ def prepare_generated_prefill_request(
     )
 
 
+def prepare_generated_replay_request(
+    request: GenerationRequest,
+    response_token_ids: Any,
+    config: Mapping[str, Any] | Any,
+) -> TokenizedRequest:
+    """Build a token replay row without applying hidden-feature constraints.
+
+    ``sequence_only`` is a data-generation mode, not a draft-training mode.
+    It therefore must not require a feature window, a minimum supervised-token
+    threshold, or a hidden-state prefill boundary.  The resulting request still
+    uses the common token/loss-mask representation consumed by the replay
+    writer, while its vLLM token list is the prompt plus completion excluding
+    the final sampled token (the same next-token convention as prefill mode).
+    """
+
+    response_ids = _token_ids(response_token_ids)
+    if not response_ids:
+        raise ValueError(
+            f"vLLM generated no response tokens for sample {request.sample_id!r}"
+        )
+    prompt_ids = list(request.prompt_token_ids)
+    full_ids = [*prompt_ids, *response_ids]
+    max_sequence_length = int(_config_value(config, "max_sequence_length", 0) or 0)
+    if max_sequence_length > 0 and len(full_ids) > max_sequence_length:
+        raise ValueError(
+            f"Producer sample {request.sample_id!r} has {len(full_ids)} tokens, "
+            f"exceeding max_sequence_length={max_sequence_length}"
+        )
+    input_ids = torch.tensor(full_ids, dtype=torch.int64)
+    loss_mask = build_loss_mask(input_ids, len(prompt_ids))
+    position_ids = torch.arange(len(full_ids), dtype=torch.int64)
+    feature_start = max(len(prompt_ids) - 1, 0)
+    feature_end = len(full_ids)
+    feature_positions = torch.arange(feature_start, feature_end, dtype=torch.int64)
+    return TokenizedRequest(
+        sequence_no=request.sequence_no,
+        sample_id=request.sample_id,
+        input_ids=input_ids,
+        loss_mask=loss_mask,
+        position_ids=position_ids,
+        feature_positions=feature_positions,
+        draft_position_ids=position_ids[feature_start:feature_end] + 1,
+        source_metadata=dict(request.source_metadata),
+        vllm_prompt_token_ids=tuple(full_ids[:-1]),
+    )
+
+
 def _prompt_ids(prompt: str | tuple[dict[str, str], ...], tokenizer: Any) -> list[int]:
     if isinstance(prompt, str):
         return _token_ids(tokenizer(prompt, add_special_tokens=False))
@@ -794,6 +841,7 @@ __all__ = [
     "iter_input_records",
     "prepare_generation_request",
     "prepare_generated_prefill_request",
+    "prepare_generated_replay_request",
     "tokenize_record",
     "tokenize_record_with_render_boundary",
 ]

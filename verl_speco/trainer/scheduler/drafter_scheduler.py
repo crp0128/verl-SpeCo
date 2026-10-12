@@ -469,16 +469,23 @@ class DrafterScheduler:
         self, context: AfterActorUpdateContext
     ) -> SchedulerEventOutcome:
         """Execute the prepared plan after the PPO actor update."""
-        plan = context.training_plan
+        return self.execute_prepared_training(context.training_plan, runtime_state=context.runtime_state)
+
+    def execute_prepared_training(self, plan: TrainingPlan, *, runtime_state) -> SchedulerEventOutcome:
+        """Execute once after the owner binds a plan, independently of actor ACK.
+
+        This method does not advance actor state or publish weights. The online
+        owner must join the actual actor and draft effects before publication.
+        """
         if not plan.launch:
             return SchedulerEventOutcome(training_plan=plan, metrics={})
         execution = self.execute_training_plan(
             plan,
-            runtime_state=context.runtime_state,
+            runtime_state=runtime_state,
         )
         outcome = TrainingOutcome.from_execution(
             execution,
-            runtime_state=context.runtime_state,
+            runtime_state=runtime_state,
             plan=plan,
         )
         return SchedulerEventOutcome(

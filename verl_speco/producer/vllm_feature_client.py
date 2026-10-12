@@ -68,6 +68,14 @@ class VllmResponse:
 
 
 @dataclass(frozen=True)
+class GeneratedTokens:
+    """Token IDs returned by a target generation request without hidden state."""
+
+    endpoint_url: str
+    generated_token_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class RawVllmFeature:
     payload: dict[str, Any]
     temporary_path: str
@@ -171,6 +179,57 @@ async def request_generate(
         endpoint_url=endpoint.base_url,
         generated_token_ids=tuple(int(token_id) for token_id in generated),
         handle=handle,
+    )
+
+
+async def request_generate_tokens(
+    endpoint: VllmEndpoint,
+    client: Any,
+    prompt_token_ids: list[int],
+    *,
+    model: str,
+    max_tokens: int,
+    timeout: float,
+    sampling_params: Mapping[str, Any] | None = None,
+) -> GeneratedTokens:
+    """Generate token IDs without requesting or materializing hidden states."""
+
+    params = dict(sampling_params or {})
+    extra_body = {"return_token_ids": True}
+    top_k = params.pop("top_k", None)
+    if top_k is not None:
+        extra_body["top_k"] = int(top_k)
+    request_kwargs: dict[str, Any] = {
+        "model": model,
+        "prompt": prompt_token_ids,
+        "max_tokens": max_tokens,
+        "extra_body": extra_body,
+        "timeout": timeout,
+    }
+    for name in ("temperature", "top_p", "seed"):
+        value = params.pop(name, None)
+        if value is not None:
+            request_kwargs[name] = value
+    if params:
+        raise ValueError(
+            "Unsupported sequence-only sampling parameters: "
+            f"{sorted(params)}"
+        )
+    response = await client.completions.create(**request_kwargs)
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        raise ValueError("vLLM generation response has no choices")
+    actual_prompt = getattr(choices[0], "prompt_token_ids", None)
+    if actual_prompt is not None and list(actual_prompt) != prompt_token_ids:
+        raise ValueError("vLLM generation prompt_token_ids mismatch")
+    generated = getattr(choices[0], "token_ids", None)
+    if not isinstance(generated, (list, tuple)) or not generated:
+        raise ValueError(
+            "vLLM generation response missing token_ids; enable return_token_ids support"
+        )
+    return GeneratedTokens(
+        endpoint_url=endpoint.base_url,
+        generated_token_ids=tuple(int(token_id) for token_id in generated),
     )
 
 
@@ -278,6 +337,100 @@ class VllmFeatureClientPool:
 
     async def generate(self, request: Any) -> RawVllmFeature:
         return await self._request(request, generate=True)
+
+    async def generate_tokens(
+        self,
+        request: Any,
+        *,
+        sampling_params: Mapping[str, Any] | None = None,
+    ) -> GeneratedTokens:
+        """Generate only token IDs; this path never requests hidden states."""
+
+        if not self._states:
+            raise RuntimeError("VllmFeatureClientPool.start() must be called first")
+        async with self._global_semaphore:
+            return await self._request_tokens_with_retries(
+                request, sampling_params=sampling_params
+            )
+
+    async def _request_tokens_with_retries(
+        self,
+        request: Any,
+        *,
+        sampling_params: Mapping[str, Any] | None = None,
+    ) -> GeneratedTokens:
+        total_attempts = _DEFAULT_MAX_RETRIES + 1
+        failed_in_round: set[str] = set()
+        for attempt in range(1, total_attempts + 1):
+            candidates = [
+                state
+                for state in self._states
+                if state.endpoint.base_url not in failed_in_round
+            ]
+            if not candidates:
+                failed_in_round.clear()
+                candidates = self._states
+            state = choose_endpoint(candidates)
+            state.inflight += 1
+            request_started = time.monotonic()
+            try:
+                async with state.semaphore:
+                    result = await request_generate_tokens(
+                        state.endpoint,
+                        state.client,
+                        list(request.prompt_token_ids),
+                        model=self.model,
+                        max_tokens=int(request.max_tokens),
+                        timeout=self.request_timeout,
+                        sampling_params=sampling_params,
+                    )
+                state.requests += 1
+                if self._should_log_success(state.requests):
+                    logger.info(
+                        "vLLM endpoint request succeeded endpoint=%s "
+                        "request_type=generate_tokens successful_requests=%s "
+                        "inflight=%s elapsed=%.3fs",
+                        state.endpoint.base_url,
+                        state.requests,
+                        state.inflight,
+                        time.monotonic() - request_started,
+                    )
+                return result
+            except ValueError:
+                raise
+            except Exception as exc:
+                failed_in_round.add(state.endpoint.base_url)
+                if attempt >= total_attempts:
+                    status_code, request_id, response_body = _http_error_detail(exc)
+                    logger.error(
+                        "vLLM token generation failed after %s attempts "
+                        "last_endpoint=%s sample_id=%s status_code=%s request_id=%s "
+                        "response_body=%s elapsed=%.3fs error=%s",
+                        total_attempts,
+                        state.endpoint.base_url,
+                        getattr(request, "sample_id", None),
+                        status_code,
+                        request_id,
+                        response_body,
+                        time.monotonic() - request_started,
+                        exc,
+                    )
+                    raise
+                backoff = _RETRY_BACKOFF_BASE_SECONDS**attempt
+                logger.warning(
+                    "vLLM token generation retry attempt=%s/%s endpoint=%s "
+                    "sample_id=%s retry_in=%ss error=%s",
+                    attempt,
+                    total_attempts,
+                    state.endpoint.base_url,
+                    getattr(request, "sample_id", None),
+                    backoff,
+                    exc,
+                )
+                await asyncio.sleep(backoff)
+            finally:
+                state.inflight = max(state.inflight - 1, 0)
+        raise RuntimeError("unreachable: token generation retry loop exhausted")
 
     async def _request(self, request: Any, *, generate: bool) -> RawVllmFeature:
         if not self._states:
