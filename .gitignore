@@ -136,3 +136,6 @@ logs
 log
 outputs
 .history
+
+# Temporary pytest directories created by Windows sandboxed runs.
+/pytest-cache-files-*/
