@@ -17,6 +17,8 @@ from verl_speco.workers.speco_worker import SpecoWorker
 
 def _worker() -> SpecoWorker:
     worker = SpecoWorker.__new__(SpecoWorker)
+    worker.replica_rank = 0
+    worker.worker_incarnation = "worker-0"
     data_buffer = DataBuffer(max_size=8)
     data_buffer.buffer.append({"value": "before"})
     data_buffer._current_step = 4

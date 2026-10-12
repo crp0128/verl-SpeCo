@@ -88,6 +88,7 @@ _CLEANUP_MAX_ATTEMPTS = 3
 @dataclass
 class ProducerStats:
     input_count: int = 0
+    saved_sequence_count: int = 0
     published_count: int = 0
     failed_count: int = 0
     dropped_count: int = 0
@@ -255,6 +256,11 @@ def _read_on_missing_response(producer_cfg: Any) -> str:
 
 
 def validate_producer_config(config: Any) -> str:
+    producer_cfg, _, tq_cfg = _config_sections(config)
+    if producer_cfg.get("mode", "tq") == "sequence_only":
+        from verl_speco.producer.replay import sequence_only_validate_sequence_only_config as _validate_sequence_only_config
+        _validate_sequence_only_config(producer_cfg, tq_cfg)
+        return "sequence_only"
     producer_cfg, training_cfg, tq_cfg = _config_sections(config)
     required = (
         "input_path",
@@ -406,6 +412,10 @@ async def run_producer(
 ) -> ProducerStats:
     """Run the bounded input -> vLLM -> TQ pipeline and publish EOS on success."""
 
+    producer_cfg, _, _ = _config_sections(config)
+    if producer_cfg.get("mode", "tq") == "sequence_only":
+        from verl_speco.producer.replay import run_sequence_only
+        return await run_sequence_only(config, tokenizer=tokenizer, client_pool=client_pool)
     on_missing_response = validate_producer_config(config)
     producer_cfg, drafter_cfg, tq_cfg = _config_sections(config)
     run_id = str(tq_cfg["run_id"])
@@ -660,6 +670,12 @@ async def run_producer(
                     sequence_no = source_sequence_no
                     source_sequence_no += 1
                     scanned_count += 1
+                    shard_count = int(producer_cfg.get("input_shard_count", 1))
+                    shard_index = int(producer_cfg.get("input_shard_index", 0))
+                    if not 0 <= shard_index < shard_count:
+                        raise ValueError("input shard index/count is invalid")
+                    if source_record.sequence_no % shard_count != shard_index:
+                        continue
                     if sequence_no in consumed_sequence_nos:
                         # Already consumed by a previous run; not a filtered row.
                         continue

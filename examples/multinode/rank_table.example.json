@@ -1,0 +1,6 @@
+{
+  "nodes": [
+    {"node_id": "producer-0", "address": "10.0.0.1", "device_count": 8},
+    {"node_id": "trainer-0", "address": "10.0.0.2", "device_count": 8}
+  ]
+}

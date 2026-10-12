@@ -1,0 +1,56 @@
+# Replace addresses, model paths and data paths before executing standalone.
+speco:
+  multinode_runtime:
+    mode: standalone
+    run_id: draft-multinode-example
+    generation: 1
+    external_services: true
+    topology:
+      rollout_nodes: 1
+      draft_nodes: 1
+      nproc_per_draft_node: 2
+      rollout_node_indices: [0]
+      draft_node_indices: [1]
+      target_tp: 2
+      target_dp: 1
+      draft_device_start: 0
+      draft_tp: 1
+      draft_pp: 1
+      draft_sp: 1
+      draft_ep: 1
+      master_addr: 10.0.0.2
+      master_port: 29500
+    ray:
+      address: 10.0.0.1:6379
+      namespace: transfer_queue
+      rollout_resource: speco_rollout
+      draft_resource: speco_draft
+      control_resource: speco_control
+      rl_learner_resource: speco_rl_learner
+    transfer_queue:
+      partition: speco_drafter_features
+      ready_shards: 1
+      capacity_bytes: 4294967296
+    execution:
+      backend: external_ray
+      trainer_engine: speco_fsdp2
+      device: cuda
+      vllm_endpoints: [http://10.0.0.1:8000/v1]
+      overrides:
+        - actor_rollout_ref.model.path=/models/target
+        - actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK
+        - actor_rollout_ref.rollout.drafter.model_path=/models/draft
+        - actor_rollout_ref.rollout.drafter.training.transfer_queue.enable=true
+        - actor_rollout_ref.rollout.drafter.training.feature_store.type=transfer_queue
+        - actor_rollout_ref.rollout.drafter.training.max_steps=10
+        - actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu=1
+        - speco.standalone_tq_producer.input_path=/data/training.jsonl
+        - speco.standalone_tq_producer.tokenizer_path=/models/target
+        - speco.standalone_tq_producer.target_model_id=target
+        - speco.standalone_tq_producer.target_model_revision=frozen-target-v1
+        - speco.standalone_tq_producer.tokenizer_fingerprint=frozen-tokenizer-v1
+        - speco.standalone_tq_producer.vllm_model=target
+        - speco.standalone_tq_producer.max_samples=20
+        - speco.standalone_tq_producer.target_layer_ids=[0,1]
+        - speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids=[1,2]
+      worker_env: {}
