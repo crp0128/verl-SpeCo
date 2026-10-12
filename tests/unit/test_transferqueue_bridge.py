@@ -119,6 +119,64 @@ def _config():
     }
 
 
+def test_generation_shards_preserve_order_and_isolate_records(fake_runtime, monkeypatch):
+    class ShardedTQ(_FakeTQ):
+        def kv_put(self, *, key, partition_id, fields, tag):
+            self.records[(partition_id, key)] = (fields, tag)
+        def kv_list(self, *, partition_id):
+            # TransferQueue 0.1.10 returns the partition wrapper, including
+            # an empty mapping when a generation has no records yet.
+            return {partition_id: {key: tag for (part, key), (_, tag) in self.records.items() if part == partition_id}}
+        def kv_batch_get(self, *, keys, partition_id):
+            return {key: self.records[(partition_id, key)][0] for key in keys}
+        def kv_clear(self, *, keys, partition_id):
+            for key in keys:
+                del self.records[(partition_id, key)]
+
+    fake = ShardedTQ()
+    monkeypatch.setattr(bridge, 'tq', fake)
+    config = _config()
+    config.update(partition_id='features:g1:s0', partition_ids=['features:g1:s0', 'features:g1:s1'])
+    assert bridge.configure_transfer_queue(config)
+    keys = [f'key-{i}' for i in range(20)]
+    for index, key in enumerate(keys):
+        bridge.put_sample(key, {'value': torch.tensor([index])}, tag={'index': index})
+    assert {partition for partition, _ in fake.records} == set(config['partition_ids'])
+    assert set(bridge.list_samples()) == set(keys)
+    fetched = bridge.get_samples(keys[::-1])
+    assert [int(fields['value'].item()) for _, fields in fetched] == list(range(19, -1, -1))
+    assert int(bridge.get_sample(keys[1])['value'].item()) == 1
+    native = bridge._native_tq_config(config)
+    assert 'partition_ids' not in native
+    monkeypatch.setitem(bridge._state, 'config', dict(config,
+        partition_id='features:g2:s0', partition_ids=['features:g2:s0', 'features:g2:s1']))
+    assert bridge.list_samples() == {}
+    bridge.put_sample(keys[0], {'value': torch.tensor([99])})
+    assert int(bridge.get_sample(keys[0])['value'].item()) == 99
+    monkeypatch.setitem(bridge._state, 'config', config)
+    bridge.clear_samples(keys)
+    assert bridge.list_samples() == {}
+    assert len(fake.records) == 1  # generation 2 remains owned by its own run.
+
+
+@pytest.mark.parametrize('parts', [[], ['same', 'same'], [''], 'not-a-list'])
+def test_invalid_partition_list_is_rejected(fake_runtime, parts):
+    config = _config()
+    config['partition_ids'] = parts
+    with pytest.raises(ValueError, match='partition_ids'):
+        bridge.configure_transfer_queue(config)
+    assert fake_runtime[0].init_calls == []
+
+
+def test_partition_binding_accepts_hydra_config_without_native_field_leaks(fake_runtime):
+    from omegaconf import OmegaConf
+    config = _config()
+    config['partition_ids'] = ['features:g1:s0', 'features:g1:s1']
+    assert bridge.configure_transfer_queue(OmegaConf.create(config))
+    assert bridge._partition_ids() == tuple(config['partition_ids'])
+    assert 'partition_ids' not in bridge._native_tq_config(bridge._state['config'])
+
+
 def test_owner_connects_ray_and_receives_only_native_tq_config(fake_runtime) -> None:
     fake_tq, fake_ray = fake_runtime
     config = _config()

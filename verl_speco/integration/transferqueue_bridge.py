@@ -113,6 +113,8 @@ def configure_transfer_queue(training_cfg: Any) -> bool:
 
     global _state
     tq_cfg = _extract_tq_config(training_cfg)
+    if tq_cfg is not None:
+        _partition_ids(tq_cfg)
     with _state_lock:
         _state["config"] = tq_cfg
         _state["enabled"] = bool(tq_cfg.get("enable")) if tq_cfg else False
@@ -148,13 +150,13 @@ def _extract_tq_config(training_cfg: Any) -> Optional[dict]:
 def _to_plain_dict(value: Any) -> dict:
     """Convert OmegaConf DictConfig / nested mapping to a plain dict."""
 
-    if hasattr(value, "to_container"):
-        try:
-            import omegaconf
-
-            return omegaconf.OmegaConf.to_container(value, resolve=True)  # type: ignore[arg-type]
-        except Exception:  # noqa: BLE001
-            pass
+    try:
+        from omegaconf import OmegaConf
+    except ImportError:
+        pass
+    else:
+        if OmegaConf.is_config(value):
+            return OmegaConf.to_container(value, resolve=True)
     if isinstance(value, dict):
         return {k: _to_plain_dict(v) for k, v in value.items()}
     return value
@@ -298,6 +300,7 @@ def _native_tq_config(tq_cfg: Mapping[str, Any]) -> dict[str, Any]:
         "package_version",
         "ray",
         "partition_id",
+        "partition_ids",
         "run_id",
         "schema_version",
         "connect_timeout_seconds",
@@ -322,6 +325,33 @@ def _partition_id() -> str:
     config = _state.get("config") or {}
     value = config.get("partition_id") if isinstance(config, Mapping) else None
     return str(value or _SPECO_TQ_PARTITION)
+
+
+def _partition_ids(config=None) -> tuple[str, ...]:
+    config = (_state.get("config") or {}) if config is None else config
+    value = config.get("partition_ids")
+    if value is None:
+        return (str(config.get("partition_id") or _SPECO_TQ_PARTITION),)
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or not value or any(
+        not isinstance(part, str) or not part.strip() for part in value
+    ) or len(set(value)) != len(value):
+        raise ValueError("partition_ids must be an ordered list of unique nonempty names")
+    return tuple(value)
+
+
+def _partition_for_key(key: str) -> str:
+    import hashlib
+
+    partitions = _partition_ids()
+    index = int.from_bytes(hashlib.sha256(str(key).encode()).digest()[:8], "big")
+    return partitions[index % len(partitions)]
+
+
+def _partitioned_keys(keys: Sequence[str]) -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = {}
+    for key in keys:
+        groups.setdefault(_partition_for_key(key), []).append(key)
+    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +394,7 @@ def put_sample(
     # incorrect. (Exact kwarg names verified against TQ 0.1.10 on first run.)
     tq.kv_put(
         key=key,
-        partition_id=_partition_id(),
+        partition_id=_partition_for_key(key),
         fields=payload,
         tag=tag or {},
     )
@@ -383,7 +413,7 @@ def get_sample(key: str) -> dict:
     _ensure_initialized()
     # TQ returns the stored sample (TensorDict-like). Return shape is version
     # dependent, so handle both a direct value and a {key: value} mapping.
-    result = tq.kv_batch_get(keys=[key], partition_id=_partition_id())
+    result = tq.kv_batch_get(keys=[key], partition_id=_partition_for_key(key))
     value = _extract_value(result, key)
     if value is None:
         return {}
@@ -396,28 +426,22 @@ def list_samples() -> dict[str, dict[str, Any]]:
     if not is_transfer_queue_enabled():
         raise RuntimeError("list_samples called while TransferQueue is not enabled.")
     _ensure_initialized()
-    result = tq.kv_list(partition_id=_partition_id())
-    if result is None:
-        return {}
-    if not isinstance(result, Mapping):
-        raise TypeError(f"tq.kv_list returned unsupported type {type(result)!r}")
-    # 0.1.10 returns key -> tag when partition_id is supplied.  Accept the
-    # partition -> (key -> tag) wrapper as well to keep the bridge version-safe.
-    nested = result.get(_partition_id())
-    if isinstance(nested, Mapping) and all(
-        isinstance(v, Mapping) for v in nested.values()
-    ):
-        result = nested
     records: dict[str, dict[str, Any]] = {}
-    for key, tag in result.items():
-        if tag is None:
-            records[str(key)] = {}
-        elif isinstance(tag, Mapping):
-            records[str(key)] = dict(tag)
-        else:
-            raise TypeError(
-                f"TQ tag for key {key!r} must be a mapping, got {type(tag)!r}"
-            )
+    for partition in _partition_ids():
+        result = tq.kv_list(partition_id=partition)
+        if result is None:
+            continue
+        if not isinstance(result, Mapping):
+            raise TypeError(f"tq.kv_list returned unsupported type {type(result)!r}")
+        nested = result.get(partition)
+        if isinstance(nested, Mapping) and all(isinstance(v, Mapping) for v in nested.values()):
+            result = nested
+        for key, tag in result.items():
+            if str(key) in records:
+                raise RuntimeError(f"TQ key {key!r} occurs in multiple configured partitions")
+            if tag is not None and not isinstance(tag, Mapping):
+                raise TypeError(f"TQ tag for key {key!r} must be a mapping, got {type(tag)!r}")
+            records[str(key)] = dict(tag or {})
     return records
 
 
@@ -432,12 +456,11 @@ def get_samples(keys: Sequence[str]) -> list[tuple[str, dict[str, Any]]]:
     if not is_transfer_queue_enabled():
         raise RuntimeError("get_samples called while TransferQueue is not enabled.")
     _ensure_initialized()
-    result = tq.kv_batch_get(keys=normalized_keys, partition_id=_partition_id())
-    values = _split_batch_result(result, normalized_keys)
-    return [
-        (key, _tensordict_to_dict(value))
-        for key, value in zip(normalized_keys, values, strict=True)
-    ]
+    values = {}
+    for partition, partition_keys in _partitioned_keys(normalized_keys).items():
+        result = tq.kv_batch_get(keys=partition_keys, partition_id=partition)
+        values.update(zip(partition_keys, _split_batch_result(result, partition_keys), strict=True))
+    return [(key, _tensordict_to_dict(values[key])) for key in normalized_keys]
 
 
 def clear_samples(keys: Sequence[str]) -> None:
@@ -449,7 +472,8 @@ def clear_samples(keys: Sequence[str]) -> None:
     if not is_transfer_queue_enabled():
         raise RuntimeError("clear_samples called while TransferQueue is not enabled.")
     _ensure_initialized()
-    tq.kv_clear(keys=normalized_keys, partition_id=_partition_id())
+    for partition, partition_keys in _partitioned_keys(normalized_keys).items():
+        tq.kv_clear(keys=partition_keys, partition_id=partition)
 
 
 def close_transfer_queue_client() -> None:
