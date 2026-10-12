@@ -460,18 +460,29 @@ class DFlashTrainingModel(nn.Module):
         ).unsqueeze(0) < valid_counts.unsqueeze(1).clamp(max=self.num_anchors)
         return torch.where(keep_mask, selected, 0), keep_mask
 
-    def _create_position_ids(self, anchor_positions: torch.Tensor, seq_len: int):
+    def _create_position_ids(
+        self, anchor_positions: torch.Tensor, seq_len: int,
+        position_ids: torch.Tensor | None = None,
+    ):
         bsz = anchor_positions.shape[0]
         device = anchor_positions.device
-        context_position_ids = (
-            self._cached_arange("context_positions", seq_len, device)
-            .unsqueeze(0)
-            .expand(bsz, -1)
-        )
+        if position_ids is None:
+            context_position_ids = (
+                self._cached_arange("context_positions", seq_len, device)
+                .unsqueeze(0).expand(bsz, -1)
+            )
+        else:
+            if position_ids.shape != (bsz, seq_len) or position_ids.dtype != torch.int64:
+                raise ValueError("packed context position_ids shape or dtype differs")
+            context_position_ids = position_ids
         offsets = self._cached_arange(
             "block_offsets", self.block_size, device, view_shape=(1, 1, -1)
         )
-        draft_position_ids = anchor_positions.unsqueeze(-1) + offsets
+        anchor_local_positions = (
+            anchor_positions if position_ids is None
+            else torch.gather(context_position_ids, 1, anchor_positions)
+        )
+        draft_position_ids = anchor_local_positions.unsqueeze(-1) + offsets
         return context_position_ids, draft_position_ids.view(bsz, -1)
 
     def _create_noise_embed(

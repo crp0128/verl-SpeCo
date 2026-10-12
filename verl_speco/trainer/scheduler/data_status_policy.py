@@ -71,7 +71,7 @@ class ConservativeTrainingDataStatusPolicy:
                 statuses[0].target_version if target_version_consistent else None
             ),
             target_version_consistent=target_version_consistent,
-            data_version=newest_sample_step,
+            data_version=(data_versions[0] if data_version_consistent else None),
             data_version_consistent=data_version_consistent,
             buffer_version=min(s.buffer_version for s in statuses),
             worker_snapshots=worker_snapshots,

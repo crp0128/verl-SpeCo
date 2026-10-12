@@ -22,9 +22,9 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import PretrainedConfig, PreTrainedModel
 
-from ..eagle.base import resolve_embedding_key
-from .configuration_dflash import DFlashConfig, resolve_rope_theta
-from .flex_attention import compile_friendly_flex_attention
+from verl_speco.models.eagle.base import resolve_embedding_key
+from verl_speco.models.dflash.configuration_dflash import DFlashConfig, resolve_rope_theta
+from verl_speco.models.dflash.flex_attention import compile_friendly_flex_attention
 
 
 class DFlashRMSNorm(nn.Module):
@@ -80,6 +80,20 @@ class DFlashRotaryEmbedding(nn.Module):
             self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
         )
+
+
+    def forward_positions(self, x: torch.Tensor, position_ids: torch.Tensor):
+        """Evaluate absolute positions without a scalar device-to-host maximum.
+
+        Window length does not bound absolute positions. Build frequencies in
+        FP32 from the base so model BF16 conversion cannot narrow inv_freq before
+        evaluating long positions, and retain the existing output dtype.
+        """
+        frequency = 1.0 / (self.base ** (
+            torch.arange(0, self.dim, 2, device=x.device, dtype=torch.float32) / self.dim))
+        angles = position_ids.to(device=x.device, dtype=torch.float32).unsqueeze(-1) * frequency
+        embedding = torch.cat((angles, angles), dim=-1)
+        return embedding.cos().to(x.dtype), embedding.sin().to(x.dtype)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -177,16 +191,13 @@ class DFlashAttention(nn.Module):
         v = v.view(bsz, total_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
-        cos, sin = self.rotary_emb(q, seq_len=total_len)
-        cos = cos.to(q.device).squeeze(1).squeeze(0)
-        sin = sin.to(q.device).squeeze(1).squeeze(0)
-
-        cos_q = cos[draft_position_ids].unsqueeze(1)
-        sin_q = sin[draft_position_ids].unsqueeze(1)
+        cos, sin = self.rotary_emb.forward_positions(q, full_position_ids)
+        cos_q = cos[:, ctx_len:].unsqueeze(1)
+        sin_q = sin[:, ctx_len:].unsqueeze(1)
         q = (q * cos_q) + (rotate_half(q) * sin_q)
 
-        cos_k = cos[full_position_ids].unsqueeze(1)
-        sin_k = sin[full_position_ids].unsqueeze(1)
+        cos_k = cos.unsqueeze(1)
+        sin_k = sin.unsqueeze(1)
         k = (k * cos_k) + (rotate_half(k) * sin_k)
 
         if block_mask is not None:

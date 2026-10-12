@@ -20,7 +20,7 @@ import torch.nn as nn
 
 from verl_speco.models.dflash import DFlashDraftModel
 
-from .configuration_dspark import DSparkConfig
+from verl_speco.models.dspark.configuration_dspark import DSparkConfig
 
 
 class DSparkForwardOutput:
@@ -176,9 +176,14 @@ class DSparkConfidenceHead(nn.Module):
 
 class DSparkDraftModel(DFlashDraftModel):
     config_class = DSparkConfig
+    # Transformers 5 expects a mapping here when init_weights calls
+    # tie_weights. DSpark has no tied parameters.
+    _tied_weights_keys = {}
+    all_tied_weights_keys = {}
 
     def __init__(self, config: DSparkConfig):
         super().__init__(config)
+        self.all_tied_weights_keys = {}
         self.markov_head = build_dspark_markov_head(config)
         self.enable_confidence_head = bool(
             getattr(config, "enable_confidence_head", False)

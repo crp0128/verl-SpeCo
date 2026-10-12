@@ -56,18 +56,23 @@ def test_status_policy_aggregates_distributed_capacity_conservatively() -> None:
     assert result.oldest_sample_step == 2
     assert result.newest_sample_step == 5
     assert not result.data_version_consistent
+    assert result.data_version is None
     assert result.worker_snapshots == {
         "0": {
             "buffer_version": 7,
             "data_version": 4,
             "worker_incarnation": "worker-0",
             "trainable_samples": 8,
+            "min_sample_step": None,
+            "max_sample_step": None,
         },
         "1": {
             "buffer_version": 9,
             "data_version": 5,
             "worker_incarnation": "worker-1",
             "trainable_samples": 8,
+            "min_sample_step": None,
+            "max_sample_step": None,
         },
     }
 
