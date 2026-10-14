@@ -3620,8 +3620,62 @@ class _SpecoVLLMHttpServerMixin:
             self, super().generate, args, kwargs
         )
 
+    def _speco_rollout_admission(self):
+        from verl_speco.integration.rollout_admission import RolloutAdmission
+
+        gate = getattr(self, "_speco_rollout_admission_gate", None)
+        if gate is None:
+            gate = RolloutAdmission()
+            self._speco_rollout_admission_gate = gate
+        return gate
+
+    async def speco_close_rollout_admission(self):
+        self._speco_rollout_admission().close()
+
+    async def speco_wait_rollout_idle(self):
+        await self._speco_rollout_admission().wait_idle()
+
+    async def speco_resume_rollout_admission(self):
+        self._speco_rollout_admission().resume()
+
+    async def speco_set_serving_drafter_revision(self, revision):
+        # The trainer calls this only after all weight commit RPCs have settled,
+        # while ordinary serving is quiescent behind the admission boundary.
+        self._speco_serving_drafter_revision = int(revision)
+
+    async def speco_generate_probe(self, *args, **kwargs):
+        # Dedicated RPC: public generation cannot opt out of admission by
+        # supplying a request ID or a private sampling parameter.
+        return await _speco_generate_with_request_stats_unblocked(
+            self, super().generate, args, kwargs
+        )
+
 
 async def _speco_generate_with_request_stats(self, generate, args, kwargs):
+    async with self._speco_rollout_admission().request():
+        return await _speco_generate_with_request_stats_unblocked(
+            self, generate, args, kwargs
+        )
+
+
+async def _speco_generate_with_request_stats_unblocked(self, generate, args, kwargs):
+    # Agent-loop metadata is not a vLLM SamplingParams field. SGLang consumes
+    # these hints separately; native vLLM returns its actual serving target
+    # revision through output.extra_fields["global_steps"]. Do not replace that
+    # revision with the potentially stale async prompt submission step.
+    sampling_params = kwargs.get("sampling_params")
+    positional_params = "sampling_params" not in kwargs and len(args) >= 2
+    if positional_params:
+        sampling_params = args[1]
+    if isinstance(sampling_params, dict):
+        clean_params = dict(sampling_params)
+        clean_params.pop("_verl_global_steps", None)
+        clean_params.pop("_verl_skip_drafter_collection", None)
+        if positional_params:
+            args = (args[0], clean_params, *args[2:])
+        else:
+            kwargs = {**kwargs, "sampling_params": clean_params}
+    revision_before = int(getattr(self, "_speco_serving_drafter_revision", 0))
     if not bool(getattr(self, "_speco_vllm_generate_entered", False)):
         logger.warning(
             "[speco acceptance bridge] generate wrapper entered class=%s mro=%s",
@@ -3638,6 +3692,13 @@ async def _speco_generate_with_request_stats(self, generate, args, kwargs):
         request_elapsed = time.perf_counter() - request_started
         extra_fields = getattr(output, "extra_fields", None)
         if isinstance(extra_fields, dict):
+            revision_after = int(getattr(self, "_speco_serving_drafter_revision", 0))
+            extra_fields["_speco_drafter_revision_min"] = min(
+                revision_before, revision_after
+            )
+            extra_fields["_speco_drafter_revision_max"] = max(
+                revision_before, revision_after
+            )
             extra_fields.setdefault(
                 f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_id",
                 str(request_id) if request_id is not None else None,
@@ -3764,6 +3825,11 @@ def _patch_upstream_vllm_http_server_methods(upstream_cls: type[Any]) -> bool:
     import inspect
 
     helper_names = (
+        "_speco_rollout_admission",
+        "speco_close_rollout_admission",
+        "speco_wait_rollout_idle",
+        "speco_resume_rollout_admission",
+        "speco_set_serving_drafter_revision",
         "_speco_request_id_from_generate_call",
         "_speco_pop_vllm_spec_decode_stats",
         "_speco_capture_request_spec_decode_stats",
@@ -3833,12 +3899,18 @@ def _patch_upstream_vllm_http_server_methods(upstream_cls: type[Any]) -> bool:
             self, original_generate.__get__(self, type(self)), args, kwargs
         )
 
+    async def generate_probe_with_speco_stats(self, *args, **kwargs):
+        return await _speco_generate_with_request_stats_unblocked(
+            self, original_generate.__get__(self, type(self)), args, kwargs
+        )
+
     setattr(launch_server_with_speco_stats, "_speco_vllm_http_method_bridge", True)
     setattr(run_server_with_speco_stats, "_speco_vllm_http_method_bridge", True)
     setattr(generate_with_speco_stats, "_speco_vllm_http_method_bridge", True)
     upstream_cls.launch_server = launch_server_with_speco_stats
     upstream_cls.run_server = run_server_with_speco_stats
     upstream_cls.generate = generate_with_speco_stats
+    upstream_cls.speco_generate_probe = generate_probe_with_speco_stats
     upstream_cls._speco_vllm_http_methods_patched = True
     return True
 

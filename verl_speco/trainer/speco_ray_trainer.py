@@ -1768,6 +1768,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         serving_version: int,
         *,
         generation_seconds: float | None = None,
+        opportunity_this_step: bool | None = None,
     ):
         """Feed one rollout step's per-request evidence to the freeze policy.
 
@@ -1818,7 +1819,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             request_accept_lens=accept_lens,
             response_tokens=response_tokens,
             generation_seconds=float(gen_time or 0.0),
-            opportunity_this_step=bool(self._speco_should_train_drafter_this_step()),
+            opportunity_this_step=(
+                bool(self._speco_should_train_drafter_this_step())
+                if opportunity_this_step is None
+                else bool(opportunity_this_step)
+            ),
             low_fraction=low_fraction,
         )
         decision = policy.observe(evidence)

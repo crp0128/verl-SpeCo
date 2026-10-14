@@ -211,6 +211,102 @@ def test_vllm_generate_initializes_once_and_preserves_request_stats(
     ]
 
 
+@pytest.mark.parametrize("pre_remote_patch", [False, True])
+def test_probe_rpc_bypasses_closed_admission_but_request_id_cannot(pre_remote_patch):
+    events = []
+
+    class UpstreamServer:
+        async def launch_server(self, *args, **kwargs):
+            pass
+
+        async def run_server(self, *args, **kwargs):
+            pass
+
+        async def generate(self, *args, **kwargs):
+            events.append(kwargs["request_id"])
+            return SimpleNamespace(extra_fields={})
+
+    if pre_remote_patch:
+        assert vllm_runtime._patch_upstream_vllm_http_server_methods(UpstreamServer)
+        server = UpstreamServer()
+    else:
+
+        class Server(_SpecoVLLMHttpServerMixin, UpstreamServer):
+            pass
+
+        server = Server()
+
+    async def scenario():
+        await server.speco_close_rollout_admission()
+        production = asyncio.create_task(
+            server.generate(request_id="speco-freeze-probe-spoofed")
+        )
+        await asyncio.sleep(0)
+        assert events == []
+        await asyncio.wait_for(server.speco_wait_rollout_idle(), 1)
+        output = await asyncio.wait_for(
+            server.speco_generate_probe(request_id="paired-arm"), 1
+        )
+        assert output.extra_fields["_speco_vllm_request_id"] == "paired-arm"
+        assert events == ["paired-arm"]
+        assert not production.done()
+        await server.speco_resume_rollout_admission()
+        await asyncio.wait_for(production, 1)
+        assert events == ["paired-arm", "speco-freeze-probe-spoofed"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("pre_remote_patch", [False, True])
+@pytest.mark.parametrize("positional", [False, True])
+@pytest.mark.parametrize("probe", [False, True])
+def test_vllm_sampling_removes_agent_metadata_preserves_serving_step(
+    pre_remote_patch, positional, probe
+):
+    params = {
+        "temperature": 0.7,
+        "max_tokens": 64,
+        "_verl_global_steps": 2,
+        "_verl_skip_drafter_collection": True,
+    }
+
+    class Upstream:
+        async def launch_server(self):
+            pass
+
+        async def run_server(self, args):
+            pass
+
+        async def generate(self, prompt_ids, sampling_params, request_id):
+            assert prompt_ids == [1, 2]
+            assert sampling_params == {"temperature": 0.7, "max_tokens": 64}
+            assert request_id == "metadata-request"
+            # Native async serving revision, not prompt submission version.
+            return SimpleNamespace(extra_fields={"global_steps": 5})
+
+    if pre_remote_patch:
+        assert vllm_runtime._patch_upstream_vllm_http_server_methods(Upstream)
+        server = Upstream()
+    else:
+
+        class Server(_SpecoVLLMHttpServerMixin, Upstream):
+            pass
+
+        server = Server()
+    method = server.speco_generate_probe if probe else server.generate
+    if positional:
+        output = asyncio.run(method([1, 2], params, "metadata-request"))
+    else:
+        output = asyncio.run(
+            method(
+                prompt_ids=[1, 2], sampling_params=params, request_id="metadata-request"
+            )
+        )
+    assert output.extra_fields["global_steps"] == 5
+    assert params["_verl_global_steps"] == 2
+    assert params["_verl_skip_drafter_collection"] is True
+
+
 @pytest.mark.parametrize(
     "failure_mode",
     ["upstream_error", "metadata_error", "no_extra_fields", "invalid_extra_fields"],
@@ -1487,6 +1583,8 @@ def test_vllm_http_server_transports_final_request_acceptance_stats() -> None:
         f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_accepted_tokens": 9.0,
         "_speco_vllm_request_id": "request-1",
         "_speco_vllm_request_verify_rounds": 4.0,
+        "_speco_drafter_revision_min": 0,
+        "_speco_drafter_revision_max": 0,
         "_speco_vllm_request_draft_tokens": 28.0,
         "_speco_vllm_request_accepted_tokens": 9.0,
         "_speco_vllm_request_invalid_spec_tokens": None,
@@ -1698,6 +1796,8 @@ def test_vllm_http_server_transports_stats_with_positional_request_id() -> None:
         f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_accepted_tokens": 5.0,
         "_speco_vllm_request_id": "request-1",
         "_speco_vllm_request_verify_rounds": 3.0,
+        "_speco_drafter_revision_min": 0,
+        "_speco_drafter_revision_max": 0,
         "_speco_vllm_request_draft_tokens": 21.0,
         "_speco_vllm_request_accepted_tokens": 5.0,
         "_speco_vllm_request_invalid_spec_tokens": None,

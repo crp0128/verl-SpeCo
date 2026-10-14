@@ -276,6 +276,103 @@ def test_async_publish_waits_after_upstream_weight_sync():
     assert trainer._speco_v1_pending_training is False
 
 
+@pytest.mark.parametrize("failure", [None, "abort", "publish"])
+def test_colocate_probe_boundary_holds_admission_and_releases_on_failure(failure):
+    events = []
+
+    class Upstream:
+        def on_step_end(self):
+            events.append("target_sync_engine_resume")
+
+    class Checkpoints:
+        def abort_replicas(self):
+            events.append("abort")
+            if failure == "abort":
+                raise RuntimeError("abort failed")
+
+        def sleep_replicas(self):
+            events.append("sleep")
+
+    class Harness(SpecoV1Mixin, Upstream):
+        config = _config(mode="colocate_async")
+        checkpoint_manager = Checkpoints()
+
+        def _speco_rollout_admission_rpc(self, method):
+            events.append(method)
+
+        def _speco_finalize_v1_drafter_publish(self):
+            assert self._speco_colocate_admission_closed
+            events.append("paired_probe_publish")
+            if failure == "publish":
+                raise RuntimeError("publish failed")
+            return {}
+
+    trainer = Harness()
+    trainer.config.actor_rollout_ref.rollout.drafter.training[
+        "drafter_convergence_freeze"
+    ] = {"enabled": True}
+    if failure == "abort":
+        with pytest.raises(RuntimeError, match="abort failed"):
+            trainer.on_sample_end()
+        assert events == [
+            "speco_close_rollout_admission",
+            "abort",
+            "speco_resume_rollout_admission",
+        ]
+    else:
+        trainer.on_sample_end()
+        if failure:
+            with pytest.raises(RuntimeError, match="publish failed"):
+                trainer.on_step_end()
+        else:
+            trainer.on_step_end()
+        assert events == [
+            "speco_close_rollout_admission",
+            "abort",
+            "speco_wait_rollout_idle",
+            "sleep",
+            "target_sync_engine_resume",
+            "paired_probe_publish",
+            "speco_resume_rollout_admission",
+        ]
+    assert trainer._speco_colocate_admission_closed is False
+
+
+@pytest.mark.parametrize("saved", [False, True])
+def test_async_branch_checkpoint_requires_real_tq_snapshot(tmp_path, saved):
+    class Parent:
+        def _save_checkpoint(self):
+            if saved:
+                queue = tmp_path / "transfer_queue"
+                queue.mkdir()
+                (queue / "metadata.json").write_text('{"global_steps":3}')
+
+    class Harness(SpecoV1Mixin, Parent):
+        global_steps = 3
+        config = _config(mode="colocate_async")
+        _speco_colocate_admission_closed = True
+
+        def _speco_online_enabled_from_config(self, config):
+            return False
+
+        def _speco_freeze_branch_config(self):
+            return {"enabled": True}
+
+        def _speco_v1_checkpoint_directory(self):
+            return str(tmp_path)
+
+    trainer = Harness()
+    if not saved:
+        with pytest.raises(RuntimeError, match="TransferQueue snapshot"):
+            trainer._save_checkpoint()
+    else:
+        trainer._save_checkpoint()
+        assert trainer._speco_v1_async_checkpoint_evidence["checkpoint_step"] == 3
+        assert trainer._speco_v1_async_checkpoint_evidence[
+            "inflight_prompts_reissued_on_resume"
+        ]
+
+
 def test_final_colocate_async_step_does_not_prefetch_an_unconsumed_rollout():
     events = []
 

@@ -189,12 +189,13 @@ def test_probe_uses_fixed_prompts_servers_and_never_tq(monkeypatch):
     assert all(kwargs["sampling_params"]["temperature"] == 0 for _, kwargs in calls)
 
 
-def test_v1_rejects_async_freeze_instead_of_silently_ignoring_probe():
+@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+def test_v1_freeze_allows_only_modes_with_fixed_target_probe_boundary(mode):
     from omegaconf import OmegaConf
 
     config = OmegaConf.create(
         {
-            "trainer": {"v1": {"trainer_mode": "colocate_async"}},
+            "trainer": {"v1": {"trainer_mode": mode}},
             "actor_rollout_ref": {
                 "rollout": {
                     "name": "vllm",
@@ -211,8 +212,102 @@ def test_v1_rejects_async_freeze_instead_of_silently_ignoring_probe():
             "algorithm": {},
         }
     )
-    with pytest.raises(ValueError, match="trainer_mode=sync"):
+    if mode == "separate_async":
+        with pytest.raises(ValueError, match="sync or colocate_async"):
+            SpecoV1Mixin._speco_validate_v1_training_config(config)
+    else:
         SpecoV1Mixin._speco_validate_v1_training_config(config)
+
+
+def test_async_freeze_projects_actual_revisions_without_changing_ppo_or_hard_batch():
+    import numpy as np
+    from omegaconf import OmegaConf
+    from verl.protocol import DataProto
+    import json
+
+    evidence = DataProto(
+        non_tensor_batch={
+            "_speco_vllm_request_id": np.array(["pure", "stale", "mixed", "missing"]),
+            "_verl_request_mean_accept_len": np.array([3.0, 4.0, 2.0, 3.0]),
+            "_speco_drafter_revision_min": np.array([2, 1, 1, None], dtype=object),
+            "_speco_drafter_revision_max": np.array([2, 1, 2, None], dtype=object),
+            "_speco_drafter_revision_stats": np.array(
+                [
+                    None,
+                    None,
+                    json.dumps(
+                        [
+                            {
+                                "revision": 1,
+                                "verify_rounds": 1,
+                                "accepted_tokens": 1,
+                                "response_tokens": 4,
+                            },
+                            {
+                                "revision": 2,
+                                "verify_rounds": 3,
+                                "accepted_tokens": 6,
+                                "response_tokens": 8,
+                            },
+                        ]
+                    ),
+                    None,
+                ],
+                dtype=object,
+            ),
+        },
+        meta_info={"speco_v1_padding_rows": 0},
+    )
+    observed = []
+
+    class Parent:
+        def _compute_old_log_prob(self, batch, metrics):
+            return batch
+
+    class Harness(SpecoV1Mixin, Parent):
+        config = OmegaConf.create(
+            {
+                "trainer": {"v1": {"trainer_mode": "colocate_async"}},
+                "actor_rollout_ref": {
+                    "rollout": {
+                        "drafter": {
+                            "training": {
+                                "drafter_convergence_freeze": {"enabled": True}
+                            }
+                        }
+                    }
+                },
+            }
+        )
+        global_steps = 3
+        _speco_freeze_policy = SimpleNamespace(drafter_version=2)
+
+        def _speco_v1_batch_data(self, batch):
+            return None, evidence
+
+        def _speco_populate_request_accept_len_records(self, data):
+            self.requests = data.non_tensor_batch["_speco_vllm_request_id"].tolist()
+
+        def _speco_observe_rollout_evidence(self, data, version, **kwargs):
+            observed.append(
+                (self.requests[:], version, kwargs["opportunity_this_step"])
+            )
+
+        def _speco_should_train_drafter_this_step(self):
+            return True
+
+        def _speco_freeze_metrics(self):
+            return {}
+
+        def _speco_oldlogprob_collection_enabled(self):
+            return False
+
+    trainer, batch, metrics = Harness(), object(), {}
+    assert trainer._compute_old_log_prob(batch, metrics) is batch
+    assert observed == [(["stale", "mixed"], 1, False), (["pure", "mixed"], 2, True)]
+    assert trainer.requests == ["pure", "stale", "mixed", "missing"]
+    assert metrics["drafter/freeze_revision_matched_rows"] == 3
+    assert metrics["drafter/freeze_revision_excluded_rows"] == 1
 
 
 def test_v1_raw_prompt_probe_uses_continuous_tokens_once_and_caps_left(monkeypatch):
