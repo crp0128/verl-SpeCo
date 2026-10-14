@@ -16,3 +16,6 @@ torchdata
 codetiming
 orjson
 einops
+cachetools
+fastapi
+uvicorn
