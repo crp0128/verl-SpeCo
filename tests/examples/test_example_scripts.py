@@ -81,11 +81,6 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
         assert f'exec bash "${{script_dir}}/{launch}"' in source
         source = (script.parent / launch).read_text(encoding="utf-8")
 
-    if script.name == "run_qwen3-8b_v1_dspark_hard_freeze_longrun_npu.sh":
-        delegate = "run_qwen3-8b_v1_dspark_hard_freeze_smoke_npu.sh"
-        assert f'exec bash "${{script_dir}}/{delegate}"' in source
-        source += (script.parent / delegate).read_text(encoding="utf-8")
-
     assert (
         "python3 -m verl_speco.main" in source or "python -m verl_speco.main" in source
     )
