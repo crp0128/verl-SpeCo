@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -59,7 +60,13 @@ def _require_working_bash() -> str:
 @pytest.mark.parametrize("script", EXAMPLES, ids=lambda path: path.name)
 def test_example_shell_syntax_is_valid(script: Path) -> None:
     bash = _require_working_bash()
-    subprocess.run([bash, "-n", str(script)], check=True)
+    path = str(script)
+    if os.name == "nt":
+        if "system32" in bash.lower():
+            path = "/mnt/" + script.drive.rstrip(":").lower() + "/" + script.relative_to(script.anchor).as_posix()
+        else:
+            path = script.as_posix()
+    subprocess.run([bash, "-n", path], check=True)
 
 
 @pytest.mark.parametrize("script", PPO_EXAMPLES, ids=lambda path: path.name)
@@ -73,6 +80,11 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
         launch = "run_qwen3-8b_v1_dspark_hard_freeze_smoke_npu.sh"
         assert f'exec bash "${{script_dir}}/{launch}"' in source
         source = (script.parent / launch).read_text(encoding="utf-8")
+
+    if script.name == "run_qwen3-8b_v1_dspark_hard_freeze_longrun_npu.sh":
+        delegate = "run_qwen3-8b_v1_dspark_hard_freeze_smoke_npu.sh"
+        assert f'exec bash "${{script_dir}}/{delegate}"' in source
+        source += (script.parent / delegate).read_text(encoding="utf-8")
 
     assert (
         "python3 -m verl_speco.main" in source or "python -m verl_speco.main" in source
@@ -285,8 +297,8 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     assert "dynamic_spec" not in mrv2_source
     assert "SPECO MRV2 run directory" not in mrv2_source
     assert "tee -a" not in mrv2_source
-    assert "MODEL_PATH=/path/to/model" in mrv2_source
-    assert "CKPTS_DIR=/path/to/checkpoint" in mrv2_source
-    assert "TRAIN_FILE=/path/to/train_file" in mrv2_source
-    assert "TEST_FILE=/path/to/test_file" in mrv2_source
-    assert "DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter" in mrv2_source
+    assert "MODEL_PATH=${MODEL_PATH:-/path/to/model}" in mrv2_source
+    assert "CKPTS_DIR=${CKPTS_DIR:-/path/to/checkpoint}" in mrv2_source
+    assert "TRAIN_FILE=${TRAIN_FILE:-/path/to/train_file}" in mrv2_source
+    assert "TEST_FILE=${TEST_FILE:-/path/to/test_file}" in mrv2_source
+    assert "DRAFTER_PATH=${DRAFTER_PATH:-/path/to/vllm-compatible-dspark-drafter}" in mrv2_source
