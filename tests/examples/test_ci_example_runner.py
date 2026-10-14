@@ -119,6 +119,24 @@ def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
     assert "tests/ci" not in source
 
 
+def test_torch_unit_dependencies_include_v1_stateful_dataloader() -> None:
+    requirements = (ROOT / "ci" / "requirements-unit.txt").read_text()
+    assert "torchdata" in requirements.splitlines()
+
+
+def test_hccl_logs_use_the_container_workspace_not_host_temp_path() -> None:
+    workflow = _workflow("npu_vllm_unit_tests.yml")
+    steps = next(
+        job["steps"] for job in workflow["jobs"].values()
+        if job.get("name") == "NPU two-card HCCL smoke"
+    )
+    run = next(step["run"] for step in steps if "ci/npu_hccl_smoke.py" in step.get("run", ""))
+    assert "mkdir -p ci-artifacts" in run
+    assert "tee ci-artifacts/hccl-smoke.log" in run
+    artifact = next(step["with"] for step in steps if step.get("name") == "Upload HCCL log")
+    assert artifact["path"] == "ci-artifacts/hccl-smoke.log"
+
+
 def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
     for workflow_name, accelerator, backend, expected_drafters in (
         ("gpu_vllm_unit_tests.yml", "gpu", "vllm", {"eagle3", "dflash"}),

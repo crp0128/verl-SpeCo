@@ -275,7 +275,7 @@ class SpecoV1Mixin:
             waited = self._speco_wait_pending_drafter_publish()
             metrics["drafter/publish_waited_after_weight_sync"] = int(waited)
             metrics["drafter/publish_safe_point_after_weight_sync"] = 1
-            if run_probe and before_arm is not None:
+            if run_probe and before_arm is not None and policy is not None:
                 try:
                     probe = self._speco_build_freeze_probe_comparison(
                         before_arm,

@@ -74,10 +74,10 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
     script: Path,
 ) -> None:
     source = script.read_text(encoding="utf-8")
-    if script.name == "run_qwen3-8b_v1_dspark_hard_freeze_longrun_npu.sh":
+    if script.name == "run_qwen3-8b_v1_hard_freeze_longrun_drafter_dspark_vllm_npu.sh":
         # This wrapper changes dimensions/policy, then reuses the complete
         # launch so its entrypoint and drafter switches cannot drift.
-        launch = "run_qwen3-8b_v1_dspark_hard_freeze_smoke_npu.sh"
+        launch = "run_qwen3-8b_v1_hard_freeze_smoke_drafter_dspark_vllm_npu.sh"
         assert f'exec bash "${{script_dir}}/{launch}"' in source
         source = (script.parent / launch).read_text(encoding="utf-8")
 
@@ -99,7 +99,7 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
 
 def test_v1_hard_freeze_longrun_uses_full_dimensions_and_normal_policy() -> None:
     source = (
-        ROOT / "examples" / "run_qwen3-8b_v1_dspark_hard_freeze_longrun_npu.sh"
+        ROOT / "examples" / "run_qwen3-8b_v1_hard_freeze_longrun_drafter_dspark_vllm_npu.sh"
     ).read_text(encoding="utf-8")
     for setting in (
         "export SPECO_TRAIN_BATCH_SIZE=64",
@@ -117,7 +117,7 @@ def test_v1_hard_freeze_longrun_uses_full_dimensions_and_normal_policy() -> None
 
 def test_v1_hard_freeze_runner_selection_is_explicit_in_ray_environment() -> None:
     source = (
-        ROOT / "examples" / "run_qwen3-8b_v1_dspark_hard_freeze_smoke_npu.sh"
+        ROOT / "examples" / "run_qwen3-8b_v1_hard_freeze_smoke_drafter_dspark_vllm_npu.sh"
     ).read_text(encoding="utf-8")
     # An existing Ray head does not inherit the launcher's shell exports.
     for name in ("VLLM_USE_V1", "VLLM_USE_V2_MODEL_RUNNER"):

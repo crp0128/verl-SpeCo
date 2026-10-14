@@ -11,3 +11,4 @@ safetensors
 pillow
 scipy
 psutil
+torchdata

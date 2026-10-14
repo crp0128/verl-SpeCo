@@ -25,7 +25,7 @@ export SPECO_USE_DATA_BUFFER=true
 export SPECO_DATA_BUFFER_MAX_SIZE=1024
 export SPECO_FEATURE_STORE_SHUFFLE=false
 freeze=actor_rollout_ref.rollout.drafter.training.drafter_convergence_freeze
-exec bash "${script_dir}/run_qwen3-8b_v1_dspark_hard_freeze_smoke_npu.sh" \
+exec bash "${script_dir}/run_qwen3-8b_v1_hard_freeze_smoke_drafter_dspark_vllm_npu.sh" \
     actor_rollout_ref.rollout.drafter.training.dspark_collect_samples_per_step=80 \
     "${freeze}.observation.min_requests_per_version=256" \
     "${freeze}.observation.min_rollout_steps_per_version=2" \

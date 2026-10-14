@@ -16,13 +16,13 @@ on:
         required: true
         type: choice
         options:
-          - examples/dspark_mrv2/run_qwen3-4b_drafter_dspark_colocate_async_vllm_gpu.sh
-          - examples/dspark_mrv2/run_qwen3-4b_drafter_dspark_separate_async_vllm_gpu.sh
-          - examples/dspark_mrv2/run_qwen3-4b_drafter_dspark_vllm_gpu.sh
+          - examples/dspark_mrv2/run_qwen3-4b_drafter_dspark_colocate_async_vllm.sh
+          - examples/dspark_mrv2/run_qwen3-4b_drafter_dspark_separate_async_vllm.sh
+          - examples/dspark_mrv2/run_qwen3-4b_drafter_dspark_vllm.sh
           - examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_colocate_async_vllm_npu.sh
           - examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_separate_async_vllm_npu.sh
-          - examples/run_qwen3-8b_v1_dspark_hard_freeze_longrun_npu.sh
-          - examples/run_qwen3-8b_v1_dspark_hard_freeze_smoke_npu.sh
+          - examples/run_qwen3-8b_v1_hard_freeze_longrun_drafter_dspark_vllm_npu.sh
+          - examples/run_qwen3-8b_v1_hard_freeze_smoke_drafter_dspark_vllm_npu.sh
           - examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_vllm_npu.sh
           - examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm.sh
           - examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm_npu.sh

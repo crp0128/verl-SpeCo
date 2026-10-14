@@ -278,11 +278,12 @@ jobs:
           ASCEND_RT_VISIBLE_DEVICES: "0,1"
         run: |
           set -euo pipefail
-          python -m torch.distributed.run --standalone --nproc-per-node=2 ci/npu_hccl_smoke.py 2>&1 | tee "${{ runner.temp }}/hccl-smoke.log"
+          mkdir -p ci-artifacts
+          python -m torch.distributed.run --standalone --nproc-per-node=2 ci/npu_hccl_smoke.py 2>&1 | tee ci-artifacts/hccl-smoke.log
       - name: Upload HCCL log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: npu-hccl-log
-          path: ${{ runner.temp }}/hccl-smoke.log
+          path: ci-artifacts/hccl-smoke.log
           if-no-files-found: warn
