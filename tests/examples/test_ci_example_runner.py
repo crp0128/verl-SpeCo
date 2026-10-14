@@ -121,7 +121,7 @@ def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
 
 def test_torch_unit_dependencies_include_v1_stateful_dataloader() -> None:
     requirements = (ROOT / "ci" / "requirements-unit.txt").read_text()
-    assert "torchdata" in requirements.splitlines()
+    assert {"torchdata", "codetiming", "orjson", "einops"} <= set(requirements.splitlines())
 
 
 def test_hccl_logs_use_the_container_workspace_not_host_temp_path() -> None:
