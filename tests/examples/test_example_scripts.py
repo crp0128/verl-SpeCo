@@ -67,6 +67,12 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
     script: Path,
 ) -> None:
     source = script.read_text(encoding="utf-8")
+    if script.name == "run_qwen3-8b_v1_dspark_hard_freeze_longrun_npu.sh":
+        # This wrapper changes dimensions/policy, then reuses the complete
+        # launch so its entrypoint and drafter switches cannot drift.
+        launch = "run_qwen3-8b_v1_dspark_hard_freeze_smoke_npu.sh"
+        assert f'exec bash "${{script_dir}}/{launch}"' in source
+        source = (script.parent / launch).read_text(encoding="utf-8")
 
     assert (
         "python3 -m verl_speco.main" in source or "python -m verl_speco.main" in source
@@ -82,6 +88,33 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
         "actor_rollout_ref.rollout.drafter.training.training_interval_steps=" in source
     )
     assert "actor_rollout_ref.rollout.drafter.training.publish_async=" in source
+
+
+def test_v1_hard_freeze_longrun_uses_full_dimensions_and_normal_policy() -> None:
+    source = (
+        ROOT / "examples" / "run_qwen3-8b_v1_dspark_hard_freeze_longrun_npu.sh"
+    ).read_text(encoding="utf-8")
+    for setting in (
+        "export SPECO_TRAIN_BATCH_SIZE=64",
+        "export SPECO_MAX_RESPONSE_LENGTH=8192",
+        "export SPECO_DRAFTER_COLLECT_INTERVAL=5",
+        "export SPECO_DRAFTER_TRAINING_INTERVAL=5",
+        '"${freeze}.gain.practical_gain_all=0.005"',
+        '"${freeze}.gain.practical_gain_hard=0.005"',
+        '"${freeze}.gain.window_updates=3"',
+        '"${freeze}.probe.interval_updates=3"',
+    ):
+        assert setting in source
+    assert '"$@"' in source
+
+
+def test_v1_hard_freeze_runner_selection_is_explicit_in_ray_environment() -> None:
+    source = (
+        ROOT / "examples" / "run_qwen3-8b_v1_dspark_hard_freeze_smoke_npu.sh"
+    ).read_text(encoding="utf-8")
+    # An existing Ray head does not inherit the launcher's shell exports.
+    for name in ("VLLM_USE_V1", "VLLM_USE_V2_MODEL_RUNNER"):
+        assert f"++ray_kwargs.ray_init.runtime_env.env_vars.{name}='\"1\"'" in source
 
 
 def test_standalone_tq_training_example_uses_unified_launcher() -> None:
@@ -165,6 +198,20 @@ def test_original_npu_dspark_example_keeps_repository_mrv1_contract() -> None:
     assert "actor_rollout_ref.rollout.max_num_batched_tokens=16384" in source
     assert "actor_rollout_ref.rollout.gpu_memory_utilization=0.7" in source
 
+    assignments = _launch_assignments(source)
+    assert assignments["data.filter_overlong_prompts"] == "False"
+    training_prefix = "actor_rollout_ref.rollout.drafter.training."
+    expected_training = {
+        "dspark_hard_candidate_ratio": "0",
+        "dspark_hard_sample_ratio": "0",
+        "collect_interval_steps": "10",
+        "training_interval_steps": "10",
+        "batch_size_per_gpu": "10",
+        "sample_last_n_steps": "10",
+    }
+    for key, value in expected_training.items():
+        assert assignments[training_prefix + key] == value
+
 
 def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None:
     baseline_source = (
@@ -182,22 +229,30 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
         "actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha",
         "data.val_batch_size",
     }
+    baseline_only_keys = {
+        "actor_rollout_ref.rollout.drafter.training.dspark_hard_candidate_ratio",
+        "actor_rollout_ref.rollout.drafter.training.dspark_hard_sample_ratio",
+        "actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu",
+        "actor_rollout_ref.rollout.drafter.training.sample_last_n_steps",
+    }
     changed_keys = {
         "data.filter_overlong_prompts",
         "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens",
         "actor_rollout_ref.rollout.drafter.training.publish_async",
+        "actor_rollout_ref.rollout.drafter.training.collect_interval_steps",
+        "actor_rollout_ref.rollout.drafter.training.training_interval_steps",
     }
 
     assert set(mrv2) - set(baseline) == added_keys
-    assert set(baseline) - set(mrv2) == set()
+    assert set(baseline) - set(mrv2) == baseline_only_keys
     assert {
         key: value
         for key, value in mrv2.items()
-        if key not in added_keys | changed_keys
+        if key not in added_keys | baseline_only_keys | changed_keys
     } == {
         key: value
         for key, value in baseline.items()
-        if key not in added_keys | changed_keys
+        if key not in added_keys | baseline_only_keys | changed_keys
     }
     assert (
         baseline["actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens"] == "7"
@@ -210,13 +265,6 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
         mrv2["+actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling"]
         == "False"
     )
-    assert (
-        baseline["actor_rollout_ref.rollout.drafter.training.publish_async"] == "True"
-    )
-    assert (
-        mrv2["actor_rollout_ref.rollout.drafter.training.publish_async"] == "False"
-    )
-
     assert "export VLLM_USE_V1=1" in mrv2_source
     assert "export VLLM_USE_V2_MODEL_RUNNER=1" in mrv2_source
     assert (

@@ -38,6 +38,30 @@ _CURRENT_GLOBAL_STEPS = contextvars.ContextVar(
     "speco_current_global_steps", default=None
 )
 _CURRENT_VALIDATE = contextvars.ContextVar("speco_current_validate", default=False)
+# Fixed paired-probe batches (RFC sec. 6) force greedy sampling and a length
+# cap so the two arms are comparable and cheap regardless of val_kwargs.
+_CURRENT_PROBE_MAX_TOKENS = contextvars.ContextVar(
+    "speco_current_probe_max_tokens", default=None
+)
+_CURRENT_PROBE_GREEDY = contextvars.ContextVar(
+    "speco_current_probe_greedy", default=False
+)
+
+
+def _apply_probe_sampling_overrides(sampling_params: Any) -> Any:
+    """Force greedy + max_tokens on the fixed paired-probe arm requests."""
+    if not isinstance(sampling_params, dict):
+        return sampling_params
+    if bool(_CURRENT_PROBE_GREEDY.get()):
+        sampling_params["temperature"] = 0
+        sampling_params["top_p"] = 1.0
+        sampling_params["top_k"] = -1
+    max_tokens = _CURRENT_PROBE_MAX_TOKENS.get()
+    if max_tokens:
+        sampling_params["max_tokens"] = int(max_tokens)
+    return sampling_params
+
+
 SPECO_AGENT_LOOP_MANAGER_CLASS = (
     "verl_speco.integration.agent_loop_runtime.SpecoAgentLoopManager"
 )
@@ -149,17 +173,32 @@ def _speco_default_agent_loop_inputs(inputs: Any) -> Any:
     return inputs
 
 
-def _speco_context_from_batch(batch: Any) -> tuple[Any, Any]:
+def _speco_context_from_batch(batch: Any) -> tuple[Any, ...]:
     meta_info = getattr(batch, "meta_info", None)
     meta_info = meta_info if isinstance(meta_info, dict) else {}
     global_steps_token = _CURRENT_GLOBAL_STEPS.set(meta_info.get("global_steps"))
     validate_token = _CURRENT_VALIDATE.set(bool(meta_info.get("validate", False)))
-    return global_steps_token, validate_token
+    probe_greedy_token = _CURRENT_PROBE_GREEDY.set(
+        bool(meta_info.get("_speco_freeze_probe", False))
+    )
+    probe_max_tokens_token = _CURRENT_PROBE_MAX_TOKENS.set(
+        meta_info.get("_speco_freeze_probe_max_tokens", None)
+    )
+    return (
+        global_steps_token,
+        validate_token,
+        probe_greedy_token,
+        probe_max_tokens_token,
+    )
 
 
-def _speco_reset_context(global_steps_token: Any, validate_token: Any) -> None:
-    _CURRENT_VALIDATE.reset(validate_token)
-    _CURRENT_GLOBAL_STEPS.reset(global_steps_token)
+def _speco_reset_context(*tokens: Any) -> None:
+    if len(tokens) >= 4:
+        _CURRENT_PROBE_MAX_TOKENS.reset(tokens[3])
+        _CURRENT_PROBE_GREEDY.reset(tokens[2])
+    if len(tokens) >= 2:
+        _CURRENT_VALIDATE.reset(tokens[1])
+        _CURRENT_GLOBAL_STEPS.reset(tokens[0])
 
 
 def _speco_worker_init(self, *args, **kwargs):
@@ -171,10 +210,9 @@ def _speco_worker_init(self, *args, **kwargs):
 
 async def _speco_worker_generate_sequences(self, batch):
     _speco_worker_request_started(self)
-    global_steps_token = None
-    validate_token = None
+    context_tokens = None
     try:
-        global_steps_token, validate_token = _speco_context_from_batch(batch)
+        context_tokens = _speco_context_from_batch(batch)
         generate_sequences = _speco_parent_method(self, "generate_sequences")
         if not callable(generate_sequences):
             raise AttributeError(
@@ -186,8 +224,8 @@ async def _speco_worker_generate_sequences(self, batch):
         result = _ensure_extra_field_defaults(result)
         return result
     finally:
-        if global_steps_token is not None and validate_token is not None:
-            _speco_reset_context(global_steps_token, validate_token)
+        if context_tokens is not None:
+            _speco_reset_context(*context_tokens)
         _speco_worker_request_finished(self)
 
 
@@ -200,6 +238,7 @@ async def _speco_worker_run_agent_loop(
         global_steps=trajectory.get("step"),
         validate=bool(trajectory.get("validate", False)),
     )
+    sampling_params = _apply_probe_sampling_overrides(sampling_params)
     run_agent_loop = _speco_parent_method(self, "_run_agent_loop")
     if not callable(run_agent_loop):
         raise AttributeError(
@@ -479,25 +518,16 @@ def install_agent_loop_runtime_patch() -> bool:
         @wraps(generate_sequences)
         async def speco_generate_sequences(self, batch):
             _speco_worker_request_started(self)
-            global_steps_token = None
-            validate_token = None
+            context_tokens = None
             try:
-                meta_info = getattr(batch, "meta_info", None)
-                meta_info = meta_info if isinstance(meta_info, dict) else {}
-                global_steps_token = _CURRENT_GLOBAL_STEPS.set(
-                    meta_info.get("global_steps")
-                )
-                validate_token = _CURRENT_VALIDATE.set(
-                    bool(meta_info.get("validate", False))
-                )
+                context_tokens = _speco_context_from_batch(batch)
                 result = generate_sequences(self, batch)
                 if inspect.isawaitable(result):
                     result = await result
                 return _ensure_extra_field_defaults(result)
             finally:
-                if global_steps_token is not None and validate_token is not None:
-                    _CURRENT_VALIDATE.reset(validate_token)
-                    _CURRENT_GLOBAL_STEPS.reset(global_steps_token)
+                if context_tokens is not None:
+                    _speco_reset_context(*context_tokens)
                 _speco_worker_request_finished(self)
 
         worker_cls.generate_sequences = speco_generate_sequences
@@ -515,6 +545,7 @@ def install_agent_loop_runtime_patch() -> bool:
                 global_steps=trajectory.get("step"),
                 validate=bool(trajectory.get("validate", False)),
             )
+            sampling_params = _apply_probe_sampling_overrides(sampling_params)
             result = run_agent_loop(self, sampling_params, trajectory, *args, **kwargs)
             if inspect.isawaitable(result):
                 result = await result
