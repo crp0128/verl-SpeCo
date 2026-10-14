@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import re
@@ -21,6 +22,7 @@ import types
 from contextlib import nullcontext
 from inspect import getsource
 from pathlib import Path
+from textwrap import dedent
 from types import SimpleNamespace
 
 import pytest
@@ -285,7 +287,15 @@ def test_vllm_weight_sync_extension_has_stable_runtime_path() -> None:
     assert source.index(
         "patch_verl_bucketed_weight_transfer_npu_staging()"
     ) < source.index("super().update_weights_from_ipc(")
-    assert "with _speco_npu_target_staging(" in source
+    tree = ast.parse(dedent(source))
+    assert any(
+        isinstance(item.context_expr, ast.Call)
+        and isinstance(item.context_expr.func, ast.Name)
+        and item.context_expr.func.id == "_speco_npu_target_staging"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.With)
+        for item in node.items
+    )
 
 
 def test_vllm_npu_staging_is_guarded_and_preserves_upstream_fallback() -> None:

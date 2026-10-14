@@ -33,6 +33,7 @@ import threading
 import time
 import types
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from typing import Any, Iterable, cast
 
@@ -742,6 +743,58 @@ def _speco_npu_target_staging(worker: Any, *, peft_config: dict | None, use_shm:
         yield
     finally:
         _NPU_TARGET_STAGING_STATE.enabled = previous
+
+
+@contextmanager
+def _speco_canonicalize_target_tied_weights(
+    worker: Any, *, peft_config: dict | None = None
+) -> Iterator[None]:
+    """Normalize aliases only while verl reloads the target model.
+
+    New vLLM loaders require a skipped alias's canonical tensor in the same
+    load_weights call. verl supplies one bucket per call, so an alias may arrive
+    separately. Rename it rather than retaining tensors from reused IPC/SHM
+    buffers. Older vLLM/Ascend loaders without alias detection are left alone.
+    """
+    model = getattr(getattr(worker, "model_runner", None), "model", None)
+    if model is None or peft_config is not None:
+        yield
+        return
+    try:
+        from vllm.model_executor.models.utils import _get_tied_embedding_params
+    except ImportError:
+        yield
+        return
+
+    aliases = _get_tied_embedding_params(model)
+    if not aliases:
+        yield
+        return
+
+    original = model.load_weights
+    had_override = "load_weights" in vars(model)
+    previous_override = vars(model).get("load_weights")
+
+    def load_weights(weights, *args, **kwargs):
+        # Materialize names and references only; never clone device tensors.
+        weights = list(weights)
+        names = {name for name, _ in weights}
+        normalized = []
+        for name, tensor in weights:
+            canonical = aliases.get(name, name)
+            if name in aliases and canonical in names:
+                continue
+            normalized.append((canonical, tensor))
+        return original(normalized, *args, **kwargs)
+
+    model.load_weights = load_weights
+    try:
+        yield
+    finally:
+        if had_override:
+            model.load_weights = previous_override
+        else:
+            del model.load_weights
 
 
 def _int_list_or_none(value: Any, field_name: str) -> list[int] | None:
@@ -3622,7 +3675,7 @@ except Exception:  # noqa: BLE001
 
 
 class SpecoVLLMWeightSyncCompatExtension(_VLLMWorkerExtensionBase):
-    """Install the serialized NPU IPC-handle compatibility before target weight sync."""
+    """Apply tied-weight and NPU transport compatibility during target sync."""
 
     def update_weights_from_ipc(
         self,
@@ -3638,15 +3691,19 @@ class SpecoVLLMWeightSyncCompatExtension(_VLLMWorkerExtensionBase):
                 "[speco vllm weight sync] installed IPC rebuild compatibility"
             )
         if not _speco_is_npu_vllm_worker(self):
-            return super().update_weights_from_ipc(
-                peft_config=peft_config,
-                base_sync_done=base_sync_done,
-                use_shm=use_shm,
-            )
+            with _speco_canonicalize_target_tied_weights(self, peft_config=peft_config):
+                return super().update_weights_from_ipc(
+                    peft_config=peft_config,
+                    base_sync_done=base_sync_done,
+                    use_shm=use_shm,
+                )
 
         try:
-            with _speco_npu_target_staging(
-                self, peft_config=peft_config, use_shm=use_shm
+            with (
+                _speco_npu_target_staging(
+                    self, peft_config=peft_config, use_shm=use_shm
+                ),
+                _speco_canonicalize_target_tied_weights(self, peft_config=peft_config),
             ):
                 return super().update_weights_from_ipc(
                     peft_config=peft_config,
@@ -4792,8 +4849,11 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         # Diagnostic: check draft state BEFORE target sync
         self._speco_diag_draft_state("before_target_sync")
         try:
-            with _speco_npu_target_staging(
-                self, peft_config=peft_config, use_shm=use_shm
+            with (
+                _speco_npu_target_staging(
+                    self, peft_config=peft_config, use_shm=use_shm
+                ),
+                _speco_canonicalize_target_tied_weights(self, peft_config=peft_config),
             ):
                 result = super().update_weights_from_ipc(
                     peft_config=peft_config,
