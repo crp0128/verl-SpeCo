@@ -1154,7 +1154,7 @@ class SpecoV1Mixin:
             compute_loss=False,
             temperature=self.config.actor_rollout_ref.rollout.temperature,
         )
-        output = self.actor_rollout_wg.compute_log_prob(control)
+        output = self._speco_compute_collection_log_prob(control)
         output_data = output
         collected = self._speco_collect_oldlogprob_features(
             data_proto, collect_plan, output_data
@@ -1250,6 +1250,33 @@ class SpecoV1Mixin:
         )
         metrics["actor/entropy"] = entropy_agg.detach().item()
         return updated_batch
+
+    def _speco_compute_collection_log_prob(self, control):
+        """Keep separate-async's fixed proximal policy during collection.
+
+        The collection forward bypasses the parent's KVBatchMeta adapter, but
+        must not bypass PPOTrainerSeparateAsync's CPU policy snapshots. Share
+        its snapshot slots so collected and non-collected local steps can be
+        interleaved within the same parameter-sync cycle.
+        """
+        worker = self.actor_rollout_wg
+        if self.config.trainer.v1.get("trainer_mode", "sync") != "separate_async":
+            return worker.compute_log_prob(control)
+
+        local_step = self.local_trigger_step
+        if local_step == 0:
+            worker.save_model_to_cpu(0)
+            return worker.compute_log_prob(control)
+
+        worker.save_model_to_cpu(local_step)
+        try:
+            worker.restore_model_from_cpu(0)
+            return worker.compute_log_prob(control)
+        finally:
+            # Restore before releasing the only copy of the training weights;
+            # if restoration fails, leave that snapshot available for recovery.
+            worker.restore_model_from_cpu(local_step)
+            worker.clear_cpu_model(local_step)
 
     def _speco_v1_spec_decode_sidecar_metrics(self) -> dict[str, float]:
         """Read cumulative EngineCore counters when RequestOutput has no stats."""
