@@ -1386,6 +1386,10 @@ class SpecoV1Mixin:
         metrics.update(self._speco_v1_spec_decode_metrics(batch))
         if getattr(self, "_speco_freeze_policy", None) is not None:
             metrics.update(self._speco_freeze_metrics())
+        if getattr(self, "_speco_ci_result", None) is not None:
+            # Shared training/publication facades already record their own
+            # outcomes; count only generation here to avoid double counting.
+            self._speco_ci_result.record_metrics({"training/global_step": global_steps})
         return result
 
     def _update_actor(self, batch, metrics):
@@ -1508,6 +1512,7 @@ class SpecoV1Mixin:
 
         if bool(getattr(self, "_speco_prepared_for_fit", False)):
             return
+        self._speco_init_ci_result()
         if self._speco_online_enabled_from_config(self.config):
             self._speco_activate_drafter_training_model_before_fit()
             self._speco_freeze_policy = self._speco_init_freeze_policy()
@@ -1546,7 +1551,35 @@ class SpecoV1Mixin:
             return None
         return super().on_train_begin()
 
+    def _speco_init_ci_result(self):
+        if (
+            os.getenv("SPECO_CI_RESULT_PATH")
+            and getattr(self, "_speco_ci_result", None) is None
+        ):
+            from verl_speco.integration.ci_result import CIResult
+
+            self._speco_ci_result = CIResult(
+                self._speco_online_enabled_from_config(self.config)
+            )
+
     def fit(self, agent_loop_manager):
+        result_path = os.getenv("SPECO_CI_RESULT_PATH")
+        if not result_path:
+            return self._speco_fit_impl(agent_loop_manager)
+        self._speco_init_ci_result()
+        try:
+            result = self._speco_fit_impl(agent_loop_manager)
+            self._speco_ci_result.data["completed"] = True
+            return result
+        except BaseException as error:
+            self._speco_ci_result.data["errors"].append(
+                {"type": type(error).__name__, "message": str(error)}
+            )
+            raise
+        finally:
+            self._speco_ci_result.write(result_path)
+
+    def _speco_fit_impl(self, agent_loop_manager):
         completed = False
         try:
             if not bool(getattr(self, "_speco_prepared_for_fit", False)):

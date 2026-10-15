@@ -92,7 +92,9 @@ def test_mooncake_store_release_propagates_deletion_failure() -> None:
 
 
 def test_connector_register_kv_caches_uses_device_stream(monkeypatch) -> None:
-    pytest.importorskip("hs_connectors.mooncake_hidden_states_connector")
+    pytest.importorskip(
+        "hs_connectors", reason="optional vLLM hidden-state connector is not installed"
+    )
     import verl_speco.mooncake_hidden_states_connector as connector_module
     from verl_speco.mooncake_hidden_states_connector import (
         SpecoMooncakeHiddenStatesConnector,
@@ -158,7 +160,9 @@ def test_file_backend_constant_matches_default() -> None:
 
 
 def test_speco_connector_restores_rank0_finished_count() -> None:
-    pytest.importorskip("hs_connectors.mooncake_hidden_states_connector")
+    pytest.importorskip(
+        "hs_connectors", reason="optional vLLM hidden-state connector is not installed"
+    )
     from hs_connectors.mooncake_hidden_states_connector import (
         MooncakeHiddenStatesConnector,
     )
@@ -167,7 +171,5 @@ def test_speco_connector_restores_rank0_finished_count() -> None:
         SpecoMooncakeHiddenStatesConnector,
     )
 
-    assert issubclass(
-        SpecoMooncakeHiddenStatesConnector, MooncakeHiddenStatesConnector
-    )
+    assert issubclass(SpecoMooncakeHiddenStatesConnector, MooncakeHiddenStatesConnector)
     assert SpecoMooncakeHiddenStatesConnector.get_finished_count(None) == 1

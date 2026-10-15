@@ -200,13 +200,17 @@ def test_v1_metrics_report_speco_mean_acceptance_length(monkeypatch):
         tags=[{}, {}, {"is_padding": True}],
     )
     metrics = {}
-    Harness()._compute_metrics(batch, metrics, {}, global_steps=1, epoch=0)
+    trainer = Harness()
+    ci_metrics = []
+    trainer._speco_ci_result = types.SimpleNamespace(record_metrics=ci_metrics.append)
+    trainer._compute_metrics(batch, metrics, {}, global_steps=1, epoch=0)
 
     # 1 + (6 + 3) / (4 + 3); the padding record must be ignored.
     assert metrics["drafter/spec_decode/mean_acceptance_length"] == pytest.approx(
         1 + 9 / 7
     )
     assert metrics["upstream/metrics"] == 1
+    assert ci_metrics == [{"training/global_step": 1}]
 
 
 def test_v1_metrics_fall_back_to_engine_core_acceptance_sidecars(monkeypatch, tmp_path):
