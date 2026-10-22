@@ -775,7 +775,7 @@ class DrafterBaseTrainer:
             return
         first_offload = (
             device_name in {"npu", "cuda"}
-            and self._drafter_strategy() in {"fsdp", "fsdp2", "ddp"}
+            and self._drafter_strategy() == "fsdp2"
             and not getattr(
                 self.optimizer, "_speco_first_blocking_optimizer_offload_done", False
             )
@@ -784,7 +784,7 @@ class DrafterBaseTrainer:
             offload_fsdp_optimizer(self.optimizer)
             return
 
-        # Complete the first accelerator-state transfer before activation
+        # Complete FSDP2's first accelerator-state transfer before activation
         # cleanup; later calls retain verl's asynchronous path. Keep VeOmni's
         # existing NPU safety policy blocking on every call.
         offloaded = False

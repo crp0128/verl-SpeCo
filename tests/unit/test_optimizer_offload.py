@@ -48,12 +48,10 @@ def trainer(monkeypatch):
 
 
 @pytest.mark.parametrize("device", ["npu", "cuda"])
-@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2", "ddp"])
 def test_first_real_offload_then_original_and_new_optimizer(
-    trainer, monkeypatch, device, strategy
+    trainer, monkeypatch, device
 ):
     monkeypatch.setattr(base, "device_name", device)
-    trainer._drafter_strategy = lambda: strategy
     original_calls = []
     monkeypatch.setattr(base, "offload_fsdp_optimizer", original_calls.append)
     trainer._offload_optimizer_state_to_cpu()
@@ -96,7 +94,16 @@ def test_failed_copy_does_not_mark_optimizer_complete(trainer):
 
 
 @pytest.mark.parametrize(
-    "device,strategy", [("cpu", "fsdp2"), ("npu", "megatron"), ("cuda", "veomni")]
+    "device,strategy",
+    [
+        ("cpu", "fsdp2"),
+        ("npu", "fsdp"),
+        ("cuda", "fsdp"),
+        ("npu", "ddp"),
+        ("cuda", "ddp"),
+        ("npu", "megatron"),
+        ("cuda", "veomni"),
+    ],
 )
 def test_other_devices_and_strategies_keep_original(
     trainer, monkeypatch, device, strategy
