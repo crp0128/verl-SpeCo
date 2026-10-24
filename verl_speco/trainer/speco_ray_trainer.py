@@ -78,7 +78,7 @@ from verl_speco.integration.vllm_runtime import (
     configure_vllm_runtime_from_config,
 )
 from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
-from verl_speco.trainer.hard_sample_selection import partition_hard_candidates
+from verl_speco.trainer.hard_sample_selection import kde_hard_partition, partition_hard_candidates
 from verl_speco.trainer.scheduler import (
     AfterActorUpdateContext,
     AfterWeightUpdateContext,
@@ -2692,6 +2692,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             accept_len_var=accept_len_var,
         )
         if payload:
+            # Retain the exact input for offline KDE replay; the legacy
+            # accept_lens/summary fields remain rounded for compatibility.
+            payload["accept_lens_full_precision"] = [
+                float(value)
+                for value in request_accept_lens
+                if value is not None and math.isfinite(float(value))
+            ]
             self._speco_pending_request_accept_len_payloads.append(payload)
         return bool(records)
 
@@ -2859,7 +2866,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         hard_candidate_ratio = float(
             training_cfg.get("dspark_hard_candidate_ratio", 0.0) or 0.0
         )
-        hard_enabled = hard_sample_ratio > 0.0 and hard_candidate_ratio > 0.0
+        hard_partition_mode = training_cfg.get("dspark_hard_partition_mode", "fixed")
+        if hard_partition_mode not in ("fixed", "kde_hard"):
+            raise ValueError(f"Invalid hard partition mode: {hard_partition_mode}")
+        kde_enabled = hard_partition_mode == "kde_hard"
+        hard_enabled = kde_enabled or (hard_sample_ratio > 0.0 and hard_candidate_ratio > 0.0)
         # The transport now retains every DP shard. The window is a logical
         # collection budget, never a physical prefix of the actor batch.
         usable_window_size = batch_size
@@ -3013,13 +3024,27 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         labeled_hard_count = 0
         hard_shortfall = 0
         normal_shortfall = 0
+        kde_metrics = {}
+        kde_candidates = []
+        if kde_enabled:
+            kde_candidates, kde_metrics = kde_hard_partition(
+                scored_candidates,
+                acceptance_values=[float(value) for value in request_accept_lens if value is not None],
+                training_multiplier=float(training_cfg.get("dspark_hard_training_multiplier", 1.0)),
+            )
+            hard_enabled = bool(kde_metrics["kde_bimodal"])
+            hard_sample_ratio = kde_metrics["effective_sample_ratio"]
         if not hard_enabled:
             normal_added = add_round_robin(candidates)
         else:
-            hard_candidates, labeled_hard_count = partition_hard_candidates(
-                scored_candidates,
-                candidate_ratio=hard_candidate_ratio,
-            )
+            if kde_enabled:
+                hard_candidates = kde_candidates
+                labeled_hard_count = len(hard_candidates)
+            else:
+                hard_candidates, labeled_hard_count = partition_hard_candidates(
+                    scored_candidates,
+                    candidate_ratio=hard_candidate_ratio,
+                )
             for candidate in hard_candidates:
                 is_hard[candidate["batch_idx"]] = True
             hard_pool = sorted(hard_candidates, key=lambda row: row["hash"])
@@ -3059,6 +3084,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             owner_counts[owner] - hard_counts[owner] for owner in range(owner_count)
         ]
         selection_metrics = {
+            **kde_metrics,
             "eligible_rows": len(candidates),
             "scored_rows": len(scored_candidates),
             "candidate_hard_count": labeled_hard_count,

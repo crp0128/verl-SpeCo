@@ -303,6 +303,8 @@ actor_rollout_ref:
         # Desired fraction of unique hard requests in the collection set.
         # Either ratio zero disables hard prioritization; training stays uniform.
         dspark_hard_sample_ratio: 0.0
+        dspark_hard_partition_mode: fixed
+        dspark_hard_training_multiplier: 1.0
         # Shared collection budget for both baseline and hard sampling.
         dspark_collect_samples_per_step: 80
         # Never duplicate requests. Fill missing hard slots with unique normals.
