@@ -32,6 +32,20 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+def dspark_history_window(drafter, *, sync: bool) -> int:
+    training = drafter.get("training", {}) or {}
+    if (
+        sync
+        and str(drafter.get("speculative_algorithm", "")).upper() == "DSPARK"
+        and training.get("mode", "online") == "online"
+        and training.get("use_data_buffer", False)
+        and training.get("collect_hidden_states_from_old_logprob", False)
+        and not training.get("use_logits", False)
+    ):
+        return max(0, int(training.get("sample_last_n_steps", 2)))
+    return 0
+
+
 class DataBuffer:
     """Buffer to store training data from multiple RL steps for draft model training.
 
@@ -50,6 +64,8 @@ class DataBuffer:
         self.buffer: deque[dict[str, Any]] = deque(maxlen=max_size)
         self._global_sample_ids: set[object] = set()
         self._current_step: Optional[int] = 0
+        self.capacity_evictions = 0
+        self.capacity_rejections = 0
 
     def add_batch(self, batch: dict[str, Any]) -> bool:
         """Add a batch of data to the buffer.
@@ -65,6 +81,7 @@ class DataBuffer:
         if sample_id is not None and sample_id in self._global_sample_ids:
             return False
         if self.max_size <= 0:
+            self.capacity_rejections += 1
             return False
         if len(self.buffer) >= self.max_size:
             # Reservations and retained Bubble replay sessions own their
@@ -86,12 +103,14 @@ class DataBuffer:
                 if index is None:
                     # Never grow the buffer or sacrifice a running quota to
                     # admit late samples. Existing collection caps still apply.
+                    self.capacity_rejections += 1
                     return False
                 evicted = self.buffer[index]
                 del self.buffer[index]
             else:
                 evicted = self.buffer.popleft()
             evicted_id = evicted.get("_speco_global_sample_id")
+            self.capacity_evictions += 1
             if evicted_id is not None:
                 self._global_sample_ids.discard(evicted_id)
         batch["step"] = self._current_step
@@ -218,6 +237,25 @@ class DataBuffer:
         return [
             sample for sample in self.get_available_data() if sample["step"] >= min_step
         ]
+
+    def discard_before_step(self, min_step: int) -> int:
+        """Release expired samples except those held by active training."""
+        kept = [
+            sample
+            for sample in self.buffer
+            if int(sample["step"]) >= min_step
+            or sample.get("_drafter_reserved_by") is not None
+            or sample.get("_drafter_replay_pinned", False)
+        ]
+        removed = len(self.buffer) - len(kept)
+        if removed:
+            self.buffer = deque(kept, maxlen=self.max_size)
+            self._global_sample_ids = {
+                sample_id
+                for sample in kept
+                if (sample_id := sample.get("_speco_global_sample_id")) is not None
+            }
+        return removed
 
     def get_data_count(self) -> int:
         """Get the current number of samples in the buffer."""
